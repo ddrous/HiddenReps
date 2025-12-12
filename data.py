@@ -11,14 +11,29 @@ class SineWaveDataModule(pl.LightningDataModule):
     def generate_data(self):
         # Generate mixed sine waves: sin(x) + sin(2.3x)
         x = np.linspace(0, 100, self.hparams.num_samples + self.hparams.seq_len)
-        # data = np.sin(x) + np.sin(2.3 * x)
-        data = np.sin(2.0*x)
+        data = np.sin(x) + np.sin(2.3 * x)
+        # data = np.sin(2.0*x)
         
         X, y = [], []
         for i in range(len(data) - self.hparams.seq_len):
             X.append(data[i:i+self.hparams.seq_len])
-            y.append(data[i+self.hparams.seq_len]) # Predict next step
-            
+            # y.append(data[i+self.hparams.seq_len]) # Predict next step
+
+            ## y is a single value that needs to account for every step in the sequence.
+            ## Sum of all input arrs
+            y.append(data[i:i+self.hparams.seq_len].mean())
+
+            # ## the sign of the sequence is how often its values are positive vs negative
+            # seq = data[i:i+self.hparams.seq_len]
+            # sign = 1.0 if (seq >= 0).sum() >= (seq < 0).sum() else -1.0
+            # y.append(sign*data[i+self.hparams.seq_len])
+
+            ## Return the maximum along the sequence
+            # y.append(data[i:i+self.hparams.seq_len].max())
+
+            # ## The output is all the input, but transposed
+            # y.append(data[i:i+self.hparams.seq_len])
+
         return torch.FloatTensor(np.array(X)).unsqueeze(-1), torch.FloatTensor(np.array(y)).unsqueeze(-1)
 
     def setup(self, stage=None):

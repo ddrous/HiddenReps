@@ -26,9 +26,9 @@ def run_experiment():
     plt.show()
 
     # Sizes to compare: 1 (Too small), 4 (Likely too small), 32 (Sufficient)
-    hidden_sizes = [2, 4, 32, 128] 
+    hidden_sizes = [2, 4, 32, 128, 512] 
     # hidden_sizes = []
-    
+
     results = {}
 
     for h_size in hidden_sizes:
@@ -38,13 +38,20 @@ def run_experiment():
         
         # Train
         history = LossHistory()
-        
+        checkpoint_callback = pl.callbacks.ModelCheckpoint(
+            monitor='val_loss',  # Name of the logged metric
+            mode='min',          # Minimize the loss
+            save_top_k=1,        # Keep only the best model
+            dirpath='checkpoints/', # Directory to save checkpoints (optional)
+            filename='best-model-{epoch:02d}-{val_loss:.2f}' # Optional custom filename
+        )
+
         trainer = pl.Trainer(
             max_epochs=500, 
-            callbacks=[history], # <--- Add here
+            callbacks=[history, checkpoint_callback], # <--- Add here
             enable_progress_bar=False, 
             logger=False, 
-            enable_checkpointing=False
+            # enable_checkpointing=False
         )
         trainer.fit(model, dm)
         
