@@ -1,14 +1,16 @@
 #%% How to tell if the hidden size of an RNN is sufficient?
 import pytorch_lightning as pl
-from data import SineWaveDataModule
-from models import RNNRegressor, RNNRegressorSigmoid
-from analysis import analyze_hidden_states, plot_loss_curves, LossHistory, plot_sigmoid_mask
+from data import *
+from models import *
+from analysis import *
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 sns.set(style='ticks')
 
-def run_experiment():
+
+#%% RNN expriment 1: ID = 50
+def run_rnn_experiment():
     # Setup Data
     dm = SineWaveDataModule(seq_len=50, batch_size=64, num_samples=2000)
     dm.setup()
@@ -90,8 +92,98 @@ def run_experiment():
     plt.title('Loss vs Hidden Size')
     plt.show()
 
+
+
+# if __name__ == "__main__":
+#     run_rnn_experiment()
+
+
+
+
+
+
+
+
+
+
+#%%
+
+def run_autoencoder_experiment():
+    # --- 1. Setup Data ---
+
+    dm = SpiralDataModule(
+        batch_size=256, 
+        num_points=15000, 
+        revolutions=10, 
+        radius_decay=0.9, 
+        noise_level=0.00,
+        val_split=0.1
+    )
+    dm.prepare_data() # Generate data
+    dm.setup()
+
+    ## Plot the data in a 3D scatter
+    sample_data = dm.train_ds[:][0].numpy()  # Get all training data
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(sample_data[:, 0], sample_data[:, 1], sample_data[:, 2], c='r', s=1, alpha=0.5)
+    ax.set_title('3D Spiral Data Sample')
+    ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+    plt.show();
+
+
+    # --- 2. Initialize Model ---
+    INPUT_DIM = dm.train_ds[0][0].shape[0] # Should be 3
+    LATENT_DIM = 64 # The maximum dimension to test (should be >= ambient dim)
+
+    print(f"--- Running Autoencoder Experiment (Input: {INPUT_DIM}, Max Latent: {LATENT_DIM}) ---")
+    
+    model = AutoencoderSigmoid(
+        input_dim=INPUT_DIM, 
+        latent_dim=LATENT_DIM, 
+        lr=1e-3
+    )
+
+    # --- 3. Train Model ---
+    history = LossHistory()
+    
+    trainer = pl.Trainer(
+        max_epochs=100, 
+        callbacks=[history], 
+        enable_progress_bar=False, 
+        logger=False,
+    )
+    trainer.fit(model, dm)
+
+    # --- 4. Plot Loss Curves ---
+    plot_loss_curves(history, title=f"Training & Validation Loss (Latent Dim {LATENT_DIM})")
+    
+    # --- 5. Final Sigmoid Reconstruction ---
+    # The learned value of sigparams should be close to 2/LATENT_DIM * LATENT_DIM = 2
+    final_sig_param = model.sigparams.detach().cpu().item()
+    plot_sigmoid_mask_final(
+        final_sig_param, 
+        LATENT_DIM, 
+        title=f"Learned Latent Mask ($\sigma$={final_sig_param * LATENT_DIM:.2f})"
+    )
+    
+    print(f"\nFinal Learned Sigmoid Cut-off Index: {final_sig_param * LATENT_DIM:.3f}")
+    print(f"Final Validation Loss: {history.val_loss[-1]:.6f}")
+
+    # --- 6. PCA Analysis on Latent Codes ---
+    analyze_latent_space(model, dm.val_dataloader(), title_suffix=f"(Latent Dim {LATENT_DIM})")
+
 if __name__ == "__main__":
-    run_experiment()
+    run_autoencoder_experiment()
+
+
+
+
+
+
+
+
+
 
 
 #%% [markdown]
