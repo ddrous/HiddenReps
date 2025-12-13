@@ -79,3 +79,19 @@ def plot_loss_curves(history, title="Loss Curve"):
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.show()
+
+
+def plot_sigmoid_mask(sigparam, h_size, title="Learned Sigmoid Mask"):
+    sigpos = np.linspace(0, h_size-1, h_size)
+    sigdrop = sigparam[0] * h_size
+    # print("Shapes are", sigpos.shape, sigdrop.shape, flush=True)
+    sig_fun = 1.0 -  1/(1 + np.exp(10 * (-sigpos + sigdrop)))  # Steepness fixed at 100 for now
+    plt.figure(figsize=(6, 4))
+    plt.plot(sigpos, sig_fun, label=f'Sigmoid Mask (Drop at {sigdrop:.1f})')
+    plt.title(title)
+    plt.xlabel('Hidden Unit Index')
+    plt.ylabel('Mask Value')
+    plt.ylim([-0.1, 1.1])
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.show()

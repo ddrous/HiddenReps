@@ -1,41 +1,54 @@
 #%% How to tell if the hidden size of an RNN is sufficient?
 import pytorch_lightning as pl
 from data import SineWaveDataModule
-from models import RNNRegressor
-from analysis import analyze_hidden_states, plot_loss_curves, LossHistory
+from models import RNNRegressor, RNNRegressorSigmoid
+from analysis import analyze_hidden_states, plot_loss_curves, LossHistory, plot_sigmoid_mask
 import matplotlib.pyplot as plt
 import seaborn as sns
+import numpy as np
 sns.set(style='ticks')
 
 def run_experiment():
     # Setup Data
-    dm = SineWaveDataModule(seq_len=50, batch_size=64)
+    dm = SineWaveDataModule(seq_len=50, batch_size=64, num_samples=2000)
     dm.setup()
-    
 
     ## PLot a few data samples
     x_sample, y_sample = next(iter(dm.train_dataloader()))
+    batch_size, seq_len, in_size = x_sample.shape
+    _, out_size = y_sample.shape
+    print(f"Data Sample Shape: Input {x_sample.shape}, Target {y_sample.shape}")
     plt.figure(figsize=(10, 4))
     for i in range(5):
         plt.plot(x_sample[i].squeeze().numpy(), label=f'Sample {i+1}')
-        plt.scatter(len(x_sample[i]), y_sample[i].item(), c='r', marker='x') # Target point
-    plt.title('Sample Sine Wave Sequences with Targets')
+        # plt.scatter(len(x_sample[i]), y_sample[i].item(), c='r', marker='x') # Target point
+    plt.title('Sample Sine Wave Sequences')
     plt.xlabel('Time Step')
     plt.ylabel('Value')
     plt.legend()
     plt.show()
 
     # Sizes to compare: 1 (Too small), 4 (Likely too small), 32 (Sufficient)
-    hidden_sizes = [2, 4, 32, 128, 512] 
-    # hidden_sizes = []
+    # hidden_sizes = [2, 32, 48, 52, 64, 128] 
+    hidden_sizes = [256]
 
     results = {}
 
     for h_size in hidden_sizes:
         print(f"\n--- Training RNN with Hidden Size: {h_size} ---")
         
-        model = RNNRegressor(rnn_type='LSTM', input_size=1, hidden_size=h_size, lr=1e-3)
-        
+        # model = RNNRegressor(rnn_type='RNN', 
+        #                      input_size=1, 
+        #                      hidden_size=h_size, 
+        #                      output_size=out_size,
+        #                      lr=1e-3)
+
+        model = RNNRegressorSigmoid(rnn_type='RNN', 
+                                    input_size=1, 
+                                    hidden_size=h_size, 
+                                    output_size=out_size,
+                                    lr=1e-3)
+
         # Train
         history = LossHistory()
         checkpoint_callback = pl.callbacks.ModelCheckpoint(
@@ -54,7 +67,11 @@ def run_experiment():
             # enable_checkpointing=False
         )
         trainer.fit(model, dm)
-        
+
+        ## If using a RNNRegressorSigmoid, plot the final sigmoid used:
+        if isinstance(model, RNNRegressorSigmoid):
+            plot_sigmoid_mask(model.sigparams.detach().cpu().numpy(), h_size, title=f"Learned Sigmoid Mask (Hidden Size {h_size})")
+
         plot_loss_curves(history, title=f"Training vs Val Loss (Hidden Size {h_size})")
 
         # Store final val loss
@@ -75,3 +92,21 @@ def run_experiment():
 
 if __name__ == "__main__":
     run_experiment()
+
+
+#%% [markdown]
+# Current ideas
+# - can the target span the basis of the succession of hidden states?
+# - to achieve a loss below a certain threshold, the hidden size must be at least X. PAC learning theory?
+# - informaiton theory angle; entropy, etc. (the init hidden state is maximum entropy, the RNN must reduce this to a low entropy representation that still allows accurate prediction)
+# - duplicate the output, so that the input to the MLP can be smaller than the output... (learning efficient representations)
+
+
+
+## Experiments:
+# - Next, we can try and reconstruct MNIST: what is the low-dimensional hidden size that allows good reconstruction? (we know this empirically!)
+
+
+## To-Do:
+# - Let's find a force that will want to reduce the drop-off location of the sigmoid mask!#   - e.g., regularization on the sigmoid param to encourage smaller hidden usage
+#
