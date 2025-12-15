@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 
 class RNNRegressor(pl.LightningModule):
@@ -263,6 +264,132 @@ class Autoencoder(pl.LightningModule):
 
 
 
+
+
+
+# --- 2. Shared Architecture Components ---
+# [cite_start]Architecture details from Table 3 [cite: 443]
+class Encoder(nn.Module):
+    def __init__(self, latent_dim, is_vae=False):
+        super().__init__()
+        self.is_vae = is_vae
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(64, 128, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(128, 256, 4, 2, 1), nn.ReLU(),
+            nn.Flatten() # 256 * 2 * 2 = 1024
+        )
+        # VAE requires double the outputs (mu, logvar)
+        out_dim = latent_dim * 2 if is_vae else latent_dim
+        self.fc = nn.Linear(1024, out_dim)
+
+    def forward(self, x):
+        h = self.net(x)
+        return self.fc(h)
+
+class Decoder(nn.Module):
+    def __init__(self, latent_dim):
+        super().__init__()
+        self.fc = nn.Linear(latent_dim, 1024)
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(32, 1, 4, 2, 1), nn.Tanh() # [cite: 443]
+        )
+
+    def forward(self, z):
+        h = self.fc(z)
+        h = h.view(-1, 256, 2, 2)
+        return self.net(h)
+
+# --- 3. Autoencoder Models ---
+class BaseAE(pl.LightningModule):
+    def __init__(self, latent_dim=128, lr=1e-4): # Hyperparams
+        super().__init__()
+        self.save_hyperparameters()
+        self.lr = lr
+    
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
+
+class AE(BaseAE):
+    def __init__(self, latent_dim=128, lr=1e-4):
+        super().__init__(latent_dim, lr)
+        self.encoder = Encoder(latent_dim, is_vae=False)
+        self.decoder = Decoder(latent_dim)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.decoder(z), z
+
+    def training_step(self, batch, batch_idx):
+        x, _ = batch
+        x_hat, _ = self(x)
+        loss = F.mse_loss(x_hat, x)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+class VAE(BaseAE):
+    def __init__(self, latent_dim=128, lr=1e-4):
+        super().__init__(latent_dim, lr)
+        self.encoder = Encoder(latent_dim, is_vae=True)
+        self.decoder = Decoder(latent_dim)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        h = self.encoder(x)
+        mu, logvar = torch.chunk(h, 2, dim=1)
+        z = self.reparameterize(mu, logvar)
+        return self.decoder(z), mu, logvar
+
+    def training_step(self, batch, batch_idx):
+        x, _ = batch
+        x_hat, mu, logvar = self(x)
+        # Recon loss + KL Divergence
+        recon_loss = F.mse_loss(x_hat, x, reduction='sum') / x.size(0)
+        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
+        loss = recon_loss + kld_loss
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+class IRMAE(BaseAE):
+    def __init__(self, latent_dim=128, lr=1e-4, num_linear_layers=8):
+        """
+        Implicit Rank-Minimizing Autoencoder.
+        [cite_start]Inserts extra linear layers between encoder and decoder[cite: 60].
+        [cite_start]Paper uses 8 extra matrices for MNIST[cite: 138].
+        """
+        super().__init__(latent_dim, lr)
+        self.encoder = Encoder(latent_dim, is_vae=False)
+        
+        # [cite_start]The implicit regularization block: Linear layers with no non-linearity [cite: 302]
+        self.linear_layers = nn.ModuleList([
+            nn.Linear(latent_dim, latent_dim, bias=False) 
+            for _ in range(num_linear_layers)
+        ])
+        
+        self.decoder = Decoder(latent_dim)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        # Pass through implicit regularization layers
+        z_reg = z
+        for layer in self.linear_layers:
+            z_reg = layer(z_reg)
+        return self.decoder(z_reg), z_reg
+
+    def training_step(self, batch, batch_idx):
+        x, _ = batch
+        x_hat, _ = self(x)
+        loss = F.mse_loss(x_hat, x)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
 
 
 

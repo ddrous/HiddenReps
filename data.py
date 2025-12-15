@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import pytorch_lightning as pl
 from torch.utils.data import TensorDataset, Dataset, DataLoader, random_split
+from torchvision import datasets, transforms
 
 class SineWaveDataModule(pl.LightningDataModule):
     def __init__(self, seq_len=50, batch_size=32, num_samples=1000):
@@ -252,3 +253,38 @@ if __name__ == '__main__':
     x, y = next(iter(train_loader))
     print(f"Batch X shape: {x.shape}")
     print(f"Batch Y (Labels) shape: {y.shape}")
+
+
+
+
+
+#%%
+
+# --- 1. Data Module ---
+class MNISTDataModule(pl.LightningDataModule):
+    def __init__(self, data_dir='./data', batch_size=32):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        # [cite_start]Paper uses 32x32 images [cite: 438] and Tanh activation (requires [-1, 1] norm)
+        self.transform = transforms.Compose([
+            transforms.Resize(32),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,)) 
+        ])
+
+    def prepare_data(self):
+        datasets.MNIST(self.data_dir, train=True, download=True)
+        datasets.MNIST(self.data_dir, train=False, download=True)
+
+    def setup(self, stage=None):
+        full_train = datasets.MNIST(self.data_dir, train=True, transform=self.transform)
+        # [cite_start]Split train/val as per standard practice, though paper uses 60k train [cite: 451]
+        self.train_ds, self.val_ds = random_split(full_train, [55000, 5000])
+        self.test_ds = datasets.MNIST(self.data_dir, train=False, transform=self.transform)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, num_workers=2)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=2)

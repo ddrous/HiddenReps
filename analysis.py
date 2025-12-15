@@ -8,6 +8,7 @@ from umap import UMAP
 from sklearn.metrics import normalized_mutual_info_score as NMI
 from tqdm.auto import tqdm
 import pytorch_lightning as pl
+from models import VAE, IRMAE
 
 def analyze_hidden_states(model, dataloader, title_suffix=""):
     model.eval()
@@ -327,4 +328,116 @@ def analyze_clustered_embeddings(model, dataloader, ae_latent_dims=(0, 1), title
     cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7]) 
     fig.colorbar(sc, cax=cbar_ax, label="True Cluster Label")
     plt.suptitle(f"Latent Space Analysis {title_suffix}", fontsize=16)
+    plt.show()
+
+def plot_multiple_loss_curves(histories):
+    """Plots Train/Val losses for all models side-by-side."""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    for ax, (name, history) in zip(axes, histories.items()):
+        ax.plot(history.train_loss, label='Train Loss')
+        # Handle cases where validation might be skipped in sanity checks
+        if history.val_loss:
+            ax.plot(history.val_loss, label='Val Loss', linestyle='--')
+        ax.set_title(f"{name} Loss")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    plt.suptitle("Training Dynamics Comparison", fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+# --- 4. Visualization & Experiment ---
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import torch
+import numpy as np
+
+def visualize_interpolation(models, dataloader, device='cuda'):
+    """
+    Replicates Figure 5 from the paper with exact layout:
+    - distinct blocks for each model (AE, VAE, IRMAE)
+    - tight spacing within blocks, larger spacing between blocks
+    - vertical labels on the left
+    """
+    # 1. Setup Parameters
+    num_pairs = 4  # Rows per model (as seen in the paper figure)
+    steps = 10     # Columns (interpolation steps)
+    
+    # 2. Prepare Data Pairs
+    # We need 4 distinct pairs of starting/ending images
+    batch = next(iter(dataloader))
+    imgs, _ = batch
+    # Create pairs: (img0, img1), (img2, img3), etc.
+    pairs = [(imgs[2*i].to(device), imgs[2*i+1].to(device)) for i in range(num_pairs)]
+
+    # 3. Setup Figure with GridSpec
+    # Outer grid: 3 rows (one for each model), 1 column. 
+    # 'hspace' controls the gap BETWEEN models.
+    fig = plt.figure(figsize=(8, 12)) 
+    outer_grid = gridspec.GridSpec(len(models), 1, hspace=0.3) 
+
+    for i, (name, model) in enumerate(models.items()):
+        model.eval()
+        model.to(device)
+        
+        # Inner grid: num_pairs rows, steps columns.
+        # 'wspace=0, hspace=0' ensures images within a model touch each other.
+        inner_grid = gridspec.GridSpecFromSubplotSpec(
+            num_pairs, steps, 
+            subplot_spec=outer_grid[i], 
+            wspace=0, hspace=0
+        )
+        
+        # Add Model Label (Vertical, centered to the left of the block)
+        # We place it relative to the bounding box of the inner grid
+        ax_label = fig.add_subplot(outer_grid[i])
+        ax_label.axis('off')
+        ax_label.text(-0.02, 0.5, name, fontsize=18, fontweight='bold', 
+                      rotation=90, va='center', ha='right', transform=ax_label.transAxes)
+
+        for row_idx, (img_A, img_B) in enumerate(pairs):
+            with torch.no_grad():
+                # Encode
+                enc_A = model.encoder(img_A.unsqueeze(0))
+                enc_B = model.encoder(img_B.unsqueeze(0))
+                
+                # Handle VAE splitting
+                if "VAE" in name or isinstance(model, type(models.get("VAE"))): # Robust check
+                    z_A, _ = torch.chunk(enc_A, 2, dim=1)
+                    z_B, _ = torch.chunk(enc_B, 2, dim=1)
+                else:
+                    z_A, z_B = enc_A, enc_B
+
+                # Interpolate and Plot
+                alpha_vals = np.linspace(0, 1, steps)
+                for col_idx, alpha in enumerate(alpha_vals):
+                    # Linear Interpolation in Latent Space
+                    z_interp = (1 - alpha) * z_A + alpha * z_B
+                    
+                    # Apply Implicit Regularization Layers (IRMAE only)
+                    # We check by attribute presence to be safe
+                    if hasattr(model, 'linear_layers'):
+                        for layer in model.linear_layers:
+                            z_interp = layer(z_interp)
+                    
+                    # Decode
+                    recon = model.decoder(z_interp)
+                    
+                    # Denormalize: Tanh [-1, 1] -> [0, 1]
+                    # This fixes the "dark image" issue
+                    img_np = recon.squeeze().cpu().numpy()
+                    img_np = (img_np * 0.5) + 0.5
+                    img_np = np.clip(img_np, 0, 1)
+
+                    # Create Subplot in the Inner Grid
+                    ax = plt.subplot(inner_grid[row_idx, col_idx])
+                    ax.imshow(img_np, cmap='gray')
+                    ax.axis('off')
+                    ax.set_xticklabels([])
+                    ax.set_yticklabels([])
+
+    plt.suptitle("Linear Interpolation on MNIST", fontsize=16, y=0.95)
     plt.show()

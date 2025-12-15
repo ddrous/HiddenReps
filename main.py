@@ -248,7 +248,7 @@ def run_clustering_experiment():
 
     # --- 2. Initialize Model ---
     INPUT_DIM = dm.train_ds[0][0].shape[0] # Should be 3
-    LATENT_DIM = 2 # The maximum dimension to test (should be >= ambient dim)
+    LATENT_DIM = 1 # The maximum dimension to test (should be >= ambient dim)
 
     print(f"--- Running Autoencoder Experiment (Input: {INPUT_DIM}, Max Latent: {LATENT_DIM}) ---")
     
@@ -282,8 +282,8 @@ def run_clustering_experiment():
                                 dataloader=dm.train_dataloader(), 
                                 title_suffix=f"(Latent Dim {LATENT_DIM})")
 
-if __name__ == "__main__":
-    run_clustering_experiment()
+# if __name__ == "__main__":
+#     run_clustering_experiment()
 
 
 
@@ -293,4 +293,74 @@ if __name__ == "__main__":
 
 ## To-Do:
 # - Let's find a force that will want to reduce the drop-off location of the sigmoid mask!#   - e.g., regularization on the sigmoid param to encourage smaller hidden usage
+
+
+
+
+
+
+
+
+#%% MNIST
+
+# --- 6. Main Experiment Runner ---
+def run_mnist_experiment():
+    # pl.seed_everything(2026)
+    """ From the paper 'Implicit Rank-Minimizing Autoencoders' (IRMAE) https://arxiv.org/abs/2305.16272"""
+    
+    # Setup
+    dm = MNISTDataModule(batch_size=64) # Increased batch size slightly for speed
+    dm.prepare_data()
+    dm.setup()
+
+    ## Visuslisalise one or two MNIST dgits, with theyr labels as the title
+    sample_batch = next(iter(dm.train_dataloader()))
+    images, labels = sample_batch
+    plt.figure(figsize=(8, 4))
+    for i in range(8):
+        plt.subplot(2, 4, i+1)
+        plt.imshow(images[i].squeeze().numpy(), cmap='gray')
+        plt.title(f"Label: {labels[i].item()}")
+        plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    models = {
+        "AE": AE(latent_dim=128),
+        "VAE": VAE(latent_dim=128),
+        "IRMAE": IRMAE(latent_dim=128, num_linear_layers=8)
+    }
+    
+    histories = {}
+    trained_models = {}
+
+    # Train Loop
+    for name, model in models.items():
+        print(f"\n--- Training {name} ---")
+        history = LossHistory()
+        trainer = pl.Trainer(
+            max_epochs=5,
+            accelerator='auto',
+            devices=1,
+            enable_progress_bar=True,
+            logger=False,
+            enable_checkpointing=False,
+            callbacks=[history],
+            check_val_every_n_epoch=1
+        )
+        trainer.fit(model, dm)
+        
+        trained_models[name] = model
+        histories[name] = history
+
+    # Visualizations
+    print("\n--- Plotting Loss Curves ---")
+    plot_multiple_loss_curves(histories)
+
+    print("\n--- Generating Interpolations ---")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    visualize_interpolation(trained_models, dm.val_dataloader(), device)
+
+if __name__ == "__main__":
+    run_mnist_experiment()
 
