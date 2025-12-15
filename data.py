@@ -56,7 +56,7 @@ class SineWaveDataModule(pl.LightningDataModule):
 
 
 
-#%%
+#%% SpiralDataModule
 # ----------------------------------------------
 # PYTORCH DATASET (Kept external for cleaner separation)
 # ----------------------------------------------
@@ -83,21 +83,6 @@ class SpiralDataModule(pl.LightningDataModule):
         super().__init__()
         # Use save_hyperparameters to store all args and access via self.hparams
         self.save_hyperparameters()
-
-    # def _generate_data(self):
-    #     """Generates the 3D spiral data based on hparams."""
-    #     hp = self.hparams
-    #     t = np.linspace(0, 2 * np.pi * hp.revolutions, hp.num_points)
-    #     R = 1.0 * np.exp(-t / (2 * np.pi * hp.revolutions / (1 - hp.radius_decay)))
-        
-    #     # Parametric equations
-    #     x = R * np.cos(t) + np.random.normal(0, hp.noise_level, hp.num_points)
-    #     y = R * np.sin(t) + np.random.normal(0, hp.noise_level, hp.num_points)
-    #     z = (t / (2 * np.pi * hp.revolutions) * 4.0) + np.random.normal(0, hp.noise_level, hp.num_points)
-        
-    #     data = np.vstack([x, y, z]).T
-    #     data -= data.mean(axis=0) # Center the data
-    #     return data
 
     def _generate_data(self):
         """Generates a rolled plane (Swiss roll) embedded in 3D space."""
@@ -151,3 +136,119 @@ if __name__ == '__main__':
     print(f"Batch Y shape: {y.shape}")
 
 # %%
+
+
+# The data manipulation happens outside, in the DataModule.
+class ClusteredManifoldDataset(Dataset):
+    """Dataset returning the 3D data point (x) and its cluster label (y)."""
+    def __init__(self, data: np.ndarray, labels: np.ndarray):
+        self.data = torch.from_numpy(data).float()
+        self.labels = torch.from_numpy(labels).long()
+        
+    def __len__(self): return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx]
+
+# --- PyTorch Lightning DataModule (Updated) ---
+class SpiralClusteredDataModule(pl.LightningDataModule):
+    def __init__(self, batch_size=64, num_points=10000, num_clusters=5, 
+                 val_split=0.1, cluster_spread=0.5, noise_level=0.05):
+        super().__init__()
+        self.save_hyperparameters()
+        self.means = None # Will store the mean
+        self.stds = None  # Will store the standard deviation
+
+    def _generate_data(self):
+        # ... (Same data generation logic as before) ...
+        hp = self.hparams
+        
+        points_per_cluster_base = hp.num_points // hp.num_clusters
+        ## We want unequal cluster sizes, adding to the base number a random amount (their sum of this random array should be 0)
+        random_sizes = np.random.randint(-points_per_cluster_base//2, points_per_cluster_base//2, size=hp.num_clusters)
+        random_sizes -= random_sizes.mean().astype(np.int64)  # Center
+        points_per_cluster = points_per_cluster_base + random_sizes
+        ## Add any remainder due to float mean calculation to the first cluster
+        points_per_cluster[0] += hp.num_points - points_per_cluster.sum()
+
+        all_data, all_labels = [], []
+        center_thetas = np.random.uniform(0.5 * np.pi, 3.5 * np.pi, hp.num_clusters)
+        center_heights = np.random.uniform(-2.0, 2.0, hp.num_clusters)
+
+        for i in range(hp.num_clusters):
+            theta = np.random.normal(loc=center_thetas[i], scale=hp.cluster_spread, size=points_per_cluster[i])
+            height = np.random.normal(loc=center_heights[i], scale=hp.cluster_spread, size=points_per_cluster[i])
+            theta = np.clip(theta, 0, 4 * np.pi)
+            height = np.clip(height, -2, 2)
+
+            x = theta * np.cos(theta) + np.random.normal(0, hp.noise_level, points_per_cluster[i])
+            y = height + np.random.normal(0, hp.noise_level, points_per_cluster[i])
+            z = theta * np.sin(theta) + np.random.normal(0, hp.noise_level, points_per_cluster[i])
+
+            all_data.append(np.vstack([x, y, z]).T)
+            all_labels.append(np.full(points_per_cluster[i], i))
+
+        data = np.vstack(all_data)
+        labels = np.concatenate(all_labels)
+        perm = np.random.permutation(len(data))
+        return data[perm], labels[perm]
+
+    def setup(self, stage=None):
+        full_data, full_labels = self._generate_data()
+        
+        # 1. Split data (BEFORE NORMALIZATION)
+        val_len = int(self.hparams.val_split * len(full_data))
+        train_len = len(full_data) - val_len
+        
+        # Determine train and validation data arrays
+        train_data = full_data[:train_len]
+        train_labels = full_labels[:train_len]
+        val_data = full_data[train_len:]
+        val_labels = full_labels[train_len:]
+        
+        # 2. FIT: Calculate statistics ONLY on the training data
+        self.means = torch.from_numpy(train_data.mean(axis=0)).float()
+        self.stds = torch.from_numpy(train_data.std(axis=0)).float()
+        
+        # Ensure minimum std is used to prevent division by zero for constant features
+        # self.stds[self.stds < 1e-6] = 1.0 
+        
+        # 3. TRANSFORM: Apply normalization to both splits
+        
+        # Convert to torch tensor *before* normalization
+        train_data_t = torch.from_numpy(train_data).float()
+        val_data_t = torch.from_numpy(val_data).float()
+
+        # Apply standard scaling: (X - mean) / std
+        train_data_normalized = (train_data_t - self.means) / self.stds
+        val_data_normalized = (val_data_t - self.means) / self.stds
+        
+        # 4. Create Datasets (passing normalized data)
+        self.train_ds = ClusteredManifoldDataset(
+            train_data_normalized.numpy(), train_labels
+        )
+        self.val_ds = ClusteredManifoldDataset(
+            val_data_normalized.numpy(), val_labels
+        )
+
+    # Dataloader methods remain unchanged
+    def train_dataloader(self): 
+        return DataLoader(self.train_ds, batch_size=self.hparams.batch_size, shuffle=True)
+    
+    def val_dataloader(self):   
+        return DataLoader(self.val_ds, batch_size=self.hparams.batch_size)
+
+
+# --- Example Usage ---
+if __name__ == '__main__':
+    dm = SpiralClusteredDataModule(num_points=5000, batch_size=128)
+    dm.prepare_data() # Not strictly necessary here, but good practice
+    dm.setup()
+    
+    train_loader = dm.train_dataloader()
+    print(f"Total Train Samples: {len(dm.train_ds)}")
+    
+    # Check one batch
+    x, y = next(iter(train_loader))
+    print(f"Batch X shape: {x.shape}")
+    print(f"Batch Y (Labels) shape: {y.shape}")

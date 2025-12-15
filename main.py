@@ -8,6 +8,9 @@ import seaborn as sns
 import numpy as np
 sns.set(style='ticks')
 
+## Set the seeds for reproducibility
+pl.seed_everything(2026, workers=True)
+
 
 #%% RNN expriment 1: ID = 50
 def run_rnn_experiment():
@@ -92,11 +95,18 @@ def run_rnn_experiment():
     plt.title('Loss vs Hidden Size')
     plt.show()
 
-
-
 # if __name__ == "__main__":
 #     run_rnn_experiment()
 
+
+
+
+#%% [markdown]
+# Current ideas
+# - can the target span the basis of the succession of hidden states?
+# - to achieve a loss below a certain threshold, the hidden size must be at least X. PAC learning theory?
+# - informaiton theory angle; entropy, etc. (the init hidden state is maximum entropy, the RNN must reduce this to a low entropy representation that still allows accurate prediction)
+# - duplicate the output, so that the input to the MLP can be smaller than the output... (learning efficient representations)
 
 
 
@@ -148,7 +158,7 @@ def run_autoencoder_experiment():
     history = LossHistory()
     
     trainer = pl.Trainer(
-        max_epochs=100, 
+        max_epochs=1, 
         callbacks=[history], 
         enable_progress_bar=False, 
         logger=False,
@@ -173,32 +183,114 @@ def run_autoencoder_experiment():
     # --- 6. PCA Analysis on Latent Codes ---
     analyze_latent_space(model, dm.val_dataloader(), title_suffix=f"(Latent Dim {LATENT_DIM})")
 
-if __name__ == "__main__":
-    run_autoencoder_experiment()
-
-
-
-
-
-
+# if __name__ == "__main__":
+#     run_autoencoder_experiment()
 
 
 
 
 
 #%% [markdown]
-# Current ideas
-# - can the target span the basis of the succession of hidden states?
-# - to achieve a loss below a certain threshold, the hidden size must be at least X. PAC learning theory?
-# - informaiton theory angle; entropy, etc. (the init hidden state is maximum entropy, the RNN must reduce this to a low entropy representation that still allows accurate prediction)
-# - duplicate the output, so that the input to the MLP can be smaller than the output... (learning efficient representations)
-
-
 
 ## Experiments:
 # - Next, we can try and reconstruct MNIST: what is the low-dimensional hidden size that allows good reconstruction? (we know this empirically!)
 
+## To-Do:
+# - Let's find a force that will want to reduce the drop-off location of the sigmoid mask!#   - e.g., regularization on the sigmoid param to encourage smaller hidden usage
+
+
+
+
+
+
+
+
+
+#%%
+
+def run_clustering_experiment():
+    # --- 1. Setup Data ---
+
+    dm = SpiralClusteredDataModule(
+        batch_size=2048, 
+        num_points=15000, 
+        noise_level=0.05,
+        num_clusters=10,
+        cluster_spread=0.4,
+        val_split=0.5
+    )
+    dm.prepare_data() # Generate data
+    dm.setup()
+
+    # print(f"Total Train Samples: {dm.train_ds.dataset.labels}")
+    # Plot the training points
+    # indices = dm.train_ds.indices
+    X_train = dm.train_ds.data[:].numpy()
+    y_train = dm.train_ds.labels[:].numpy()
+
+    print("Min and Max of each dimension:", np.min(X_train, axis=0), np.max(X_train, axis=0))
+    print(f"Cluster sizes: {[np.sum(y_train==i) for i in range(dm.hparams.num_clusters)]}")
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # cmap='tab10' ensures integer labels (0-4) map to distinct colors
+    scatter = ax.scatter(X_train[:, 0], X_train[:, 1], X_train[:, 2], 
+                        c=y_train, cmap='tab10', s=2, alpha=0.6)
+
+    ax.legend(*scatter.legend_elements(), title="Cluster ID")
+    ax.set_title(f"Training Data: {len(X_train)} Points")
+    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+
+    plt.tight_layout()
+    plt.show()
+
+
+    # --- 2. Initialize Model ---
+    INPUT_DIM = dm.train_ds[0][0].shape[0] # Should be 3
+    LATENT_DIM = 2 # The maximum dimension to test (should be >= ambient dim)
+
+    print(f"--- Running Autoencoder Experiment (Input: {INPUT_DIM}, Max Latent: {LATENT_DIM}) ---")
+    
+    model = Autoencoder(
+        input_dim=INPUT_DIM, 
+        latent_dim=LATENT_DIM, 
+        lr=1e-3
+    )
+
+    # --- 3. Train Model ---
+    history = LossHistory()
+    
+    trainer = pl.Trainer(
+        max_epochs=2500, 
+        callbacks=[history], 
+        enable_progress_bar=False, 
+        check_val_every_n_epoch=1,
+        logger=False,
+    )
+    trainer.fit(model, dm)
+
+    # --- 4. Plot Loss Curves ---
+    plot_loss_curves(history, title=f"Training & Validation Loss (Latent Dim {LATENT_DIM})")
+    
+    print(f"Final Validation Loss: {history.val_loss[-1]:.6f}")
+
+    # --- 5. PCA/t-SNE/UMPA/Plotting of our latent codes ---
+    analyze_clustered_embeddings(model=model,
+                                ae_latent_dims=(0, 1), 
+                            #   dataloader=dm.val_dataloader(), 
+                                dataloader=dm.train_dataloader(), 
+                                title_suffix=f"(Latent Dim {LATENT_DIM})")
+
+if __name__ == "__main__":
+    run_clustering_experiment()
+
+
+
+
+
+#%% [markdown]
 
 ## To-Do:
 # - Let's find a force that will want to reduce the drop-off location of the sigmoid mask!#   - e.g., regularization on the sigmoid param to encourage smaller hidden usage
-#
+

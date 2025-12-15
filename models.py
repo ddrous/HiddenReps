@@ -188,6 +188,84 @@ class AutoencoderSigmoid(pl.LightningModule):
 
 
 
+
+
+
+
+
+
+
+class Autoencoder(pl.LightningModule):
+    def __init__(self, input_dim: int, latent_dim: int, lr: float = 1e-3):
+        """
+        Autoencoder.
+
+        Args:
+            input_dim (int): Dimension of the input data (3 for the spiral data).
+            latent_dim (int): latent dimension (e.g., 2 or 3).
+            lr (float): Learning rate for the optimizer.
+        """
+        super().__init__()
+        # Save all arguments as hyperparameters for checkpointing and logging
+        self.save_hyperparameters()
+        
+        # 1. Encoder: Maps input_dim (3) to latent_dim (e.g., 3)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, latent_dim) # Output: latent code z
+        )
+        
+        # 2. Decoder: Maps latent_dim (e.g., 3) back to input_dim (3)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, input_dim) # Output: reconstructed data x_hat
+        )
+
+        # Loss and Optimizer
+        self.criterion = nn.MSELoss()
+
+    def forward(self, x):
+        z = self.encoder(x)
+
+        x_hat = self.decoder(z)
+        
+        return x_hat, z
+
+    def _shared_step(self, batch):
+        x, y = batch # x is input, y is target (x for reconstruction)
+        x_hat, z = self(x)
+
+        # Reconstruction Loss (L_rec)
+        loss = self.criterion(x_hat, x)
+        
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        loss = self._shared_step(batch)
+        self.log_dict({'train_loss': loss}, 
+                      prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        loss = self._shared_step(batch)
+        self.log_dict({'val_loss': loss}, 
+                      prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+
+
+
+
+
 #%% Plot this sigmoid
 
 if __name__ == "__main__":
