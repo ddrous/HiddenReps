@@ -14,7 +14,7 @@ sns.set(style="white")
 
 # jax.print_environment_info()
 
-from data import *
+from data import SpiralDataHandler
 from models import *
 from analysis import *
 
