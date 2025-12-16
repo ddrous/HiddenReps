@@ -1,0 +1,530 @@
+2025-12-16 23:14:59.278246: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:479] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2025-12-16 23:14:59.288293: E external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:10575] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2025-12-16 23:14:59.288315: E external/local_xla/xla/stream_executor/cuda/cuda_blas.cc:1442] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+2025-12-16 23:14:59.672785: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+📂 Global Experiment Directory: ../runs/16122025-231500
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 100
+============================================================
+Generating 100 points across 10 clusters.
+   ⏱ Training finished in 2.58s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 80 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_100)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5911 |   0.9662 |  3.369e-02 |    0.921 |     0.574 |  0.848
+PCA                    |   0.6611 |   1.0000 |  4.070e-02 |    0.875 |     0.568 |  0.836
+Kernel PCA             |   0.6513 |   0.9345 |  2.854e-02 |    0.851 |     0.630 |  0.867
+t-SNE                  |   0.6721 |   0.9927 |  1.122e-01 |    0.821 |     0.576 |  0.784
+UMAP                   |   0.6108 |   0.9459 |  4.480e-01 |    0.911 |     0.370 |  0.463
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 100
+============================================================
+Generating 100 points across 10 clusters.
+   ⏱ Training finished in 2.24s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 80 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_100)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5911 |   0.9702 |  5.167e-02 |    0.867 |     0.595 |  0.810
+PCA                    |   0.6611 |   1.0000 |  4.070e-02 |    0.875 |     0.568 |  0.836
+Kernel PCA             |   0.6513 |   0.9345 |  2.854e-02 |    0.851 |     0.630 |  0.867
+t-SNE                  |   0.6721 |   0.9927 |  1.122e-01 |    0.821 |     0.576 |  0.784
+UMAP                   |   0.6108 |   0.9459 |  4.480e-01 |    0.911 |     0.370 |  0.463
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 200
+============================================================
+Generating 200 points across 10 clusters.
+   ⏱ Training finished in 3.31s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 160 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_200)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5746 |   0.9871 |  4.567e-02 |    0.872 |     0.579 |  0.816
+PCA                    |   0.5957 |   1.0000 |  4.275e-02 |    0.923 |     0.537 |  0.818
+Kernel PCA             |   0.6503 |   0.9607 |  2.705e-02 |    0.812 |     0.636 |  0.852
+t-SNE                  |   0.6454 |   0.9963 |  4.713e-02 |    0.929 |     0.612 |  0.864
+UMAP                   |   0.7040 |   0.9812 |  1.122e-01 |    0.877 |     0.451 |  0.719
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 200
+============================================================
+Generating 200 points across 10 clusters.
+   ⏱ Training finished in 3.64s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 160 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_200)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5731 |   0.9875 |  6.297e-02 |    0.814 |     0.590 |  0.794
+PCA                    |   0.5957 |   1.0000 |  4.275e-02 |    0.923 |     0.537 |  0.818
+Kernel PCA             |   0.6503 |   0.9607 |  2.705e-02 |    0.812 |     0.636 |  0.852
+t-SNE                  |   0.6454 |   0.9963 |  4.713e-02 |    0.929 |     0.612 |  0.864
+UMAP                   |   0.7040 |   0.9812 |  1.122e-01 |    0.877 |     0.451 |  0.719
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 300
+============================================================
+Generating 300 points across 10 clusters.
+   ⏱ Training finished in 4.60s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 240 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_300)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5948 |   0.9943 |  1.210e-01 |    0.846 |     0.555 |  0.693
+PCA                    |   0.5744 |   1.0000 |  4.694e-02 |    0.982 |     0.495 |  0.807
+Kernel PCA             |   0.6448 |   0.9714 |  2.819e-02 |    0.842 |     0.614 |  0.846
+t-SNE                  |   0.7268 |   0.9971 |  2.123e-01 |    0.924 |     0.499 |  0.597
+UMAP                   |   0.6934 |   0.9905 |  1.993e-01 |    0.956 |     0.431 |  0.618
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 300
+============================================================
+Generating 300 points across 10 clusters.
+   ⏱ Training finished in 4.89s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 240 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_300)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5887 |   0.9902 |  1.719e-01 |    0.847 |     0.519 |  0.612
+PCA                    |   0.5744 |   1.0000 |  4.694e-02 |    0.982 |     0.495 |  0.807
+Kernel PCA             |   0.6448 |   0.9714 |  2.819e-02 |    0.842 |     0.614 |  0.846
+t-SNE                  |   0.7268 |   0.9971 |  2.123e-01 |    0.924 |     0.499 |  0.597
+UMAP                   |   0.6934 |   0.9905 |  1.993e-01 |    0.956 |     0.431 |  0.618
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 400
+============================================================
+Generating 400 points across 10 clusters.
+   ⏱ Training finished in 7.41s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 320 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_400)
+Embedding              | NMI      | Trust   /home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+ | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5640 |   0.9966 |  1.239e-01 |    0.845 |     0.551 |  0.667
+PCA                    |   0.5164 |   1.0000 |  4.926e-02 |    0.968 |     0.496 |  0.800
+Kernel PCA             |   0.6216 |   0.9614 |  2.759e-02 |    0.847 |     0.614 |  0.848
+t-SNE                  |   0.6313 |   0.9985 |  2.268e-02 |    0.925 |     0.540 |  0.870
+UMAP                   |   0.7628 |   0.9944 |  2.989e-01 |    0.882 |     0.402 |  0.542
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 400
+============================================================
+Generating 400 points across 10 clusters.
+   ⏱ Training finished in 7.57s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 320 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_400)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.4970 |   0.9955 |  1.673e-01 |    0.804 |     0.535 |  0.615
+PCA                    |   0.5164 |   1.0000 |  4.926e-02 |    0.968 |     0.496 |  0.800
+Kernel PCA             |   0.6216 |   0.9614 |  2.759e-02 |    0.847 |     0.614 |  0.848
+t-SNE                  |   0.6313 |   0.9985 |  2.268e-02 |    0.925 |     0.540 |  0.870
+UMAP                   |   0.7628 |   0.9944 |  2.989e-01 |    0.882 |     0.402 |  0.542
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 500
+============================================================
+Generating 500 points across 10 clusters.
+   ⏱ Training finished in 9.03s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 400 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_500)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5275 |   0.9971 |  1.113e-01 |    0.830 |     0.555 |  0.689
+PCA                    |   0.5397 |   1.0000 |  5.296e-02 |    0.966 |     0.494 |  0.792
+Kernel PCA             |   0.6061 |   0.9700 |  3.537e-02 |    0.813 |     0.619 |  0.825
+t-SNE                  |   0.6522 |   0.9983 |  1.487e-02 |    0.938 |     0.540 |  0.900
+UMAP                   |   0.6743 |   0.9946 |  4.512e-02 |    0.938 |     0.540 |  0.800
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 500
+============================================================
+Generating 500 points across 10 clusters.
+   ⏱ Training finished in 9.02s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 400 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_500)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5735 |   0.9961 |  1.226e-01 |    0.742 |     0.568 |  0.701
+PCA                    |   0.5397 |   1.0000 |  5.296e-02 |    0.966 |     0.494 |  0.792
+Kernel PCA             |   0.6061 |   0.9700 |  3.537e-02 |    0.813 |     0.619 |  0.825
+t-SNE                  |   0.6522 |   0.9983 |  1.487e-02 |    0.938 |     0.540 |  0.900
+UMAP                   |   0.6743 |   0.9946 |  4.512e-02 |    0.938 |     0.540 |  0.800
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 600
+============================================================
+Generating 600 points across 10 clusters.
+   ⏱ Training finished in 10.23s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 480 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_600)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.6058 |   0.9986 |  1.047e-01 |    0.776 |     0.571 |  0.723
+PCA                    |   0.5485 |   1.0000 |  5.223e-02 |    0.967 |     0.508 |  0.800
+Kernel PCA             |   0.6011 |   0.9687 |  3.209e-02 |    0.809 |     0.632 |  0.839
+t-SNE                  |   0.6769 |   0.9984 |  4.182e-02 |    0.902 |     0.540 |  0.818
+UMAP                   |   0.7317 |   0.9950 |  3.022e-01 |    0.774 |     0.357 |  0.475
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 600
+============================================================
+Generating 600 points across 10 clusters.
+   ⏱ Training finished in 10.79s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 480 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_600)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5539 |   0.9976 |  1.269e-01 |    0.760 |     0.567 |  0.690
+PCA                    |   0.5485 |   1.0000 |  5.223e-02 |    0.967 |     0.508 |  0.800
+Kernel PCA             |   0.6011 |   0.9687 |  3.209e-02 |    0.809 |     0.632 |  0.839
+t-SNE                  |   0.6769 |   0.9984 |  4.182e-02 |    0.902 |     0.540 |  0.818
+UMAP                   |   0.7317 |   0.9950 |  3.022e-01 |    0.774 |     0.357 |  0.475
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 700
+============================================================
+Generating 700 points across 10 clusters.
+   ⏱ Training finished in 11.97s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 560 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_700)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5455 |   0.9982 |  1.779e-01 |    0.825 |     0.537 |  0.614
+PCA                    |   0.5540 |   1.0000 |  4.350e-02 |    0.982 |     0.482 |  0.808
+Kernel PCA             |   0.6329 |   0.9633 |  2.751e-02 |    0.844 |     0.614 |  0.842
+t-SNE                  |   0.6177 |   0.9985 |  5.577e-02 |    0.950 |     0.507 |  0.788
+UMAP                   |   0.6427 |   0.9955 |  4.824e-02 |    0.895 |     0.521 |  0.813
+================================================================================
+
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+/home/gb21553/miniconda3/envs/jax/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 700
+============================================================
+Generating 700 points across 10 clusters.
+   ⏱ Training finished in 12.08s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 560 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_700)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.4141 |   0.9962 |  1.956e-01 |    0.755 |     0.523 |  0.565
+PCA                    |   0.5540 |   1.0000 |  4.350e-02 |    0.982 |     0.482 |  0.808
+Kernel PCA             |   0.6329 |   0.9633 |  2.751e-02 |    0.844 |     0.614 |  0.842
+t-SNE                  |   0.6177 |   0.9985 |  5.577e-02 |    0.950 |     0.507 |  0.788
+UMAP                   |   0.6427 |   0.9955 |  4.824e-02 |    0.895 |     0.521 |  0.813
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 800
+============================================================
+Generating 800 points across 10 clusters.
+   ⏱ Training finished in 14.33s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 640 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_800)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.4113 |   0.9974 |  1.641e-01 |    0.806 |     0.539 |  0.607
+PCA                    |   0.5373 |   1.0000 |  4.863e-02 |    0.976 |     0.488 |  0.798
+Kernel PCA             |   0.6180 |   0.9667 |  2.773e-02 |    0.793 |     0.631 |  0.841
+t-SNE                  |   0.5932 |   0.9985 |  4.858e-02 |    0.918 |     0.495 |  0.791
+UMAP                   |   0.6168 |   0.9955 |  3.063e-02 |    0.934 |     0.514 |  0.850
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 800
+============================================================
+Generating 800 points across 10 clusters.
+   ⏱ Training finished in 14.95s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 640 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_800)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5645 |   0.9973 |  1.118e-01 |    0.775 |     0.574 |  0.729
+PCA                    |   0.5373 |   1.0000 |  4.863e-02 |    0.976 |     0.488 |  0.798
+Kernel PCA             |   0.6180 |   0.9667 |  2.773e-02 |    0.793 |     0.631 |  0.841
+t-SNE                  |   0.5932 |   0.9985 |  4.858e-02 |    0.918 |     0.495 |  0.791
+UMAP                   |   0.6168 |   0.9955 |  3.063e-02 |    0.934 |     0.514 |  0.850
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 900
+============================================================
+Generating 900 points across 10 clusters.
+   ⏱ Training finished in 15.78s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 720 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_900)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5418 |   0.9984 |  4.643e-02 |    0.724 |     0.622 |  0.801
+PCA                    |   0.5329 |   1.0000 |  4.221e-02 |    0.984 |     0.496 |  0.814
+Kernel PCA             |   0.6207 |   0.9644 |  2.895e-02 |    0.838 |     0.617 |  0.839
+t-SNE                  |   0.5458 |   0.9987 |  9.363e-02 |    0.948 |     0.490 |  0.723
+UMAP                   |   0.7364 |   0.9962 |  1.788e-01 |    0.752 |     0.430 |  0.579
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 900
+============================================================
+Generating 900 points across 10 clusters.
+   ⏱ Training finished in 16.13s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 720 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_900)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5842 |   0.9978 |  5.680e-02 |    0.706 |     0.615 |  0.800
+PCA                    |   0.5329 |   1.0000 |  4.221e-02 |    0.984 |     0.496 |  0.814
+Kernel PCA             |   0.6207 |   0.9644 |  2.895e-02 |    0.838 |     0.617 |  0.839
+t-SNE                  |   0.5458 |   0.9987 |  9.363e-02 |    0.948 |     0.490 |  0.723
+UMAP                   |   0.7364 |   0.9962 |  1.788e-01 |    0.752 |     0.430 |  0.579
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Standard AE | Data Size: 1000
+============================================================
+Generating 1000 points across 10 clusters.
+   ⏱ Training finished in 17.40s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 800 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Standard AE_1000)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5942 |   0.9988 |  5.826e-02 |    0.765 |     0.607 |  0.795
+PCA                    |   0.5206 |   1.0000 |  4.677e-02 |    0.978 |     0.498 |  0.805
+Kernel PCA             |   0.6320 |   0.9632 |  3.321e-02 |    0.834 |     0.611 |  0.828
+t-SNE                  |   0.6204 |   0.9989 |  8.316e-02 |    0.876 |     0.496 |  0.727
+UMAP                   |   0.6809 |   0.9968 |  2.910e-01 |    0.822 |     0.461 |  0.536
+================================================================================
+
+
+============================================================
+🚀 RUNNING: Taylor AE | Data Size: 1000
+============================================================
+Generating 1000 points across 10 clusters.
+   ⏱ Training finished in 17.98s
+✅ Run saved to ../runs/16122025-231500
+Collecting data for analysis...
+Computing embeddings for 800 points...
+Running Kernel PCA...
+Running t-SNE...
+Running UMAP...
+
+================================================================================
+⚡️ Embedding Quality Metrics (Taylor AE_1000)
+Embedding              | NMI      | Trust    | Proc-MSE ↓ | Max|ρ| ↑ | Mean|ρ| ↑ | R² ↑
+/home/gb21553/Projects/HiddenReps/jax/sample_size_exp.py:149: RuntimeWarning: More than 20 figures have been opened. Figures created through the pyplot interface (`matplotlib.pyplot.figure`) are retained until explicitly closed and may consume too much memory. (To control this warning, see the rcParam `figure.max_open_warning`). Consider using `matplotlib.pyplot.close()`.
+  fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+--------------------------------------------------------------------------------
+AE (Latents)           |   0.5572 |   0.9978 |  7.411e-02 |    0.731 |     0.598 |  0.765
+PCA                    |   0.5206 |   1.0000 |  4.677e-02 |    0.978 |     0.498 |  0.805
+Kernel PCA             |   0.6320 |   0.9632 |  3.321e-02 |    0.834 |     0.611 |  0.828
+t-SNE                  |   0.6204 |   0.9989 |  8.316e-02 |    0.876 |     0.496 |  0.727
+UMAP                   |   0.6809 |   0.9968 |  2.910e-01 |    0.822 |     0.461 |  0.536
+================================================================================
+
+
+--- Generating Comparative Plots ---
+✅ Comparison plot saved to: ../runs/16122025-231500/experiment_comparison.png
