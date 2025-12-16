@@ -59,7 +59,8 @@ class SpiralDataHandler:
     def _generate_data(self):
         # Exact replication of the logic from original data.py
         points_per_cluster_base = self.num_points // self.num_clusters
-        
+        print(f"Generating {self.num_points} points across {self.num_clusters} clusters.")
+
         # Unequal cluster sizes
         random_sizes = self.rng.integers(-points_per_cluster_base//2, points_per_cluster_base//2, size=self.num_clusters)
         random_sizes -= int(random_sizes.mean())
@@ -133,3 +134,32 @@ class SpiralDataHandler:
         if split == 'train':
             return jnp.array(self.train_data), jnp.array(self.train_labels)
         return jnp.array(self.val_data), jnp.array(self.val_labels)
+
+    def compute_true_latents(self, split='train', normalize=True):
+        """
+        Compute the intrinsic 2D coordinates (theta, height)
+        underlying the spiral structure.
+        
+        Returns:
+            latents: jnp.array of shape (N, 2)
+        """
+        # Get normalized data
+        if split == 'train':
+            data = self.train_data
+        else:
+            data = self.val_data
+
+        # Un-normalize
+        data = data * self.stds + self.means
+        x, y, z = data[:, 0], data[:, 1], data[:, 2]
+
+        # Intrinsic coordinates
+        theta = np.sqrt(x**2 + z**2)
+        height = y
+
+        latents = np.stack([theta, height], axis=1)
+
+        if normalize:
+            latents = (latents - latents.mean(axis=0)) / (latents.std(axis=0) + 1e-6)
+
+        return jnp.array(latents, dtype=jnp.float32)
