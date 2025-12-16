@@ -1,2 +1,8 @@
 checkpoints/*
+torch/checkpoints/*
 data/*
+__pycache__/*
+torch/__pycache__/*
+jax/__pycache__/*
+*.pyc
+runs/*

@@ -248,7 +248,7 @@ def run_clustering_experiment():
 
     # --- 2. Initialize Model ---
     INPUT_DIM = dm.train_ds[0][0].shape[0] # Should be 3
-    LATENT_DIM = 1 # The maximum dimension to test (should be >= ambient dim)
+    LATENT_DIM = 2 # The maximum dimension to test (should be >= ambient dim)
 
     print(f"--- Running Autoencoder Experiment (Input: {INPUT_DIM}, Max Latent: {LATENT_DIM}) ---")
     
@@ -282,8 +282,8 @@ def run_clustering_experiment():
                                 dataloader=dm.train_dataloader(), 
                                 title_suffix=f"(Latent Dim {LATENT_DIM})")
 
-# if __name__ == "__main__":
-#     run_clustering_experiment()
+if __name__ == "__main__":
+    run_clustering_experiment()
 
 
 
@@ -339,7 +339,7 @@ def run_mnist_experiment():
         print(f"\n--- Training {name} ---")
         history = LossHistory()
         trainer = pl.Trainer(
-            max_epochs=5,
+            max_epochs=100,
             accelerator='auto',
             devices=1,
             enable_progress_bar=True,
@@ -361,6 +361,6 @@ def run_mnist_experiment():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     visualize_interpolation(trained_models, dm.val_dataloader(), device)
 
-if __name__ == "__main__":
-    run_mnist_experiment()
+# if __name__ == "__main__":
+#     run_mnist_experiment()
 
