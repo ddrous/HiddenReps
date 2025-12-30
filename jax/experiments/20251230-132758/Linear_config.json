@@ -1,0 +1,7 @@
+{
+    "lr": 0.01,
+    "batch_size": 32,
+    "epochs": 1000,
+    "seed": 42,
+    "noise_std": 0.5
+}
