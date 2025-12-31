@@ -1,3 +1,9 @@
+#%% [markdown]
+# - Key takeways. Increasign the radius of TaylorMLP turns it into a linear model. (Overparametrised, but behaves like a linear model).
+# - This benefit works during OOD generalization as well, the model remains linear.
+# - Turn this into a Energy-based model, by adding a context vector for each data point. We do Taylor expansion around the context. During inference, we can optimize the context to minimize energy.
+# - y*,c* = argmin E_{\theta}(x,y,c) during training and infence.
+
 #%%
 import jax
 import jax.numpy as jnp
@@ -202,6 +208,57 @@ class MLPModel(eqx.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+    
+class TaylorMLP(eqx.Module):
+    layers: list
+    radius: float
+
+    def __init__(self, key, input_dim=1, hidden_dim=64, output_dim=1, radius=0.1):
+        key1, key2, key3 = jax.random.split(key, 3)
+        self.layers = [
+            eqx.nn.Linear(input_dim, hidden_dim, key=key1),
+            jax.nn.relu,
+            eqx.nn.Linear(hidden_dim, hidden_dim, key=key2),
+            jax.nn.relu,
+            eqx.nn.Linear(hidden_dim, output_dim, key=key3)
+        ]
+        self.radius = radius
+
+    def _base_forward(self, x):
+        """Standard MLP forward pass for a single point."""
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+    def __call__(self, x, key=None):
+        """
+        Forward pass with Taylor Expansion.
+        
+        Args:
+            x: Input batch of shape (Batch, Dim)
+            key: JAX PRNGKey. If provided, applies random Taylor expansion.
+                 If None, falls back to standard MLP behavior (x0 = x).
+        """
+        # If no key is provided (e.g., during simple inference), standard forward
+        if key is None:
+            return jax.vmap(self._base_forward)(x)
+
+        # 1. Sample x0 (Random neighbor within radius)
+        # x0 = x + epsilon, where epsilon ~ Uniform(-radius, radius)
+        epsilon = jax.random.uniform(key, x.shape, minval=-self.radius, maxval=self.radius)
+        x0 = x + epsilon
+
+        # 2. Define the Taylor Expansion logic for a single point
+        def taylor_approx(xi, x0i):
+            # We want: f(x) ≈ f(x0) + J(x0) @ (x - x0)
+            # eqx.filter_jvp computes f(primal) and J(primal) @ tangent
+            # Here: primal = x0i, tangent = (xi - x0i)
+            
+            f_x0, df_x0_dx_diff = eqx.filter_jvp(self._base_forward, (x0i,), (xi - x0i,))
+            return f_x0 + df_x0_dx_diff
+
+        # 3. Apply over the batch
+        return jax.vmap(taylor_approx)(x, x0)
 
 # --- TRAINING CONFIGURATION ---
 TRAIN = True
@@ -210,7 +267,7 @@ CONFIG = {
     "lr": 0.01,
     "batch_size": 32,
     "epochs": 1000,
-    "seed": 42,
+    "seed": time.time_ns() % 2**32,
     "noise_std": 0.5
 }
 
@@ -268,15 +325,18 @@ dm = SimpleDataHandler(X_train, Y_train, CONFIG["batch_size"])
 key = jax.random.PRNGKey(SEED)
 models_config = [
     ("Linear", LinearModel(key)),
-    ("MLP", MLPModel(key))
+    ("MLP", MLPModel(key)),
+    ("TaylorMLP", TaylorMLP(key, radius=1.05))
 ]
-
 # 2. Train or Load
 if TRAIN:
     run_dir = get_run_path()
     print(f"🚀 Starting Training. Run ID: {run_dir.name}")
     
     trained_models = [] # Store (name, model, history)
+    
+    # Main training key
+    train_key = jax.random.PRNGKey(CONFIG["seed"])
 
     for name, model in models_config:
         print(f"\nTraining {name}...")
@@ -284,13 +344,18 @@ if TRAIN:
         opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
         @eqx.filter_value_and_grad
-        def compute_loss(model, x, y):
-            pred = jax.vmap(model)(x)
+        def compute_loss(model, x, y, key):
+            if isinstance(model, TaylorMLP):
+                pred = model(x, key=key)
+            else:
+                # Fallback for models that don't accept/need a key
+                pred = jax.vmap(model)(x)
+                
             return jnp.mean((pred - y) ** 2)
 
         @eqx.filter_jit
-        def make_step(model, opt_state, x, y):
-            loss, grads = compute_loss(model, x, y)
+        def make_step(model, opt_state, x, y, key):
+            loss, grads = compute_loss(model, x, y, key)
             updates, opt_state = optimizer.update(grads, opt_state, model)
             model = eqx.apply_updates(model, updates)
             return model, opt_state, loss
@@ -301,7 +366,10 @@ if TRAIN:
         for epoch in range(CONFIG["epochs"]):
             batch_losses = []
             for bx, by in dm.get_iterator():
-                model, opt_state, loss = make_step(model, opt_state, bx, by)
+                # Split key for every step to ensure randomness
+                train_key, step_key = jax.random.split(train_key)
+                
+                model, opt_state, loss = make_step(model, opt_state, bx, by, step_key)
                 batch_losses.append(loss)
             loss_history.append(np.mean(batch_losses))
         
@@ -327,14 +395,14 @@ else:
         except FileNotFoundError:
             print(f"Could not find model file for {name}")
 
-
 #%%
 # --- ANALYSIS & PLOTTING ---
+colors = ['darkred', 'darkgreen', 'magenta'] # Distinct colors for models
 
 # 1. Loss Curves
 plt.figure(figsize=(10, 5))
-for name, _, history in trained_models:
-    plt.plot(history['train_loss'], label=f"{name} Train Loss", linewidth=2)
+for i, (name, _, history) in enumerate(trained_models):
+    plt.plot(history['train_loss'], label=f"{name} Train Loss", linewidth=2, color=colors[i])
 plt.xlabel("Epochs")
 plt.ylabel("MSE Loss")
 plt.yscale('log')
@@ -350,31 +418,36 @@ plt.figure(figsize=(12, 8))
 
 # Calculate Test Metrics and Plot Fits
 x_grid = jnp.linspace(-1.5, 1.5, 500)[:, None] # Covers both train and test range
-colors = ['darkred', 'darkgreen', 'purple'] # Distinct colors for models
 
 for i, (name, model, _) in enumerate(trained_models):
-    # Predict on grid for visualization
-    y_grid = jax.vmap(model)(x_grid)
+    # TaylorMLP is batch-native and accepts 'key'.
+    # Standard models (Linear, MLP) are single-point native and do not accept 'key'.
+    if isinstance(model, TaylorMLP):
+        # Try batch call with key (TaylorMLP path)
+        y_grid = model(x_grid, key=None)
+        y_test_pred = model(X_test, key=None)
+    else:
+        # Fallback: vmap over single-point models (Linear/MLP path)
+        y_grid = jax.vmap(model)(x_grid)
+        y_test_pred = jax.vmap(model)(X_test)
     
-    # Predict on Test set for MSE
-    y_test_pred = jax.vmap(model)(X_test)
     test_mse = jnp.mean((y_test_pred - Y_test)**2)
-    
+        
     plt.plot(x_grid, y_grid, color=colors[i], linewidth=4, 
-             label=f"{name} (Test MSE: {test_mse:.6f})")
+            label=f"{name} (Test MSE: {test_mse:.6f})")
 
 # Plot Data
 # Train Data (Blue shades)
 for seg in np.unique(train_segs):
     mask = train_segs == seg
     plt.scatter(train_data[mask, 0], train_data[mask, 1], 
-                color=plt.cm.Blues(0.5 + seg*0.1), alpha=0.4, label=f"Train Seg {int(seg)}")
+                color=plt.cm.Blues(0.5 + seg*0.1), alpha=0.4, label=f"Train Seg {int(seg)}", s=10)
 
 # Test Data (Orange shades)
 for seg in np.unique(test_segs):
     mask = test_segs == seg
     plt.scatter(test_data[mask, 0], test_data[mask, 1], 
-                color=plt.cm.Oranges(0.5 + seg*0.1), alpha=0.4, label=f"Test Seg {int(seg)}")
+                color=plt.cm.Oranges(0.5 + seg*0.1), alpha=0.4, label=f"Test Seg {int(seg)}", s=10)
 
 plt.title("Model Predictions vs Locally Linear Data")
 plt.xlabel("X")
