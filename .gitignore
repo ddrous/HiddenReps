@@ -1,9 +1,10 @@
 checkpoints/*
-torch/checkpoints/*
+torch_hiddenreps/checkpoints/*
 data/*
 __pycache__/*
 torch/__pycache__/*
 jax/__pycache__/*
 *.pyc
 runs/*
-jax/experiments/*
+jax_hiddenreps/experiments/*
+neural_data_flow/experiments/*
