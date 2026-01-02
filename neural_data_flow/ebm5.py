@@ -8,7 +8,7 @@ import optax
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-sns.set(style="white")
+sns.set(style="white", context="talk")
 from pathlib import Path
 import time
 import json
@@ -28,11 +28,11 @@ CONFIG = {
     "context_init": "zero", # "zero" or "random"
     
     # Inner Loop Hyperparameters
-    "inner_gd_steps": 10,
+    "inner_gd_steps": 20,
     "inner_gd_lr": 0.1, 
     
     # Model Hyperparameters
-    "taylor_radius": 0.01,
+    "taylor_radius": 0.5,
     "context_dim": 1,
     "width_size": 32,
     "noise_std": 0.015,
@@ -251,6 +251,72 @@ class BaseEBM(eqx.Module):
         pred, _ = self(x)
         return pred
 
+class TaylorBaseEBM(eqx.Module):
+    neuralnet: eqx.nn.MLP
+    y_mean: float
+    radius: float
+    
+    def __init__(self, key, y_mean=0.0, radius=0.2, context_dim=None):
+        self.neuralnet = eqx.nn.MLP(in_size=2, out_size=1, width_size=width_size, depth=3, 
+                                    activation=jax.nn.swish, key=key)
+        self.y_mean = y_mean
+        self.radius = radius
+
+    def energy(self, x, y):
+        inp = jnp.concatenate([x, y], axis=0)
+        return jnp.squeeze(self.neuralnet(inp))
+
+    def _solve_y(self, x, key=None):
+        y_init = jnp.array([self.y_mean])
+        opt = optax.adam(inner_gd_lr)
+        opt_state = opt.init(y_init)
+
+        # Logic for Taylor Sampling of x0
+        if key is not None:
+            epsilon = jax.random.uniform(key, x.shape, minval=-self.radius, maxval=self.radius)
+            x0 = x + epsilon
+        else:
+            x0 = x # Placeholder, won't be used if key is None
+
+        def step(state, _):
+            y_curr, opt_state = state
+            
+            # Define Loss Function
+            def loss_fn(y_arg):
+                if key is None:
+                    # Standard Energy
+                    return self.energy(x, y_arg)
+                else:
+                    # Taylor Expanded Energy wrt X around X0
+                    # E(x, y) ~ E(x0, y) + dE/dx(x0, y) * (x - x0)
+                    
+                    def energy_wrt_x(x_in):
+                        return self.energy(x_in, y_arg)
+                    
+                    val, grad_dot = jax.jvp(energy_wrt_x, (x0,), (x - x0,))
+                    return val + grad_dot
+
+            grads = jax.grad(loss_fn)(y_curr)
+            updates, opt_state = opt.update(grads, opt_state, y_curr)
+            y_next = optax.apply_updates(y_curr, updates)
+            return (y_next, opt_state), None
+
+        (y_final, _), _ = jax.lax.scan(step, (y_init, opt_state), None, length=inner_gd_steps)
+        return y_final
+
+    def __call__(self, x, c=None, key=None):
+        # We need to split keys for vmap if we are in training (key provided)
+        if key is not None:
+            keys = jax.random.split(key, x.shape[0])
+            return jax.vmap(self._solve_y)(x, keys), None
+        else:
+            return jax.vmap(self._solve_y)(x, None), None
+
+    def predict(self, x):
+        # Disable Taylor by passing key=None
+        pred, _ = self(x, key=None)
+        return pred
+
 # --- PAM COMPATIBLE CLASSES ---
 
 class Contexts(eqx.Module):
@@ -449,7 +515,7 @@ class ContextEBM(eqx.Module):
     def predict(self, x):
         return self.nn.predict(x)
 
-class TaylorEBM(eqx.Module):
+class TaylorContextEBM(eqx.Module):
     nn: TaylorEBMNet
     ctx: Contexts
     def __init__(self, key, num_train_samples, y_mean=0.0, context_dim=1):
@@ -477,10 +543,11 @@ if TRAIN:
     models_config = [
         # ("Linear", LinearModel(key)),
         # ("MLP", MLPModel(key)),
-        # ("TaylorMLP", TaylorMLP(key, radius=CONFIG["taylor_radius"])),
-        # ("BaseEBM", BaseEBM(key, y_mean)),
+        ("TaylorMLP", TaylorMLP(key, radius=CONFIG["taylor_radius"])),
+        ("BaseEBM", BaseEBM(key, y_mean)),
+        ("TaylorBaseEBM", TaylorBaseEBM(key, y_mean, radius=CONFIG["taylor_radius"])),
         # ("ContextEBM", ContextEBM(key, num_train, y_mean, c_dim)),
-        ("TaylorEBM", TaylorEBM(key, num_train, y_mean, c_dim))
+        # ("TaylorContextEBM", TaylorContextEBM(key, num_train, y_mean, c_dim))
     ]
 
     for name, model in models_config:
@@ -630,7 +697,7 @@ else:
 
 #%%
 # --- 6. ANALYSIS & PLOTTING ---
-colors = ['black', 'green', 'blue', 'orange', 'red', 'purple']
+colors = ['black', 'green', 'blue', 'orange', 'red', 'purple', 'brown']
 
 # 1. Loss Curves
 plt.figure(figsize=(10, 5))
