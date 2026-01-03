@@ -8,3 +8,6 @@ jax/__pycache__/*
 runs/*
 jax_hiddenreps/experiments/*
 neural_data_flow/experiments/*
+
+neural_data_flow/experiments/*
+limit_weight_space/experiments/*
