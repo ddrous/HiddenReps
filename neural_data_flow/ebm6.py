@@ -215,13 +215,14 @@ class LinearModel(eqx.Module):
         pred, _ = self(x)
         return pred
 
+width_size = CONFIG["width_size"]
 class MLPModel(eqx.Module):
     layers: list
     def __init__(self, key, context_dim=None):
         k1, k2, k3 = jax.random.split(key, 3)
-        self.layers = [eqx.nn.Linear(1, 64, key=k1), jax.nn.relu,
-                       eqx.nn.Linear(64, 64, key=k2), jax.nn.relu,
-                       eqx.nn.Linear(64, 1, key=k3)]
+        self.layers = [eqx.nn.Linear(1, width_size, key=k1), jax.nn.relu,
+                       eqx.nn.Linear(width_size, width_size, key=k2), jax.nn.relu,
+                       eqx.nn.Linear(width_size, 1, key=k3)]
     def _forward(self, x):
         for l in self.layers: x = l(x)
         return x
@@ -684,7 +685,7 @@ if TRAIN:
     models_config = [
         # ("Linear", LinearModel(key)),
         ("MLP", MLPModel(key)),
-        ("TaylorMLP", TaylorMLP(key, radius=t_radius, order=t_order_mlp)),
+        # ("TaylorMLP", TaylorMLP(key, radius=t_radius, order=t_order_mlp)),
         # ("BaseEBM", BaseEBM(key, y_mean, order_y=0, radius=0)),
         # ("TaylorBaseEBM", TaylorBaseEBM(key, y_mean, radius=t_radius, order=t_order_ebm_x, order_y=t_order_ebm_y)),
         # ("ContextEBM", ContextEBM(key, num_train, y_mean, c_dim)),
