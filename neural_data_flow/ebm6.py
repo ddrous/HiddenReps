@@ -39,7 +39,7 @@ CONFIG = {
     "taylor_order_ebm_c": 0,    # Order for TaylorContextEBM (w.r.t context c)
     
     "context_dim": 1,
-    "width_size": 64,
+    "width_size": 48,
     "noise_std": 0.005,
     "data_samples": 2000,
     "segments": 11,
