@@ -21,9 +21,9 @@ RUN_DIR = ""
 CONFIG = {
     # "seed": 2026,
     "seed": time.time_ns() % (2**32 - 1),
-    "lr_nn": 0.001,    # Standard Models & PAM NN
+    "lr_nn": 0.0001,    # Standard Models & PAM NN
     "lr_ctx": 0.01,    # PAM Contexts
-    "batch_size": 16*4,
+    "batch_size": 8*1,
     "epochs": 600,     
     "context_init": "zero", # "zero" or "random"
     
@@ -39,10 +39,10 @@ CONFIG = {
     "taylor_order_ebm_c": 0,    # Order for TaylorContextEBM (w.r.t context c)
     
     "context_dim": 1,
-    "width_size": 32,
-    "noise_std": 0.015,
-    "data_samples": 1000,
-    "segments": 9,
+    "width_size": 64,
+    "noise_std": 0.005,
+    "data_samples": 2000,
+    "segments": 11,
     "x_range": [-1.5, 1.5],
 
     # PAM Hyperparameters
@@ -107,7 +107,7 @@ def params_norm_squared(params):
 
 def gen_data(seed, n_samples, n_segments=3, local_structure="random", 
              x_range=[-1, 1], slope=2.0, base_intercept=0.0, 
-             step_size=2.0, custom_func=None, noise_std=0.5):
+             step_size=4.0, custom_func=None, noise_std=0.5):
     np.random.seed(seed)
     x_min, x_max = x_range
     segment_boundaries = np.linspace(x_min, x_max, n_segments + 1)
@@ -153,11 +153,11 @@ class SimpleDataHandler:
 
 # Generate Data
 SEED = CONFIG["seed"]
-TRAIN_SEG_IDS = [2, 3, 4, 5, 6]
+TRAIN_SEG_IDS = [2, 3, 4, 5, 6, 7, 8]
 
 data, segs = gen_data(SEED, CONFIG["data_samples"], n_segments=CONFIG["segments"], 
                       local_structure="gradual_increase", x_range=CONFIG["x_range"], 
-                      slope=0.5, base_intercept=-0.4, step_size=0.1, noise_std=CONFIG["noise_std"])
+                      slope=0.5, base_intercept=-0.4, step_size=0.2, noise_std=CONFIG["noise_std"])
 
 test_mask = ~np.isin(segs, TRAIN_SEG_IDS)
 train_mask = np.isin(segs, TRAIN_SEG_IDS)
@@ -222,6 +222,9 @@ class MLPModel(eqx.Module):
         k1, k2, k3 = jax.random.split(key, 3)
         self.layers = [eqx.nn.Linear(1, width_size, key=k1), jax.nn.relu,
                        eqx.nn.Linear(width_size, width_size, key=k2), jax.nn.relu,
+                       eqx.nn.Linear(width_size, width_size, key=k2), jax.nn.relu,
+                       eqx.nn.Linear(width_size, width_size, key=k2), jax.nn.relu,
+                    #    eqx.nn.Linear(width_size, width_size, key=k2), jax.nn.relu,
                        eqx.nn.Linear(width_size, 1, key=k3)]
     def _forward(self, x):
         for l in self.layers: x = l(x)

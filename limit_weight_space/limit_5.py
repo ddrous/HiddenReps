@@ -25,11 +25,11 @@ CONFIG = {
     "seed": time.time_ns() % (2**32 - 1),
 
     # Data & MLP Hyperparameters
-    "data_samples": 1000,
-    "noise_std": 0.015,
-    "segments": 9,
+    "data_samples": 2000,
+    "noise_std": 0.005,
+    "segments": 11,
     "x_range": [-1.5, 1.5],
-    "train_seg_ids": [2, 3, 4, 5, 6], 
+    "train_seg_ids": [2, 3, 4, 5, 6, 7, 8], 
     "width_size": 48,
 
     # Expansion Hyperparameters
@@ -167,7 +167,7 @@ if TRAIN:
     SEED = CONFIG["seed"]
     data, segs = gen_data(SEED, CONFIG["data_samples"], n_segments=CONFIG["segments"], 
                           local_structure="gradual_increase", x_range=CONFIG["x_range"], 
-                          slope=0.5, base_intercept=-0.4, step_size=0.1, noise_std=CONFIG["noise_std"])
+                          slope=0.5, base_intercept=-0.4, step_size=0.2, noise_std=CONFIG["noise_std"])
 
     train_mask = np.isin(segs, CONFIG["train_seg_ids"])
     test_mask = ~train_mask
@@ -202,9 +202,10 @@ width_size = CONFIG["width_size"]
 class MLPModel(eqx.Module):
     layers: list
     def __init__(self, key):
-        k1, k2, k3 = jax.random.split(key, 3)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
         self.layers = [eqx.nn.Linear(1, width_size, key=k1), jax.nn.relu,
                        eqx.nn.Linear(width_size, width_size, key=k2), jax.nn.relu,
+                       eqx.nn.Linear(width_size, width_size, key=k4), jax.nn.relu,
                        eqx.nn.Linear(width_size, 1, key=k3)]
     def __call__(self, x):
         for l in self.layers: x = l(x)
