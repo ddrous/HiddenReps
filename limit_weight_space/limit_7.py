@@ -18,6 +18,8 @@ from typing import List, Tuple, Optional, Any
 
 # Set plotting style
 sns.set(style="white", context="talk")
+## Set background to white as well
+plt.rcParams['figure.facecolor'] = 'white'
 
 # --- 1. CONFIGURATION ---
 TRAIN = True  
@@ -40,7 +42,7 @@ CONFIG = {
     # GRU & Training Config
     "lr": 1e-4,      
     "gru_hidden_size": 128,    
-    "gru_epochs": 2000,  
+    "gru_epochs": 1500,  
     "gru_batch_size": 16,      # Number of parallel initializations (Seeds)
     
     "gru_target_step": 100,    # Total steps to unroll (Horizon)
@@ -357,14 +359,23 @@ if TRAIN:
     
     loss_history = []
     train_key = jax.random.PRNGKey(CONFIG["seed"] + 99)
+    best_model = gru_model      ## Best model on train set
+    lowest_loss = float('inf')
 
     for ep in range(CONFIG["gru_epochs"]):
         train_key, step_key = jax.random.split(train_key)
         gru_model, opt_state, loss = make_step(gru_model, opt_state, x0_batch, step_key)
         loss_history.append(loss)
+
+        if loss < lowest_loss:
+            lowest_loss = loss
+            best_model = gru_model
         
         if (ep+1) % 100 == 0:
             print(f"Epoch {ep+1} | Loss: {loss:.6f}")
+
+    ## Make sure we use the best model at the end
+    gru_model = best_model
 
     # Generate final trajectories for ALL batch members
     eval_key = jax.random.PRNGKey(42)
@@ -373,10 +384,14 @@ if TRAIN:
     np.save(artefacts_path / "final_batch_traj.npy", final_batch_traj)
     np.save(artefacts_path / "loss_history.npy", np.array(loss_history))
 
+    ## Save the gru model as well with Equinox serialization
+    eqx.tree_serialise_leaves(artefacts_path / "gru_model.eqx", gru_model)
+
 else:
     print("Loading results...")
     final_batch_traj = np.load(artefacts_path / "final_batch_traj.npy")
     loss_history = np.load(artefacts_path / "loss_history.npy")
+    gru_model = eqx.tree_deserialise_leaves(artefacts_path / "gru_model.eqx", WeightGRU)
 
 # Use the FIRST trajectory for standard single-model dashboards to keep them working
 final_traj = final_batch_traj[0]
@@ -625,4 +640,82 @@ ax_circles.set_title("Data Expansion")
 
 plt.tight_layout()
 plt.savefig(plots_path / "dashboard_advanced_diagnostics.png")
+plt.show()
+
+#%% Special plot paramter trajectories
+## We are plotting as many parameters as possible in a tall plot. We only plot the first n_circles steps to focus on the interesting part.
+print("Generating Extended Parameter Trajectories Plot...")
+fig, ax = plt.subplots(figsize=(7, 10), nrows=1, ncols=1) ## everything in one axis
+plot_ids = np.arange(10)  # First 64 parameters
+
+for idx in plot_ids:
+    # traj = traj_seed_0[:CONFIG["n_circles"], idx]
+    # ax.plot(np.arange(CONFIG["n_circles"]), traj, linewidth=1.5, label=f"Param {idx}")
+
+    ## Plot the difference from initial value to highlight changes
+    # traj = traj_seed_0[:CONFIG["n_circles"], idx]
+    # traj_diff = traj - traj[0]
+    # ax.plot(np.arange(CONFIG["n_circles"]), traj_diff, linewidth=1.5, label=f"Param {idx}")
+
+    ## Plot the difference x_t - x_(t-1) to highlight changes
+    traj = traj_seed_0[:CONFIG["n_circles"], idx]
+    traj_diff = jnp.concatenate([jnp.array([0.0]), traj[1:] - traj[:-1]])
+    ax.plot(np.arange(CONFIG["n_circles"]), traj_diff, linewidth=1.5, label=f"Param {idx}")
+
+ax.set_title("Parameter Trajectories")
+ax.set_xlabel("Training Step")
+ax.set_ylabel("Parameter Value")
+# ax.legend(ncol=2, fontsize='small')
+plt.tight_layout()
+plt.savefig(plots_path / "extended_parameter_trajectories.png")
+plt.show()
+
+
+#%% Plot the n_circles model predictions on the train and test sets
+# This shows how well the model fits the data at the end of the data expansion phase
+print("Generating n_circles Model Prediction Plot...")
+# step_idx = CONFIG["n_circles"]
+step_idx = 2
+fig, ax = plt.subplots(figsize=(10, 6))     
+# Background Data
+# ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
+ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1, label="Test Data")
+
+## PLot the train data in colors correspond to the radius for this steo_idx
+dists = jnp.abs(X_train_full - x_mean).flatten()
+r_current = radii[jnp.minimum(step_idx, CONFIG["n_circles"] - 1)]
+train_colors = np.where(dists <= r_current, 'green', 'blue')
+ax.scatter(X_train_full, Y_train_full, c=train_colors, s=10, alpha=0.3, label="Train Data")
+
+## Create a new final batch traj from a random seed to ensure we have diversity
+print("Generating new batch for n_circles prediction plot...")
+x0_batch_list = []
+gen_key = jax.random.PRNGKey(time.time_ns() % (2**12 - 1))
+# gen_key = jax.random.PRNGKey(CONFIG["seed"] + 100)
+for _ in range(CONFIG["gru_batch_size"]):
+    gen_key, sk = jax.random.split(gen_key)
+    m = MLPModel(sk)
+    p, _ = eqx.partition(m, eqx.is_array)
+    f, _, _, _ = flatten_pytree(p)
+    x0_batch_list.append(f)
+x0_batch = jnp.stack(x0_batch_list) # (Batch, Input_Dim)
+new_final_batch_traj = jax.vmap(gru_model, in_axes=(0, None, None))(x0_batch, CONFIG["gru_target_step"], None)
+
+# Plot all batch members
+for b in range(CONFIG["gru_batch_size"]):
+    # w = final_batch_traj[b, step_idx]
+    w = new_final_batch_traj[b, step_idx]
+    p = unflatten_pytree(w, shapes, treedef, mask)
+    m = eqx.combine(p, static)
+    pred = m.predict(x_grid)
+    
+    # Color based on batch index to track consistency
+    color = plt.cm.tab20(b % 20)
+    ax.plot(x_grid, pred, color=color, alpha=0.6, linewidth=1.5)
+ax.set_title(f"Model Predictions at End of Data Expansion (Step {step_idx})")
+ax.set_ylim(jnp.min(Y_train_full)-1, jnp.max(Y_train_full)+1)
+ax.grid(True, alpha=0.3)
+ax.legend()
+plt.tight_layout()
+plt.savefig(plots_path / "model_predictions_n_circles.png")
 plt.show()
