@@ -9,11 +9,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import time
-import json
 import datetime
 import shutil
 import sys
-import os
+
+from equinox_utils import EideticGRUCell
 
 # Set plotting style
 sns.set(style="white", context="talk")
@@ -25,7 +25,8 @@ TRAIN = True
 RUN_DIR = "." 
 
 CONFIG = {
-    "seed": time.time_ns() % (2**32 - 1),
+    # "seed": time.time_ns() % (2**32 - 1),
+    "seed": 2026,
 
     # Data & MLP Hyperparameters
     "data_samples": 2000,
@@ -36,23 +37,25 @@ CONFIG = {
     "width_size": 48,
 
     # Expansion Hyperparameters
-    "n_circles": 30,           
+    "n_circles": 50,           
     
     # GRU & Training Config
     "lr": 1e-4,      
     "gru_hidden_size": 128,    
-    "gru_epochs": 1500,  
-    "gru_batch_size": 16,      # Number of parallel initializations (Seeds)
+    "gru_epochs": 2500,  
+    "gru_batch_size": 2,      # Number of parallel initializations (Seeds)
+    "eidetic_gru": True,        # Whether to use Eidetic GRU Cell
     
     "gru_target_step": 100,    # Total steps to unroll (Horizon)
+    "scheduled_loss_weight": False,  # Whether to use scheduled weight for each loss step
     
     # Regularization Config
-    "regularization_step": 90,     # Step at which to apply the 'final' constraint
+    "regularization_step": 75,     # Step at which to apply the 'final' constraint
     "regularization_weight": 0.0,  # Coefficient for the reg loss (0 = drift)
     
     # Data Selection Mode
-    "data_selection": "full_disk",   # "annulus" or "full_disk"
-    "final_step_mode": "full",     # 'full' (regularize at reg_step) or 'none'
+    "data_selection": "annulus",   # "annulus" or "full_disk"
+    "final_step_mode": "none",     # 'full' (regularize at reg_step) or 'none'
 }
 
 #%%
@@ -213,7 +216,10 @@ class WeightGRU(eqx.Module):
         k1, k2, k3 = jax.random.split(key, 3)
         
         self.encoder = eqx.nn.Linear(input_dim, hidden_dim, key=k1)
-        self.cell = eqx.nn.GRUCell(hidden_dim, hidden_dim, key=k2)
+        if not CONFIG["eidetic_gru"]:
+            self.cell = eqx.nn.GRUCell(hidden_dim, hidden_dim, key=k2)
+        else:
+            self.cell = EideticGRUCell(hidden_dim, hidden_dim, key=k2)      ##TODO
         self.decoder = eqx.nn.Linear(hidden_dim, input_dim, key=k3)
 
     def __call__(self, x0, steps, key=None):
@@ -316,7 +322,13 @@ def get_functional_loss(flat_w, step_idx):
     
     eff_weight = jax.lax.select(is_reg_step, CONFIG["regularization_weight"], 1.0)
     
-    return base_loss * eff_weight
+    final_loss = base_loss * eff_weight
+
+    if not CONFIG["scheduled_loss_weight"]:
+        return final_loss
+    else:
+        return (base_loss * eff_weight) / (step_idx**2 + 1)         ## TODO scale down over time?
+
 
 @eqx.filter_value_and_grad
 def train_step_fn(gru, x0_batch, key):
@@ -327,15 +339,18 @@ def train_step_fn(gru, x0_batch, key):
     # keys needs to be (Batch,) for randomness if used, but here GRU is deterministic
     # We broadcast key or split it if needed. 
     # Current GRU doesn't use key for sampling anymore (MSE mode)
+
+
+    preds_batch = jax.vmap(gru, in_axes=(0, None, None))(x0_batch, total_steps, None) # preds_batch: (Batch, Steps, D)
     
     step_indices = jnp.arange(total_steps)
 
-    ## TODO: randomly select two steps per batch member for efficiency
-    # step_indices = jax.random.choice(key, total_steps, shape=(5,), replace=False)
+    # ## TODO: randomly select two steps per batch member for efficiency
+    # # step_indices = jax.random.choice(key, CONFIG["n_circles"], shape=(2,), replace=False)
+    # step_indices = jax.random.choice(key, 10, shape=(2,), replace=False)
+    # # step_indices = jnp.array([CONFIG["n_circles"]-1])
     # step_indices = jnp.sort(step_indices)
-
-    preds_batch = jax.vmap(gru, in_axes=(0, None, None))(x0_batch, total_steps, None) # preds_batch: (Batch, Steps, D)
-    # preds_batch = preds_batch[:, step_indices, :]       #TODO
+    # preds_batch = preds_batch[:, step_indices, :]
 
     # Calculate loss for each batch member, for each step
     # double vmap: outer over batch, inner over steps
@@ -374,7 +389,7 @@ if TRAIN:
             lowest_loss = loss
             best_model = gru_model
         
-        if (ep+1) % 100 == 0:
+        if (ep+1) % 500 == 0:
             print(f"Epoch {ep+1} | Loss: {loss:.6f}")
 
     ## Make sure we use the best model at the end
@@ -687,7 +702,7 @@ plt.show()
 # This shows how well the model fits the data at the end of the data expansion phase
 print("Generating n_circles Model Prediction Plot...")
 # step_idx = CONFIG["n_circles"]
-step_idx = 10
+step_idx = 50
 fig, ax = plt.subplots(figsize=(10, 6))     
 # Background Data
 # ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
@@ -724,7 +739,7 @@ for b in range(CONFIG["gru_batch_size"]):
     # Color based on batch index to track consistency
     color = plt.cm.tab20(b % 20)
     ax.plot(x_grid, pred, color=color, alpha=0.6, linewidth=1.5)
-ax.set_title(f"Model Predictions at End of Data Expansion (Step {step_idx})")
+ax.set_title(f"Model Predictions Corresponding to Circles (Step {step_idx})")
 ax.set_ylim(jnp.min(Y_train_full)-1, jnp.max(Y_train_full)+1)
 ax.grid(True, alpha=0.3)
 ax.legend()

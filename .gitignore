@@ -11,3 +11,5 @@ neural_data_flow/experiments/*
 
 neural_data_flow/experiments/*
 limit_weight_space/experiments/*
+
+torch/checkpoints/*
