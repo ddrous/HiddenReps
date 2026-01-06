@@ -14,12 +14,11 @@ import datetime
 import shutil
 import sys
 import os
-from typing import List, Tuple, Optional, Any
 
 # Set plotting style
 sns.set(style="white", context="talk")
-## Set background to white as well
-plt.rcParams['figure.facecolor'] = 'white'
+plt.rcParams['savefig.facecolor'] = 'white'
+
 
 # --- 1. CONFIGURATION ---
 TRAIN = True  
@@ -329,11 +328,15 @@ def train_step_fn(gru, x0_batch, key):
     # We broadcast key or split it if needed. 
     # Current GRU doesn't use key for sampling anymore (MSE mode)
     
-    preds_batch = jax.vmap(gru, in_axes=(0, None, None))(x0_batch, total_steps, None)
-    # preds_batch: (Batch, Steps, D)
-    
     step_indices = jnp.arange(total_steps)
-    
+
+    ## TODO: randomly select two steps per batch member for efficiency
+    # step_indices = jax.random.choice(key, total_steps, shape=(5,), replace=False)
+    # step_indices = jnp.sort(step_indices)
+
+    preds_batch = jax.vmap(gru, in_axes=(0, None, None))(x0_batch, total_steps, None) # preds_batch: (Batch, Steps, D)
+    # preds_batch = preds_batch[:, step_indices, :]       #TODO
+
     # Calculate loss for each batch member, for each step
     # double vmap: outer over batch, inner over steps
     def loss_per_seq(seq):
@@ -391,7 +394,7 @@ else:
     print("Loading results...")
     final_batch_traj = np.load(artefacts_path / "final_batch_traj.npy")
     loss_history = np.load(artefacts_path / "loss_history.npy")
-    gru_model = eqx.tree_deserialise_leaves(artefacts_path / "gru_model.eqx", WeightGRU)
+    gru_model = eqx.tree_deserialise_leaves(artefacts_path / "gru_model.eqx", gru_model)
 
 # Use the FIRST trajectory for standard single-model dashboards to keep them working
 final_traj = final_batch_traj[0]
@@ -626,17 +629,26 @@ ax_3d.legend()
 # PLOT D: DATA EXPANSION
 ax_circles = fig_diag.add_subplot(gs_diag[1, 1])
 point_indices = jnp.sum(~circle_masks, axis=0)
-cmap_hard = plt.cm.get_cmap('tab20', CONFIG["n_circles"] + 1)
-scatter = ax_circles.scatter(X_train_full, Y_train_full, c=point_indices, cmap=cmap_hard, s=15, alpha=0.9)
+
+# Use a more distinct colormap
+scatter = ax_circles.scatter(X_train_full, Y_train_full, c=point_indices, 
+                            cmap='Spectral', s=15, alpha=0.9)
 
 for i in range(0, CONFIG["n_circles"], 5):
     r = radii[i]
     ax_circles.axvline(x_mean - r, color='k', linestyle='-', alpha=0.2)
     ax_circles.axvline(x_mean + r, color='k', linestyle='-', alpha=0.2)
+    
+    # Add radius labels at the top of each vertical line
+    y_top = ax_circles.get_ylim()[1]
+    ax_circles.text(x_mean - r, y_top, f'R{i}', 
+                   ha='center', va='bottom', fontsize=8, rotation=90)
+    ax_circles.text(x_mean + r, y_top, f'R{i}', 
+                   ha='center', va='bottom', fontsize=8, rotation=90)
 
 cbar = plt.colorbar(scatter, ax=ax_circles, ticks=np.arange(0, CONFIG["n_circles"]+1, 5))
 cbar.set_label("Circle Index")
-ax_circles.set_title("Data Expansion")
+ax_circles.set_title("Training Data Circles", y=1.02)
 
 plt.tight_layout()
 plt.savefig(plots_path / "dashboard_advanced_diagnostics.png")
@@ -675,7 +687,7 @@ plt.show()
 # This shows how well the model fits the data at the end of the data expansion phase
 print("Generating n_circles Model Prediction Plot...")
 # step_idx = CONFIG["n_circles"]
-step_idx = 2
+step_idx = 10
 fig, ax = plt.subplots(figsize=(10, 6))     
 # Background Data
 # ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
@@ -690,7 +702,7 @@ ax.scatter(X_train_full, Y_train_full, c=train_colors, s=10, alpha=0.3, label="T
 ## Create a new final batch traj from a random seed to ensure we have diversity
 print("Generating new batch for n_circles prediction plot...")
 x0_batch_list = []
-gen_key = jax.random.PRNGKey(time.time_ns() % (2**12 - 1))
+gen_key = jax.random.PRNGKey(time.time_ns() % (2**32 - 1))
 # gen_key = jax.random.PRNGKey(CONFIG["seed"] + 100)
 for _ in range(CONFIG["gru_batch_size"]):
     gen_key, sk = jax.random.split(gen_key)
