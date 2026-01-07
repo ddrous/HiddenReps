@@ -43,7 +43,7 @@ CONFIG = {
     "lr": 5e-5,      
     "gru_hidden_size": 128,    
     "gru_epochs": 2000,  
-    "gru_batch_size": 2,      # Number of parallel initializations (Seeds)
+    "gru_batch_size": 4,      # Number of parallel initializations (Seeds)
     "eidetic_gru": True,        # Whether to use Eidetic GRU Cell
     
     "gru_target_step": 100,    # Total steps to unroll (Horizon)
@@ -51,6 +51,7 @@ CONFIG = {
 
     ## Consistency Loss Config
     "n_synthetic_points": 1000,  # Number of synthetic points to sample for consistency loss
+    # "consistency_loss_weight": 1.25,  # Weight for the consistency loss term
     "consistency_loss_weight": 0.0,  # Weight for the consistency loss term
 
     # Regularization Config
@@ -61,6 +62,8 @@ CONFIG = {
     "data_selection": "annulus",   # "annulus" or "full_disk"
     "final_step_mode": "none",     # 'full' (regularize at reg_step) or 'none'
 }
+
+print("Config seed is:", CONFIG["seed"])
 
 #%%
 # --- 2. UTILITY FUNCTIONS ---
@@ -372,8 +375,52 @@ def get_consistency_loss(flat_w_in, flat_w_out, step_idx_in, key):
     y_pred_out = model_out.predict(X_synthetic[:, None])
     residuals = (y_pred_in - y_pred_out) ** 2
 
-    return jnp.mean(residuals)
+    final_loss =  jnp.mean(residuals)
+    if CONFIG["scheduled_loss_weight"]:
+        return final_loss / (step_idx_in**2 + 1)         ## TODO scale down over time?
+    else:
+        return final_loss
 
+
+
+# def get_disconsistency_loss(flat_w_in, flat_w_out, step_idx_in, key):
+#     ## Consistency loss between two consecutive steps. 
+#     ## The models corresponds to the inner and outer circles must NOT match their predictions on the anulus data. 
+
+#     # Unflatten MLPs
+#     params_in = unflatten_pytree(flat_w_in, shapes, treedef, mask)
+#     model_in = eqx.combine(params_in, static)
+
+#     params_out = unflatten_pytree(flat_w_out, shapes, treedef, mask)
+#     model_out = eqx.combine(params_out, static)
+
+#     ## Sample the synthetic data, it should all fall within the inner circle;
+#     ## We know the center of the data, and we know the radius of the inner circle at this step
+#     ## We want to sample with higer probability close to the perimeter of the inner circle. Gradual probablity increase.
+#     ## This is synthetic data, so we can sample as much as we want, even outside n_circles in the original data
+#     circle_idx = jnp.minimum(step_idx_in, CONFIG["gru_target_step"] - 2)
+#     radius_in = all_radii[circle_idx]
+#     radius_out = all_radii[circle_idx + 1]
+#     n_synthetic = CONFIG["n_synthetic_points"]
+#     angles = jax.random.uniform(key, shape=(n_synthetic,)) * 2 * jnp.pi
+
+#     ## Sampling with higher density near the perimeter (closer to radius). Use the beta distribution with alpha>1
+#     radii_sampled = jax.random.beta(key, a=5.0, b=1.0, shape=(n_synthetic,)) * (radius_out - radius_in) + radius_in
+
+#     X_synthetic = x_mean + radii_sampled * jnp.cos(angles)      ## TODO: add a dimention along axis 1 if x is multi-dim?
+    
+#     y_pred_in = model_in.predict(X_synthetic[:, None])
+#     y_pred_out = model_out.predict(X_synthetic[:, None])
+#     residuals = (y_pred_in - y_pred_out) ** 2
+
+#     # return -jnp.mean(residuals)
+#     return jnp.maximum(0.0, 1.0 - jnp.mean(residuals))   ## Hinge loss style
+
+
+def get_disconsistency_loss(flat_w_in, flat_w_out, step_idx_in, key):
+    ## Maybe the consistency loss is just maximiisng the difference between the two models directly?
+    residual = jnp.mean((flat_w_in - flat_w_out) ** 2)
+    return jnp.maximum(0.0, 1.0 - residual)   ## Hinge loss style
 
 @eqx.filter_value_and_grad
 def train_step_fn(gru, x0_batch, key):
@@ -418,7 +465,8 @@ def train_step_fn(gru, x0_batch, key):
     keys = jax.random.split(key, len(step_indices)-1)
     preds_batch_cons = preds_batch[:, step_indices, :]
     def cons_loss_per_seq(seq):
-        return jax.vmap(get_consistency_loss)(seq[:-1], seq[1:], step_indices[:-1], keys)
+        # return jax.vmap(get_consistency_loss)(seq[:-1], seq[1:], step_indices[:-1], keys)
+        return jax.vmap(get_disconsistency_loss)(seq[:-1], seq[1:], step_indices[:-1], keys)
     cons_losses_batch = jax.vmap(cons_loss_per_seq)(preds_batch_cons) # (Batch, Steps-1)
     total_cons_loss = jnp.mean(jnp.sum(cons_losses_batch, axis=1))
 
@@ -767,7 +815,7 @@ plt.show()
 # This shows how well the model fits the data at the end of the data expansion phase
 print("Generating n_circles Model Prediction Plot...")
 # step_idx = CONFIG["n_circles"]
-step_idx = 75
+step_idx = 35
 fig, ax = plt.subplots(figsize=(10, 6))     
 # Background Data
 # ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
@@ -811,3 +859,158 @@ ax.legend()
 plt.tight_layout()
 plt.savefig(plots_path / "model_predictions_n_circles.png")
 plt.show()
+
+
+#%% Special evaluation of the loss
+## Our annulus training strategy gives us gru_step>n_circles models, each specialised on its own radius.
+## So our evalulation is simple. For each point, we find which circle it belongs to, and use the corresponding model to evaluate its loss.
+print("Evaluating Final Model Loss with Circle-Specific Models...")
+# def evaluate_circle_specific_loss(final_batch_traj, X_data, Y_data):
+#     total_loss = 0.0
+#     n_points = X_data.shape[0]
+    
+#     for i in range(n_points):
+#         x_point = X_data[i:i+1, :]  # Shape (1, D)
+#         y_point = Y_data[i:i+1, :]  # Shape (1, D)
+        
+#         dist = jnp.abs(x_point - x_mean).item()
+        
+#         # Determine which circle this point belongs to
+#         circle_idx = 0
+#         for j, r in enumerate(radii):
+#             if dist <= r:
+#                 circle_idx = j
+#                 break
+#         else:
+#             circle_idx = CONFIG["n_circles"] - 1  # Assign to the outermost circle if beyond all
+        
+#         # Use the corresponding model from the final batch trajectory
+#         w = final_batch_traj[0, circle_idx]  # Using the first batch member for simplicity
+#         p = unflatten_pytree(w, shapes, treedef, mask)
+#         m = eqx.combine(p, static)
+        
+#         y_pred = m.predict(x_point)
+#         point_loss = jnp.mean((y_pred - y_point) ** 2)
+#         total_loss += point_loss
+    
+#     avg_loss = total_loss / n_points
+#     return avg_loss
+
+def evaluate_circle_specific_loss(final_batch_traj, X_data, Y_data):
+    ## THis function should return the average loss, for each circle. only on the corresponding data points.
+    ## All this in a dictionnary with key the circle index.
+    circle_losses = {}
+    n_points = X_data.shape[0]
+
+    for circle_idx in range(CONFIG["gru_target_step"]):
+        # Get the model for this circle from the first batch member
+        w = final_batch_traj[0, circle_idx]  # Using the first batch member for simplicity
+        p = unflatten_pytree(w, shapes, treedef, mask)
+        m = eqx.combine(p, static)
+
+        # Get the mask for this circle
+        ## Calculate all circle masks
+        circle_masks = []
+        for r in all_radii:
+            new_mask = jnp.abs(X_data - x_mean) <= r
+            circle_masks.append(new_mask.flatten())
+
+        circle_mask = circle_masks[circle_idx]
+
+        # Select data points belonging to this circle
+        X_circle = X_data[circle_mask]
+        Y_circle = Y_data[circle_mask]
+
+        if X_circle.shape[0] == 0:
+            continue  # Skip if no points in this circle
+
+        y_pred = m.predict(X_circle)
+        circle_loss = jnp.mean((y_pred - Y_circle) ** 2)
+        circle_losses[circle_idx] = circle_loss
+
+    return circle_losses
+
+final_test_loss_cc = evaluate_circle_specific_loss(final_batch_traj, X_test, Y_test)
+test_loss_cc = jnp.mean(jnp.array(list(final_test_loss_cc.values())))
+print(f"Final Test Loss (Circle-Specific Models): {test_loss_cc:.6f}")
+final_train_loss_cc = evaluate_circle_specific_loss(final_batch_traj, X_train_full, Y_train_full)
+
+## Replot the Performance Evolution with Circle-Specific Loss as a horizontal line
+fig, ax = plt.subplots(figsize=(10, 6))
+## Plot final_train_loss_circle_specific and final_test_loss_circle_specific as horizontal lines
+ax.plot(traj_train_losses, label="Train MSE", color='blue', alpha=0.7)
+# ax.plot(final_train_loss_cc.keys(), final_train_loss_cc.values(), label="Train MSE (CC)", color='blue', linewidth=2, linestyle='--')
+ax.plot(traj_test_losses, label="Test MSE", color='orange', linewidth=2)
+# ax.plot(final_test_loss_cc.keys(), final_test_loss_cc.values(), label="Test MSE (CC)", color='orange', linewidth=2, linestyle='--')
+## PLot a horizontal line for the average circle-specific test loss
+ax.axhline(test_loss_cc, color='orange', linestyle='--', label="Avg Test MSE (CC)")
+ax.axhline(jnp.mean(jnp.array(list(final_train_loss_cc.values()))), color='blue', linestyle='--', label="Avg Train MSE (CC)")
+ax.axvline(CONFIG["n_circles"], color='k', linestyle='--')
+ax.axvline(CONFIG["regularization_step"], color='red', linestyle=':')
+ax.set_yscale('log')
+ax.set_title("Performance Evolution with Circle-Specific (CC) Models")
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(plots_path / "performance_evolution_circle_specific.png")
+plt.show()
+
+#%% Let's redo the Model Predictions Corresponding to Circles plot with circle-specific models
+print("Generating n_circles Model Prediction Plot (Circle-Specific Models)...")
+## For each data point (train+test), find which circle it belongs to, and do the prediction with the corresponding model
+dists = jnp.abs(X_train_full - x_mean).flatten()
+r_current = all_radii[jnp.minimum(step_idx, CONFIG["gru_target_step"] - 1)]
+
+def predict_circle_specific_loss(final_batch_traj, X_data):
+    ## THis function should return the average loss, for each circle. only on the corresponding data points.
+    ## All this in a dictionnary with key the circle index.
+    circle_losses = {}
+    n_points = X_data.shape[0]
+
+    for circle_idx in range(CONFIG["gru_target_step"]):
+        # Get the model for this circle from the first batch member
+        w = final_batch_traj[0, circle_idx]  # Using the first batch member for simplicity
+        p = unflatten_pytree(w, shapes, treedef, mask)
+        m = eqx.combine(p, static)
+
+        # Get the mask for this circle
+        ## Calculate all circle masks
+        circle_masks = []
+        for r in all_radii:
+            new_mask = jnp.abs(X_data - x_mean) <= r
+            circle_masks.append(new_mask.flatten())
+
+        circle_mask = circle_masks[circle_idx]
+
+        # Select data points belonging to this circle
+        X_circle = X_data[circle_mask]
+
+        if X_circle.shape[0] == 0:
+            continue  # Skip if no points in this circle
+        y_pred = m.predict(X_circle)
+        circle_losses[circle_idx] = (X_circle, y_pred)
+    return circle_losses
+
+
+train_preds_cc = predict_circle_specific_loss(final_batch_traj, X_train_full)
+test_preds_cc = predict_circle_specific_loss(final_batch_traj, X_test)
+
+fig, ax = plt.subplots(figsize=(10, 6))     
+
+# Background Data
+ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
+ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1, label="Test Data")
+
+## PLot the train data predictions in colors correspond to the radius for this steo_idx
+for circle_idx, (X_circle, y_pred) in train_preds_cc.items():
+    ax.scatter(X_circle, y_pred, c='green', s=10, alpha=0.3)
+## PLot the test data predictions in colors correspond to the radius for this steo_idx
+for circle_idx, (X_circle, y_pred) in test_preds_cc.items():
+    ax.scatter(X_circle, y_pred, c='red', s=10, alpha=0.3)
+
+ax.set_title(f"Model Predictions Corresponding to Circles (Circle-Specific Models)")
+ax.set_ylim(jnp.min(Y_train_full)-1, jnp.max(Y_train_full)+1)
+ax.grid(True, alpha=0.3)
+ax.legend()
+plt.tight_layout()
+plt.savefig(plots_path / "model_predictions_n_circles_circle_specific.png")
