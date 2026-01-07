@@ -25,8 +25,8 @@ TRAIN = True
 RUN_DIR = "." 
 
 CONFIG = {
-    "seed": time.time_ns() % (2**32 - 1),
-    # "seed": 2026,
+    # "seed": time.time_ns() % (2**32 - 1),
+    "seed": 2026,
 
     # Data & MLP Hyperparameters
     "data_samples": 2000,
@@ -40,19 +40,15 @@ CONFIG = {
     "n_circles": 50,           
     
     # GRU & Training Config
-    "lr": 5e-5,      
+    "lr": 1e-4,      
     "gru_hidden_size": 128,    
-    "gru_epochs": 2000,  
+    "gru_epochs": 2500,  
     "gru_batch_size": 2,      # Number of parallel initializations (Seeds)
     "eidetic_gru": True,        # Whether to use Eidetic GRU Cell
     
     "gru_target_step": 100,    # Total steps to unroll (Horizon)
     "scheduled_loss_weight": False,  # Whether to use scheduled weight for each loss step
-
-    ## Consistency Loss Config
-    "n_synthetic_points": 1000,  # Number of synthetic points to sample for consistency loss
-    "consistency_loss_weight": 1e1,  # Weight for the consistency loss term
-
+    
     # Regularization Config
     "regularization_step": 75,     # Step at which to apply the 'final' constraint
     "regularization_weight": 0.0,  # Coefficient for the reg loss (0 = drift)
@@ -192,12 +188,6 @@ print(f"Data Center (Mean): {x_mean:.4f}")
 dists = jnp.abs(X_train_full - x_mean).flatten()
 radii = jnp.linspace(0.05, jnp.max(dists) + 0.01, CONFIG["n_circles"])
 circle_masks = jnp.stack([dists <= r for r in radii]) 
-
-## We need a fake set of radii for synthetic data sampling in consistency loss. 
-## We simply extend the "radii" with same spacing, uncil we have gru_steps
-delta_radius = radii[1] - radii[0]
-fake_radii = jnp.arange(radii[-1], radii[-1] + (CONFIG["gru_target_step"]-CONFIG["n_circles"])*delta_radius + 0.01, delta_radius)
-all_radii = jnp.concatenate([radii, fake_radii])
 
 #%%
 # --- 4. MODEL DEFINITIONS ---
@@ -340,41 +330,6 @@ def get_functional_loss(flat_w, step_idx):
         return (base_loss * eff_weight) / (step_idx**2 + 1)         ## TODO scale down over time?
 
 
-def get_consistency_loss(flat_w_in, flat_w_out, step_idx_in, key):
-    ## Consistency loss between two consecutive steps. 
-    ## The models corresponds to the inner and outer circles must match their predictions on the inner circle data. 
-
-    # Unflatten MLPs
-    params_in = unflatten_pytree(flat_w_in, shapes, treedef, mask)
-    model_in = eqx.combine(params_in, static)
-
-    params_out = unflatten_pytree(flat_w_out, shapes, treedef, mask)
-    model_out = eqx.combine(params_out, static)
-
-    ## Sample the synthetic data, it should all fall within the inner circle;
-    ## We know the center of the data, and we know the radius of the inner circle at this step
-    ## We want to sample with higer probability close to the perimeter of the inner circle. Gradual probablity increase.
-    ## This is synthetic data, so we can sample as much as we want, even outside n_circles in the original data
-    circle_idx = jnp.minimum(step_idx_in, CONFIG["gru_target_step"] - 1)
-    radius = all_radii[circle_idx]
-    n_synthetic = CONFIG["n_synthetic_points"]
-    angles = jax.random.uniform(key, shape=(n_synthetic,)) * 2 * jnp.pi
-    
-    ## Uniform sampling
-    # radii_sampled = jax.random.uniform(key, shape=(n_synthetic,)) * radius
-
-    ## Sampling with higher density near the perimeter (closer to radius). Use the beta distribution with alpha>1
-    radii_sampled = jax.random.beta(key, a=5.0, b=1.0, shape=(n_synthetic,)) * radius
-
-    X_synthetic = x_mean + radii_sampled * jnp.cos(angles)      ## TODO: add a dimention along axis 1 if x is multi-dim?
-    
-    y_pred_in = model_in.predict(X_synthetic[:, None])
-    y_pred_out = model_out.predict(X_synthetic[:, None])
-    residuals = (y_pred_in - y_pred_out) ** 2
-
-    return jnp.mean(residuals)
-
-
 @eqx.filter_value_and_grad
 def train_step_fn(gru, x0_batch, key):
     # x0_batch: (Batch, D)
@@ -385,47 +340,28 @@ def train_step_fn(gru, x0_batch, key):
     # We broadcast key or split it if needed. 
     # Current GRU doesn't use key for sampling anymore (MSE mode)
 
-    preds_batch = jax.vmap(gru, in_axes=(0, None, None))(x0_batch, total_steps, None) # preds_batch: (Batch, Steps, D)
 
-    ## DO a cumsum along the steps to get the full trajectory
-    # preds_batch = jnp.cumsum(preds_batch, axis=1)
+    preds_batch = jax.vmap(gru, in_axes=(0, None, None))(x0_batch, total_steps, None) # preds_batch: (Batch, Steps, D)
     
     step_indices = jnp.arange(total_steps)
-    preds_batch_data = preds_batch
 
     # ## TODO: randomly select two steps per batch member for efficiency
-    # step_indices = jax.random.choice(key, CONFIG["n_circles"], shape=(12,), replace=False)
-    # # step_indices = jax.random.choice(key, 10, shape=(2,), replace=False)
+    # # step_indices = jax.random.choice(key, CONFIG["n_circles"], shape=(2,), replace=False)
+    # step_indices = jax.random.choice(key, 10, shape=(2,), replace=False)
     # # step_indices = jnp.array([CONFIG["n_circles"]-1])
     # step_indices = jnp.sort(step_indices)
-    # preds_batch_data = preds_batch[:, step_indices, :]
+    # preds_batch = preds_batch[:, step_indices, :]
 
     # Calculate loss for each batch member, for each step
     # double vmap: outer over batch, inner over steps
     def loss_per_seq(seq):
         return jax.vmap(get_functional_loss)(seq, step_indices)
-    losses_batch = jax.vmap(loss_per_seq)(preds_batch_data) # (Batch, Steps)
+        
+    losses_batch = jax.vmap(loss_per_seq)(preds_batch) # (Batch, Steps)
+    
     # Mean over batch, Sum over steps
-    total_data_loss = jnp.mean(jnp.sum(losses_batch, axis=1))
-
-
-    ## TODO: Add any additional regularization losses here if needed
-    ## This is a consistency loss along the sequence.
-    step_indices = jnp.arange(total_steps)
-    # step_indices = jnp.arange(CONFIG["n_circles"], total_steps)
-    # step_indices = jax.random.choice(key, total_steps, shape=(50,), replace=False)
-    # step_indices = jnp.sort(step_indices)
-    keys = jax.random.split(key, len(step_indices)-1)
-    preds_batch_cons = preds_batch[:, step_indices, :]
-    def cons_loss_per_seq(seq):
-        return jax.vmap(get_consistency_loss)(seq[:-1], seq[1:], step_indices[:-1], keys)
-    cons_losses_batch = jax.vmap(cons_loss_per_seq)(preds_batch_cons) # (Batch, Steps-1)
-    total_cons_loss = jnp.mean(jnp.sum(cons_losses_batch, axis=1))
-
-    # total_loss = total_data_loss
-    # total_loss = total_cons_loss
-    total_loss = total_data_loss + CONFIG["consistency_loss_weight"]*total_cons_loss
-
+    total_loss = jnp.mean(jnp.sum(losses_batch, axis=1))
+    
     return total_loss
 
 @eqx.filter_jit
@@ -737,7 +673,7 @@ plt.show()
 ## We are plotting as many parameters as possible in a tall plot. We only plot the first n_circles steps to focus on the interesting part.
 print("Generating Extended Parameter Trajectories Plot...")
 fig, ax = plt.subplots(figsize=(7, 10), nrows=1, ncols=1) ## everything in one axis
-plot_ids = np.arange(100)  # First 64 parameters
+plot_ids = np.arange(10)  # First 64 parameters
 
 for idx in plot_ids:
     # traj = traj_seed_0[:CONFIG["n_circles"], idx]
@@ -762,12 +698,11 @@ plt.savefig(plots_path / "extended_parameter_trajectories.png")
 plt.show()
 
 
-
 #%% Plot the n_circles model predictions on the train and test sets
 # This shows how well the model fits the data at the end of the data expansion phase
 print("Generating n_circles Model Prediction Plot...")
 # step_idx = CONFIG["n_circles"]
-step_idx = 75
+step_idx = 50
 fig, ax = plt.subplots(figsize=(10, 6))     
 # Background Data
 # ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
