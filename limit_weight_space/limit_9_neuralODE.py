@@ -12,8 +12,7 @@ import time
 import datetime
 import shutil
 import sys
-
-from equinox_utils import EideticGRUCell
+import diffrax  # <--- Added Diffrax
 
 # Set plotting style
 sns.set(style="white", context="talk")
@@ -25,8 +24,8 @@ TRAIN = True
 RUN_DIR = "." 
 
 CONFIG = {
-    "seed": time.time_ns() % (2**32 - 1),
-    # "seed": 2026,
+    # "seed": time.time_ns() % (2**32 - 1),
+    "seed": 2026,
 
     # Data & MLP Hyperparameters
     "data_samples": 2000,
@@ -39,14 +38,13 @@ CONFIG = {
     # Expansion Hyperparameters
     "n_circles": 50,           
     
-    # GRU & Training Config
+    # NODE & Training Config (Renamed from GRU)
     "lr": 5e-5,      
-    "gru_hidden_size": 128,    
-    "gru_epochs": 2000,  
-    "gru_batch_size": 1,      # Number of parallel initializations (Seeds)
-    "eidetic_gru": True,        # Whether to use Eidetic GRU Cell
+    "node_hidden_size": 128,    
+    "node_epochs": 1500,  
+    "node_batch_size": 1,      # Number of parallel initializations (Seeds)
     
-    "gru_target_step": 100,    # Total steps to unroll (Horizon)
+    "node_target_step": 60,    # Total steps to unroll (Horizon) corresponds to t=1
     "scheduled_loss_weight": False,  # Whether to use scheduled weight for each loss step
 
     ## Consistency Loss Config
@@ -55,7 +53,7 @@ CONFIG = {
     "consistency_loss_weight": 0.0,  # Weight for the (de)consistency loss term
 
     # Regularization Config
-    "regularization_step": 75,     # Step at which to apply the 'final' constraint
+    "regularization_step": 55,     # Step at which to apply the 'final' constraint
     "regularization_weight": 0.0,  # Coefficient for the reg loss (0 = drift)
     
     # Data Selection Mode
@@ -193,17 +191,18 @@ print(f"Data Center (Mean): {x_mean:.4f}")
 
 # Precompute masks for circles
 dists = jnp.abs(X_train_full - x_mean).flatten()
-radii = jnp.linspace(0.05, jnp.max(dists) + 0.01, CONFIG["n_circles"])
+min_radius = jnp.max(dists) / (2 * CONFIG["n_circles"])
+radii = jnp.linspace(min_radius, jnp.max(dists) + 0.01, CONFIG["n_circles"])
 circle_masks = jnp.stack([dists <= r for r in radii]) 
 
 ## We need a fake set of radii for synthetic data sampling in consistency loss. 
-## We simply extend the "radii" with same spacing, uncil we have gru_steps
+## We simply extend the "radii" with same spacing, uncil we have node_steps
 delta_radius = radii[1] - radii[0]
-fake_radii = jnp.arange(radii[-1], radii[-1] + (CONFIG["gru_target_step"]-CONFIG["n_circles"])*delta_radius + 0.01, delta_radius)
+fake_radii = jnp.arange(radii[-1], radii[-1] + (CONFIG["node_target_step"]-CONFIG["n_circles"])*delta_radius + 0.01, delta_radius)
 all_radii = jnp.concatenate([radii, fake_radii])
 
 #%%
-# --- 4. MODEL DEFINITIONS ---
+# --- 4. MODEL DEFINITIONS (NEURAL ODE) ---
 
 width_size = CONFIG["width_size"]
 class MLPModel(eqx.Module):
@@ -220,51 +219,128 @@ class MLPModel(eqx.Module):
     def predict(self, x):
         return jax.vmap(self)(x)
 
-class WeightGRU(eqx.Module):
-    cell: eqx.nn.GRUCell
-    encoder: eqx.nn.Linear
-    decoder: eqx.nn.Linear
-    
-    def __init__(self, key, input_dim, hidden_dim):
+# The dynamics model: an MLP representing dy/dt = f(t, y)
+class VectorField(eqx.Module):
+    layers: list
+
+    def __init__(self, hidden_size, key):
         k1, k2, k3 = jax.random.split(key, 3)
+        # Input: [y, t] -> size: hidden_size + 1
+        self.layers = [
+            # eqx.nn.Linear(hidden_size + 1, hidden_size, key=k1), 
+            eqx.nn.Linear(hidden_size, hidden_size, key=k1), 
+            jax.nn.softplus,
+            eqx.nn.Linear(hidden_size, hidden_size, key=k2),
+            jax.nn.softplus,
+            eqx.nn.Linear(hidden_size, hidden_size, key=k3)
+        ]
+
+    def __call__(self, t, y, args):
+        # t is scalar, y is (hidden_size,)
+        # t_vec = jnp.array([t])
+        # x = jnp.concatenate([y, t_vec])
+
+        x = y
+        for l in self.layers:
+            x = l(x)
+        return x
+
+# class WeightNODE(eqx.Module):
+#     encoder: eqx.nn.Linear
+#     decoder: eqx.nn.Linear
+#     vector_field: VectorField
+    
+#     def __init__(self, key, input_dim, hidden_dim):
+#         k1, k2, k3 = jax.random.split(key, 3)
         
-        self.encoder = eqx.nn.Linear(input_dim, hidden_dim, key=k1)
-        if not CONFIG["eidetic_gru"]:
-            self.cell = eqx.nn.GRUCell(hidden_dim, hidden_dim, key=k2)
-        else:
-            self.cell = EideticGRUCell(hidden_dim, hidden_dim, key=k2)      ##TODO
-        self.decoder = eqx.nn.Linear(hidden_dim, input_dim, key=k3)
+#         self.encoder = eqx.nn.Linear(input_dim, hidden_dim, key=k1)
+#         self.vector_field = VectorField(hidden_dim, key=k2)
+#         self.decoder = eqx.nn.Linear(hidden_dim, input_dim, key=k3)
+
+#     def __call__(self, x0, steps, key=None):
+#         # x0 shape: (Input_Dim)
+        
+#         # 1. Encode initial weights into latent state
+#         h0 = self.encoder(x0)
+        
+#         # 2. Integrate ODE
+#         # We want output at specific time steps from t=0 to t=1
+#         ts = jnp.linspace(0, 1, steps)
+        
+#         term = diffrax.ODETerm(self.vector_field)
+#         solver = diffrax.Dopri5()
+#         # Ensure we save the state at the exact request time points
+#         saveat = diffrax.SaveAt(ts=ts)
+#         # Use PID controller for adaptive step size
+#         stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
+        
+#         sol = diffrax.diffeqsolve(
+#             term, 
+#             solver, 
+#             t0=0, 
+#             t1=1, 
+#             dt0=0.01, # Initial step size guess 
+#             y0=h0, 
+#             saveat=saveat, 
+#             stepsize_controller=stepsize_controller
+#         )
+        
+#         # sol.ys shape: (steps, hidden_dim)
+        
+#         # 3. Decode latent trajectory back to weight space
+#         # vmap the decoder over the time dimension
+#         predictions = jax.vmap(self.decoder)(sol.ys)
+        
+#         return predictions
+
+
+class WeightNODE(eqx.Module):
+    """ Simple NODE without encoder/decoder, directly models weights in latent space. """
+    vector_field: VectorField
+
+    def __init__(self, key, input_dim, hidden_dim):
+        k1 = key
+        
+        self.vector_field = VectorField(input_dim, key=k1)
 
     def __call__(self, x0, steps, key=None):
         # x0 shape: (Input_Dim)
-        # We handle batching via vmap in training loop, so here assumes single item logic
         
-        h0 = jnp.zeros((self.cell.hidden_size,))
-        keys = jax.random.split(key, steps) if key is not None else [None] * steps
+        # 1. Initial state is directly the weights
+        h0 = x0
         
-        def scan_step(carry, inputs):
-            h, x_prev = carry
-            
-            # Autoregressive input (Always previous prediction)
-            current_input = x_prev
+        # 2. Integrate ODE
+        # We want output at specific time steps from t=0 to t=1
+        ts = jnp.linspace(0, 1, steps)
+        
+        term = diffrax.ODETerm(self.vector_field)
+        solver = diffrax.Dopri5()
+        # Ensure we save the state at the exact request time points
+        saveat = diffrax.SaveAt(ts=ts)
+        # Use PID controller for adaptive step size
+        stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
+        
+        sol = diffrax.diffeqsolve(
+            term, 
+            solver, 
+            t0=0, 
+            t1=1, 
+            dt0=0.01, # Initial step size guess 
+            y0=h0, 
+            saveat=saveat, 
+            stepsize_controller=stepsize_controller
+        )
+        
+        # sol.ys shape: (steps, input_dim)
+        
+        return sol.ys
 
-            embedded = self.encoder(current_input)
-            h_new = self.cell(embedded, h)
-            out = self.decoder(h_new)
-            
-            x_next = out
-            return (h_new, x_next), x_next
-
-        init_carry = (h0, x0)
-        _, predictions = jax.lax.scan(scan_step, init_carry, jnp.array(keys))
-        
-        return predictions
 
 #%%
 # --- 5. INITIALIZATION & BATCH GENERATION ---
 
 key = jax.random.PRNGKey(CONFIG["seed"])
-k_init, k_gru, key = jax.random.split(key, 3)
+k_init, k_node, key = jax.random.split(key, 3)
 
 # 1. Setup Model Structure (Static)
 model_template = MLPModel(k_init)
@@ -273,11 +349,11 @@ flat_template, shapes, treedef, mask = flatten_pytree(params_template)
 input_dim = flat_template.shape[0]
 
 # 2. Generate Batch of Initial States (Different Seeds)
-print(f"Generating {CONFIG['gru_batch_size']} initial states...")
+print(f"Generating {CONFIG['node_batch_size']} initial states...")
 x0_batch_list = []
 gen_key = jax.random.PRNGKey(CONFIG["seed"] + 100)
 
-for _ in range(CONFIG["gru_batch_size"]):
+for _ in range(CONFIG["node_batch_size"]):
     gen_key, sk = jax.random.split(gen_key)
     m = MLPModel(sk)
     p, _ = eqx.partition(m, eqx.is_array)
@@ -286,10 +362,10 @@ for _ in range(CONFIG["gru_batch_size"]):
 
 x0_batch = jnp.stack(x0_batch_list) # (Batch, Input_Dim)
 
-# 3. Init GRU
-gru_model = WeightGRU(k_gru, input_dim, CONFIG["gru_hidden_size"])
+# 3. Init NODE
+node_model = WeightNODE(k_node, input_dim, CONFIG["node_hidden_size"])
 opt = optax.adam(CONFIG["lr"]) 
-opt_state = opt.init(eqx.filter(gru_model, eqx.is_array))
+opt_state = opt.init(eqx.filter(node_model, eqx.is_array))
 
 #%%
 # --- 6. END-TO-END TRAINING LOOP (BATCHED) ---
@@ -358,7 +434,7 @@ def get_consistency_loss(flat_w_in, flat_w_out, step_idx_in, key):
     ## We know the center of the data, and we know the radius of the inner circle at this step
     ## We want to sample with higer probability close to the perimeter of the inner circle. Gradual probablity increase.
     ## This is synthetic data, so we can sample as much as we want, even outside n_circles in the original data
-    circle_idx = jnp.minimum(step_idx_in, CONFIG["gru_target_step"] - 1)
+    circle_idx = jnp.minimum(step_idx_in, CONFIG["node_target_step"] - 1)
     radius = all_radii[circle_idx]
     n_synthetic = CONFIG["n_synthetic_points"]
     angles = jax.random.uniform(key, shape=(n_synthetic,)) * 2 * jnp.pi
@@ -375,7 +451,7 @@ def get_consistency_loss(flat_w_in, flat_w_out, step_idx_in, key):
     y_pred_out = model_out.predict(X_synthetic[:, None])
     residuals = (y_pred_in - y_pred_out) ** 2
 
-    final_loss =  jnp.mean(residuals)
+    final_loss = jnp.mean(residuals)
     if CONFIG["scheduled_loss_weight"]:
         return final_loss / (step_idx_in**2 + 1)         ## TODO scale down over time?
     else:
@@ -398,7 +474,7 @@ def get_consistency_loss(flat_w_in, flat_w_out, step_idx_in, key):
 #     ## We know the center of the data, and we know the radius of the inner circle at this step
 #     ## We want to sample with higer probability close to the perimeter of the inner circle. Gradual probablity increase.
 #     ## This is synthetic data, so we can sample as much as we want, even outside n_circles in the original data
-#     circle_idx = jnp.minimum(step_idx_in, CONFIG["gru_target_step"] - 2)
+#     circle_idx = jnp.minimum(step_idx_in, CONFIG["node_target_step"] - 2)
 #     radius_in = all_radii[circle_idx]
 #     radius_out = all_radii[circle_idx + 1]
 #     n_synthetic = CONFIG["n_synthetic_points"]
@@ -423,16 +499,15 @@ def get_disconsistency_loss(flat_w_in, flat_w_out, step_idx_in, key):
     return jnp.maximum(0.0, 1.0 - residual)   ## Hinge loss style
 
 @eqx.filter_value_and_grad
-def train_step_fn(gru, x0_batch, key):
+def train_step_fn(node, x0_batch, key):
     # x0_batch: (Batch, D)
-    total_steps = CONFIG["gru_target_step"]
+    total_steps = CONFIG["node_target_step"]
     
-    # VMAP GRU over batch
-    # keys needs to be (Batch,) for randomness if used, but here GRU is deterministic
+    # VMAP NODE over batch
+    # keys needs to be (Batch,) for randomness if used, but here NODE is deterministic
     # We broadcast key or split it if needed. 
-    # Current GRU doesn't use key for sampling anymore (MSE mode)
 
-    preds_batch = jax.vmap(gru, in_axes=(0, None, None))(x0_batch, total_steps, None) # preds_batch: (Batch, Steps, D)
+    preds_batch = jax.vmap(node, in_axes=(0, None, None))(x0_batch, total_steps, None) # preds_batch: (Batch, Steps, D)
 
     ## DO a cumsum along the steps to get the full trajectory
     # preds_batch = jnp.cumsum(preds_batch, axis=1)
@@ -440,12 +515,11 @@ def train_step_fn(gru, x0_batch, key):
     step_indices = jnp.arange(total_steps)
     preds_batch_data = preds_batch
 
-    # ## TODO: randomly select two steps per batch member for efficiency
-    # step_indices = jax.random.choice(key, CONFIG["n_circles"], shape=(12,), replace=False)
-    # # step_indices = jax.random.choice(key, 10, shape=(2,), replace=False)
-    # # step_indices = jnp.array([CONFIG["n_circles"]-1])
-    # step_indices = jnp.sort(step_indices)
-    # preds_batch_data = preds_batch[:, step_indices, :]
+    ## TODO: randomly select two steps per batch member for efficiency
+    step_indices = jax.random.choice(key, CONFIG["n_circles"], shape=(2,), replace=False)
+    # step_indices = jnp.array([CONFIG["n_circles"]-1])
+    step_indices = jnp.sort(step_indices)
+    preds_batch_data = preds_batch[:, step_indices, :]
 
     # Calculate loss for each batch member, for each step
     # double vmap: outer over batch, inner over steps
@@ -474,54 +548,60 @@ def train_step_fn(gru, x0_batch, key):
     # total_loss = total_cons_loss
     total_loss = total_data_loss + CONFIG["consistency_loss_weight"]*total_cons_loss
 
+
+    # ## Add a loss term that penalises complex dynamics? E.g., L2 norm of the vector field parameters?
+    # node_reg_params = eqx.filter(node.vector_field, eqx.is_array)
+    # reg_loss = sum([jnp.sum(jnp.square(p)) for p in jtree.tree_leaves(node_reg_params)])
+    # total_loss = total_loss + 1e-6 * reg_loss
+
     return total_loss
 
 @eqx.filter_jit
-def make_step(gru, opt_state, x0_batch, key):
-    loss, grads = train_step_fn(gru, x0_batch, key)
-    updates, opt_state = opt.update(grads, opt_state, gru)
-    gru = eqx.apply_updates(gru, updates)
-    return gru, opt_state, loss
+def make_step(node, opt_state, x0_batch, key):
+    loss, grads = train_step_fn(node, x0_batch, key)
+    updates, opt_state = opt.update(grads, opt_state, node)
+    node = eqx.apply_updates(node, updates)
+    return node, opt_state, loss
 
 if TRAIN:
-    print(f"🚀 Starting Batch GRU Training. Batch Size: {CONFIG['gru_batch_size']}")
+    print(f"🚀 Starting Batch NODE Training. Batch Size: {CONFIG['node_batch_size']}")
     print(f"Reg Weight: {CONFIG['regularization_weight']} @ Step {CONFIG['regularization_step']}")
     
     loss_history = []
     train_key = jax.random.PRNGKey(CONFIG["seed"] + 99)
-    best_model = gru_model      ## Best model on train set
+    best_model = node_model      ## Best model on train set
     lowest_loss = float('inf')
 
-    for ep in range(CONFIG["gru_epochs"]):
+    for ep in range(CONFIG["node_epochs"]):
         train_key, step_key = jax.random.split(train_key)
-        gru_model, opt_state, loss = make_step(gru_model, opt_state, x0_batch, step_key)
+        node_model, opt_state, loss = make_step(node_model, opt_state, x0_batch, step_key)
         loss_history.append(loss)
 
         if loss < lowest_loss:
             lowest_loss = loss
-            best_model = gru_model
+            best_model = node_model
         
         if (ep+1) % 500 == 0:
             print(f"Epoch {ep+1} | Loss: {loss:.6f}")
 
     ## Make sure we use the best model at the end
-    gru_model = best_model
+    node_model = best_model
 
     # Generate final trajectories for ALL batch members
     eval_key = jax.random.PRNGKey(42)
-    final_batch_traj = jax.vmap(gru_model, in_axes=(0, None, None))(x0_batch, CONFIG["gru_target_step"], None)
+    final_batch_traj = jax.vmap(node_model, in_axes=(0, None, None))(x0_batch, CONFIG["node_target_step"], None)
     
     np.save(artefacts_path / "final_batch_traj.npy", final_batch_traj)
     np.save(artefacts_path / "loss_history.npy", np.array(loss_history))
 
-    ## Save the gru model as well with Equinox serialization
-    eqx.tree_serialise_leaves(artefacts_path / "gru_model.eqx", gru_model)
+    ## Save the node model as well with Equinox serialization
+    eqx.tree_serialise_leaves(artefacts_path / "node_model.eqx", node_model)
 
 else:
     print("Loading results...")
     final_batch_traj = np.load(artefacts_path / "final_batch_traj.npy")
     loss_history = np.load(artefacts_path / "loss_history.npy")
-    gru_model = eqx.tree_deserialise_leaves(artefacts_path / "gru_model.eqx", gru_model)
+    node_model = eqx.tree_deserialise_leaves(artefacts_path / "node_model.eqx", node_model)
 
 # Use the FIRST trajectory for standard single-model dashboards to keep them working
 final_traj = final_batch_traj[0]
@@ -596,7 +676,7 @@ fig_batch = plt.figure(figsize=(20, 8))
 gs_batch = fig_batch.add_gridspec(1, 3)
 
 # Define Key Steps
-steps_to_plot = [CONFIG["n_circles"], CONFIG["regularization_step"], CONFIG["gru_target_step"] - 1]
+steps_to_plot = [CONFIG["n_circles"], CONFIG["regularization_step"], CONFIG["node_target_step"] - 1]
 titles = ["End of Circles", "Regularization Step", "Final Limit"]
 
 
@@ -608,7 +688,7 @@ for i, step_idx in enumerate(steps_to_plot):
     ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1)
     
     # Plot all batch members
-    for b in range(CONFIG["gru_batch_size"]):
+    for b in range(CONFIG["node_batch_size"]):
         w = final_batch_traj[b, step_idx]
         p = unflatten_pytree(w, shapes, treedef, mask)
         m = eqx.combine(p, static)
@@ -658,57 +738,53 @@ ax_t1.legend(ncol=2, fontsize='small')
 # PLOT B: STABILITY (Jacobian at Reg Step of First Seed)
 ax_e = fig_diag.add_subplot(gs_diag[0, 1])
 
-def get_gru_step_fn(gru):
-    def step_fn(joint_state):
-        # One step of GRU dynamics: (w_t, h_t) -> (w_t+1, h_t+1)
-        w, h = joint_state
-        embedded = gru.encoder(w)
-        h_new = gru.cell(embedded, h)
-        w_new = gru.decoder(h_new)
-        return (w_new, h_new)
+# For NODE, stability is defined by the integration step of the latent state h.
+# We recover h at the regularization step, then calculate the Jacobian of 
+# integrating h from t to t + dt.
+
+print("Recovering hidden state for stability analysis...")
+# 1. Recover h at the regularization time
+reg_t_idx = CONFIG["regularization_step"]
+total_steps = CONFIG["node_target_step"]
+dt_step = 1.0 / (total_steps - 1)
+t_reg = reg_t_idx * dt_step
+
+x_start = x0_batch[0] 
+if hasattr(node_model, 'encoder'):
+    h0 = node_model.encoder(x_start)
+else:
+    h0 = x_start
+
+# Solve ODE from 0 to t_reg to get h_target
+term = diffrax.ODETerm(node_model.vector_field)
+solver = diffrax.Dopri5()
+sol_reg = diffrax.diffeqsolve(
+    term, solver, t0=0, t1=t_reg, dt0=0.01, y0=h0,
+    stepsize_controller=diffrax.PIDController(rtol=1e-3, atol=1e-6)
+)
+h_target = sol_reg.ys[-1]
+
+def get_node_step_fn(vector_field, dt):
+    def step_fn(h_state):
+        # Integrate for exactly one conceptual "step" (dt)
+        # We perform a single integration step for analysis
+        term = diffrax.ODETerm(vector_field)
+        solver = diffrax.Dopri5()
+        sol = diffrax.diffeqsolve(
+            term, solver, t0=0, t1=dt, dt0=dt, y0=h_state
+        )
+        return sol.ys[-1]
     return step_fn
 
-# --- FIX: Proper Autoregressive Scan to Recover Hidden State ---
-print("Recovering hidden state for stability analysis...")
-h0 = jnp.zeros((gru_model.cell.hidden_size,))
-x_start = x0_batch[0] # Initial weight for the first seed
+step_fn = get_node_step_fn(node_model.vector_field, dt_step)
 
-def diag_scan_step(carry, _):
-    # Ignore the second arg (which is None)
-    h, x_prev = carry
-    
-    # Autoregressive: Input is previous output
-    embedded = gru_model.encoder(x_prev)
-    h_new = gru_model.cell(embedded, h)
-    x_next = gru_model.decoder(h_new)
-    
-    return (h_new, x_next), None
-
-# Run forward exactly as training did to get consistent (h, w) at reg_step
-(h_target, w_target), _ = jax.lax.scan(
-    diag_scan_step,
-    (h0, x_start), 
-    None, 
-    length=CONFIG["regularization_step"]
-)
-
-step_fn = get_gru_step_fn(gru_model)
 try:
     # Compute Jacobian of the step function at the regularization point
-    print(f"Computing Jacobian at step {CONFIG['regularization_step']}...")
-    J_tuple = jax.jacfwd(step_fn)((w_target, h_target))
+    print(f"Computing Jacobian at step {CONFIG['regularization_step']} (t={t_reg:.3f})...")
+    # Jacobian is d(h_next)/d(h_prev) which is size (Hidden, Hidden)
+    J = jax.jacfwd(step_fn)(h_target)
     
-    # J_tuple is ((dw'/dw, dw'/dh), (dh'/dw, dh'/dh))
-    J_ww = J_tuple[0][0]
-    J_wh = J_tuple[0][1]
-    J_hw = J_tuple[1][0]
-    J_hh = J_tuple[1][1]
-    
-    top = jnp.concatenate([J_ww, J_wh], axis=1)
-    bot = jnp.concatenate([J_hw, J_hh], axis=1)
-    Full_J = jnp.concatenate([top, bot], axis=0)
-    
-    eigenvals = jnp.linalg.eigvals(Full_J)
+    eigenvals = jnp.linalg.eigvals(J)
     
     # Visualization
     unit_circle = plt.Circle((0, 0), 1, color='black', fill=False, linestyle='--', linewidth=2)
@@ -720,7 +796,7 @@ try:
     
     max_rad = jnp.max(jnp.abs(eigenvals))
     ax_e.text(0.05, 0.95, f"Max |λ|: {max_rad:.4f}", transform=ax_e.transAxes, bbox=dict(facecolor='white', alpha=0.8))
-    ax_e.set_title("Stability Analysis (Eigenvalues)")
+    ax_e.set_title("Stability Analysis (Eigenvalues of Integral Step)")
     ax_e.set_aspect('equal')
     ax_e.grid(True, alpha=0.3)
     
@@ -785,7 +861,7 @@ plt.show()
 ## We are plotting as many parameters as possible in a tall plot. We only plot the first n_circles steps to focus on the interesting part.
 print("Generating Extended Parameter Trajectories Plot...")
 fig, ax = plt.subplots(figsize=(7, 10), nrows=1, ncols=1) ## everything in one axis
-plot_ids = np.arange(100)  # First 64 parameters
+plot_ids = np.arange(10)  # First 64 parameters
 
 for idx in plot_ids:
     # traj = traj_seed_0[:CONFIG["n_circles"], idx]
@@ -815,7 +891,7 @@ plt.show()
 # This shows how well the model fits the data at the end of the data expansion phase
 print("Generating n_circles Model Prediction Plot...")
 # step_idx = CONFIG["n_circles"]
-step_idx = 35
+step_idx = 75
 fig, ax = plt.subplots(figsize=(10, 6))     
 # Background Data
 # ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
@@ -830,19 +906,19 @@ ax.scatter(X_train_full, Y_train_full, c=train_colors, s=10, alpha=0.3, label="T
 ## Create a new final batch traj from a random seed to ensure we have diversity
 print("Generating new batch for n_circles prediction plot...")
 x0_batch_list = []
-gen_key = jax.random.PRNGKey(time.time_ns() % (2**32 - 1))
-# gen_key = jax.random.PRNGKey(CONFIG["seed"] + 100)
-for _ in range(CONFIG["gru_batch_size"]):
+# gen_key = jax.random.PRNGKey(time.time_ns() % (2**32 - 1))      ## TODO: NeuralODE overfits to death
+gen_key = jax.random.PRNGKey(CONFIG["seed"] + 100)
+for _ in range(CONFIG["node_batch_size"]):
     gen_key, sk = jax.random.split(gen_key)
     m = MLPModel(sk)
     p, _ = eqx.partition(m, eqx.is_array)
     f, _, _, _ = flatten_pytree(p)
     x0_batch_list.append(f)
 x0_batch = jnp.stack(x0_batch_list) # (Batch, Input_Dim)
-new_final_batch_traj = jax.vmap(gru_model, in_axes=(0, None, None))(x0_batch, CONFIG["gru_target_step"], None)
+new_final_batch_traj = jax.vmap(node_model, in_axes=(0, None, None))(x0_batch, CONFIG["node_target_step"], None)
 
 # Plot all batch members
-for b in range(CONFIG["gru_batch_size"]):
+for b in range(CONFIG["node_batch_size"]):
     # w = final_batch_traj[b, step_idx]
     w = new_final_batch_traj[b, step_idx]
     p = unflatten_pytree(w, shapes, treedef, mask)
@@ -862,7 +938,7 @@ plt.show()
 
 
 #%% Special evaluation of the loss
-## Our annulus training strategy gives us gru_step>n_circles models, each specialised on its own radius.
+## Our annulus training strategy gives us node_step>n_circles models, each specialised on its own radius.
 ## So our evalulation is simple. For each point, we find which circle it belongs to, and use the corresponding model to evaluate its loss.
 print("Evaluating Final Model Loss with Circle-Specific Models...")
 # def evaluate_circle_specific_loss(final_batch_traj, X_data, Y_data):
@@ -902,7 +978,7 @@ def evaluate_circle_specific_loss(final_batch_traj, X_data, Y_data):
     circle_losses = {}
     n_points = X_data.shape[0]
 
-    for circle_idx in range(CONFIG["gru_target_step"]):
+    for circle_idx in range(CONFIG["node_target_step"]):
         # Get the model for this circle from the first batch member
         w = final_batch_traj[0, circle_idx]  # Using the first batch member for simplicity
         p = unflatten_pytree(w, shapes, treedef, mask)
@@ -959,7 +1035,7 @@ plt.show()
 print("Generating n_circles Model Prediction Plot (Circle-Specific Models)...")
 ## For each data point (train+test), find which circle it belongs to, and do the prediction with the corresponding model
 dists = jnp.abs(X_train_full - x_mean).flatten()
-r_current = all_radii[jnp.minimum(step_idx, CONFIG["gru_target_step"] - 1)]
+r_current = all_radii[jnp.minimum(step_idx, CONFIG["node_target_step"] - 1)]
 
 def predict_circle_specific_loss(final_batch_traj, X_data):
     ## THis function should return the average loss, for each circle. only on the corresponding data points.
@@ -967,7 +1043,7 @@ def predict_circle_specific_loss(final_batch_traj, X_data):
     circle_losses = {}
     n_points = X_data.shape[0]
 
-    for circle_idx in range(CONFIG["gru_target_step"]):
+    for circle_idx in range(CONFIG["node_target_step"]):
         # Get the model for this circle from the first batch member
         w = final_batch_traj[0, circle_idx]  # Using the first batch member for simplicity
         p = unflatten_pytree(w, shapes, treedef, mask)
@@ -1014,3 +1090,4 @@ ax.grid(True, alpha=0.3)
 ax.legend()
 plt.tight_layout()
 plt.savefig(plots_path / "model_predictions_n_circles_circle_specific.png")
+# %%
