@@ -23,8 +23,8 @@ CONFIG = {
     "seed": time.time_ns() % (2**32 - 1),
     "lr_nn": 0.0001,    # Standard Models & PAM NN
     "lr_ctx": 0.01,    # PAM Contexts
-    "batch_size": 8*1,
-    "epochs": 600,     
+    "batch_size": 64,
+    "epochs": 300,     
     "context_init": "zero", # "zero" or "random"
     
     # Inner Loop Hyperparameters
@@ -686,13 +686,13 @@ if TRAIN:
     t_order_ebm_y = CONFIG["taylor_order_ebm_y"]
 
     models_config = [
-        # ("Linear", LinearModel(key)),
+        ("Linear", LinearModel(key)),
         ("MLP", MLPModel(key)),
-        # ("TaylorMLP", TaylorMLP(key, radius=t_radius, order=t_order_mlp)),
-        # ("BaseEBM", BaseEBM(key, y_mean, order_y=0, radius=0)),
-        # ("TaylorBaseEBM", TaylorBaseEBM(key, y_mean, radius=t_radius, order=t_order_ebm_x, order_y=t_order_ebm_y)),
-        # ("ContextEBM", ContextEBM(key, num_train, y_mean, c_dim)),
-        # ("TaylorContextEBM", TaylorContextEBM(key, num_train, y_mean, c_dim))
+        ("TaylorMLP", TaylorMLP(key, radius=t_radius, order=t_order_mlp)),
+        ("BaseEBM", BaseEBM(key, y_mean, order_y=0, radius=0)),
+        ("TaylorBaseEBM", TaylorBaseEBM(key, y_mean, radius=t_radius, order=t_order_ebm_x, order_y=t_order_ebm_y)),
+        ("ContextEBM", ContextEBM(key, num_train, y_mean, c_dim)),
+        ("TaylorContextEBM", TaylorContextEBM(key, num_train, y_mean, c_dim))
     ]
 
     for name, model in models_config:

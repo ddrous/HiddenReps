@@ -42,7 +42,7 @@ CONFIG = {
     # GRU & Training Config
     "lr": 5e-5,      
     "gru_hidden_size": 128,    
-    "gru_epochs": 2000,  
+    "gru_epochs": 5000,  
     "gru_batch_size": 1,      # Number of parallel initializations (Seeds)
     "eidetic_gru": True,        # Whether to use Eidetic GRU Cell
     
@@ -277,14 +277,42 @@ print(f"Generating {CONFIG['gru_batch_size']} initial states...")
 x0_batch_list = []
 gen_key = jax.random.PRNGKey(CONFIG["seed"] + 100)
 
-for _ in range(CONFIG["gru_batch_size"]):
-    gen_key, sk = jax.random.split(gen_key)
-    m = MLPModel(sk)
-    p, _ = eqx.partition(m, eqx.is_array)
-    f, _, _, _ = flatten_pytree(p)
-    x0_batch_list.append(f)
+# for _ in range(CONFIG["gru_batch_size"]):
+#     gen_key, sk = jax.random.split(gen_key)
+#     m = MLPModel(sk)
+#     p, _ = eqx.partition(m, eqx.is_array)
+#     f, _, _, _ = flatten_pytree(p)
+#     x0_batch_list.append(f)
 
-x0_batch = jnp.stack(x0_batch_list) # (Batch, Input_Dim)
+# x0_batch = jnp.stack(x0_batch_list) # (Batch, Input_Dim)
+
+
+def gen_x0_batch(batch_size, key):
+    x0_batch_list = []
+    gen_key = key
+
+    for _ in range(batch_size):
+        gen_key, sk = jax.random.split(gen_key)
+        m = MLPModel(sk)
+        p, _ = eqx.partition(m, eqx.is_array)
+        f, _, _, _ = flatten_pytree(p)
+
+        # ## Perturb slightly around the fixed init model
+        # eps = jax.random.uniform(gen_key, shape=f.shape, minval=-1e-5, maxval=1e-5)
+        # f = f + eps
+
+        # ## Let's pick 10 paramters at random, and perturb them only
+        # eps = jax.random.uniform(gen_key, shape=(10,), minval=-1e-4, maxval=1e-4)
+        # param_indices = jax.random.choice(gen_key, f.shape[0], shape=(10,), replace=False)
+        # f = f.at[param_indices].add(eps)
+    
+        x0_batch_list.append(f)
+
+    x0_batch = jnp.stack(x0_batch_list) 
+    return x0_batch
+
+x0_batch = gen_x0_batch(CONFIG["gru_batch_size"], gen_key)
+
 
 # 3. Init GRU
 gru_model = WeightGRU(k_gru, input_dim, CONFIG["gru_hidden_size"])
@@ -494,6 +522,9 @@ if TRAIN:
 
     for ep in range(CONFIG["gru_epochs"]):
         train_key, step_key = jax.random.split(train_key)
+
+        x0_batch = gen_x0_batch(CONFIG["gru_batch_size"], step_key)     ## TODO: regenerate each step?
+
         gru_model, opt_state, loss = make_step(gru_model, opt_state, x0_batch, step_key)
         loss_history.append(loss)
 
@@ -967,6 +998,7 @@ def predict_circle_specific_loss(final_batch_traj, X_data):
     circle_losses = {}
     n_points = X_data.shape[0]
 
+    # for circle_idx in range(CONFIG["gru_target_step"]):
     for circle_idx in range(CONFIG["gru_target_step"]):
         # Get the model for this circle from the first batch member
         w = final_batch_traj[0, circle_idx]  # Using the first batch member for simplicity
