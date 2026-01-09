@@ -808,7 +808,7 @@ def gen_x0_batch(batch_size, key):
         # eps = jax.random.uniform(gen_key, shape=f.shape[0], minval=-1, maxval=1)
 
         # x0_batch_list.append(f*0.0 + jnp.sign(eps)*0.5)
-        x0_batch_list.append(f)
+        x0_batch_list.append(f/100.0)
 
     x0_batch = jnp.stack(x0_batch_list) 
     return x0_batch
