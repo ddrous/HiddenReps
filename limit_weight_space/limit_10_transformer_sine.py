@@ -26,6 +26,10 @@ CONFIG = {
     # "seed": time.time_ns() % (2**32 - 1),
     "seed": 2026,
 
+    "x_range": [-4.0, 4.0],  # Wider range to see the sine wave repeat
+    "segments": 5,           # Split into 5 distinct vertical strips
+    "train_seg_ids": [1, 2, 3], # Train on the middle
+
     # Data & MLP Hyperparameters
     "data_samples": 2000,
     "noise_std": 0.005,
@@ -41,14 +45,14 @@ CONFIG = {
     # --- TRANSFORMER HYPERPARAMETERS ---
     "lr": 5e-6,      
     "transformer_epochs": 5000,
-    "transformer_batch_size": 1,      
+    "transformer_batch_size": 16,      
     
     # New Params
     "transformer_d_model": 128,    # Embedding Dimension
     "transformer_n_heads": 2,      # Number of Heads
     "transformer_n_layers": 4,     # Number of Transformer Blocks
     "transformer_d_ff": 256,       # Feedforward dimension inside block
-    "transformer_substeps": 1,     # Number of micro-steps per macro step
+    "transformer_substeps": 50,     # Number of micro-steps per macro step
     
     "transformer_target_step": 75,    # Total steps to unroll
     "scheduled_loss_weight": False,
@@ -127,35 +131,42 @@ def unflatten_pytree(flat, shapes, tree_def, is_array_mask):
 #%%
 # --- 3. DATA GENERATION ---
 
-def gen_data(seed, n_samples, n_segments=3, local_structure="random", 
-             x_range=[-1, 1], slope=2.0, base_intercept=0.0, 
-             step_size=2.0, custom_func=None, noise_std=0.5):
+def gen_data(seed, n_samples, n_segments=3, x_range=[-3.0, 3.0], noise_std=0.1):
+    """
+    Generates a classical 1D-1D regression dataset: y = sin(3x) + 0.5x
+    Segments are assigned based on spatial position (x-value), allowing
+    for easy OOD splitting (e.g., train on segments [0,1], test on [2]).
+    """
     np.random.seed(seed)
-    x_min, x_max = x_range
-    segment_boundaries = np.linspace(x_min, x_max, n_segments + 1)
-    samples_per_seg = [n_samples // n_segments + (1 if i < n_samples % n_segments else 0) 
-                       for i in range(n_segments)]
-    all_x, all_y, segment_ids = [], [], []
     
-    for i in range(n_segments):
-        seg_x_min, seg_x_max = segment_boundaries[i], segment_boundaries[i+1]
-        n_seg_samples = samples_per_seg[i]
-        x_seg = np.random.uniform(seg_x_min, seg_x_max, n_seg_samples)
-        
-        b = 0
-        if local_structure == "constant": b = base_intercept
-        elif local_structure == "random": b = np.random.uniform(-5, 5) 
-        elif local_structure == "gradual_increase": b = base_intercept + (i * step_size)
-        elif local_structure == "gradual_decrease": b = base_intercept - (i * step_size)
-        
-        noise = np.random.normal(0, noise_std, n_seg_samples)
-        y_seg = (slope * x_seg) + b + noise
-        all_x.append(x_seg)
-        all_y.append(y_seg)
-        segment_ids.append(np.full(n_seg_samples, i))
-        
-    data = np.column_stack((np.concatenate(all_x), np.concatenate(all_y)))
-    return data, np.concatenate(segment_ids)
+    # 1. Generate X uniformly across the full range
+    x_min, x_max = x_range
+    X = np.random.uniform(x_min, x_max, n_samples)
+    
+    # 2. Define the unchanging relation P(Y|X) (Concept)
+    # y = sin(3x) + 0.5x is classic because it has both trend and periodicity
+    Y = np.sin(5 * X) + 0.5 * X
+    
+    # Add noise
+    noise = np.random.normal(0, noise_std, n_samples)
+    Y += noise
+    
+    # 3. Create Segments spatially
+    # We divide the x_range into n_segments equal distinct regions
+    bins = np.linspace(x_min, x_max, n_segments + 1)
+    
+    # np.digitize returns indices 1..N, we want 0..N-1
+    segs = np.digitize(X, bins) - 1
+    
+    # Clip to ensure bounds (in case of float precision issues at max edge)
+    segs = np.clip(segs, 0, n_segments - 1)
+    
+    # 4. Format Output
+    # data shape: (N, 2) -> [x, y]
+    # segs shape: (N,)
+    data = np.column_stack((X, Y))
+    
+    return data, segs
 
 run_path = setup_run_dir()
 artefacts_path = run_path / "artefacts"
@@ -163,9 +174,7 @@ plots_path = run_path / "plots"
 
 if TRAIN:
     SEED = CONFIG["seed"]
-    data, segs = gen_data(SEED, CONFIG["data_samples"], n_segments=CONFIG["segments"], 
-                          local_structure="gradual_increase", x_range=CONFIG["x_range"], 
-                          slope=0.5, base_intercept=-0.4, step_size=0.2, noise_std=CONFIG["noise_std"])
+    data, segs = gen_data(SEED, CONFIG["data_samples"], CONFIG["segments"], CONFIG["x_range"], CONFIG["noise_std"])
 
     train_mask = np.isin(segs, CONFIG["train_seg_ids"])
     test_mask = ~train_mask
@@ -1031,7 +1040,7 @@ if TRAIN:
         train_key, step_key = jax.random.split(train_key)
 
         # if ep % 10 == 0:
-        # x0_batch = gen_x0_batch(CONFIG["transformer_batch_size"], step_key)     ## TODO: remmeber to remove this, as we previsouly had this fixed
+        x0_batch = gen_x0_batch(CONFIG["transformer_batch_size"], step_key)     ## TODO: remmeber to remove this, as we previsouly had this fixed
 
         tf_model, opt_state, loss = make_step(tf_model, opt_state, x0_batch, step_key)
         loss_history.append(loss)
