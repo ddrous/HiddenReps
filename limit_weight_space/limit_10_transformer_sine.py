@@ -36,35 +36,35 @@ CONFIG = {
     "segments": 11,
     "x_range": [-1.5, 1.5],
     "train_seg_ids": [2, 3, 4, 5, 6, 7, 8], 
-    "width_size": 48,
+    "width_size": 32,
     "mlp_batch_size": 64,
 
     # Expansion Hyperparameters
-    "n_circles": 50,           
+    "n_circles": 30*1,           
     
     # --- TRANSFORMER HYPERPARAMETERS ---
     "lr": 5e-6,      
-    "transformer_epochs": 5000,
-    "transformer_batch_size": 16,      
+    "transformer_epochs": 2500,
+    "transformer_batch_size": 1,      
     
     # New Params
     "transformer_d_model": 128,    # Embedding Dimension
     "transformer_n_heads": 2,      # Number of Heads
     "transformer_n_layers": 4,     # Number of Transformer Blocks
     "transformer_d_ff": 256,       # Feedforward dimension inside block
-    "transformer_substeps": 50,     # Number of micro-steps per macro step
+    "transformer_substeps": 64,     # Number of micro-steps per macro step
     
-    "transformer_target_step": 75,    # Total steps to unroll
+    "transformer_target_step": 60*1,    # Total steps to unroll
     "scheduled_loss_weight": False,
 
     ## Consistency Loss Config
     "n_synthetic_points": 512,
-    "consistency_loss_weight": 10.0,
+    "consistency_loss_weight": 0.0,
 
     # Regularization Config
-    "regularization_step": 60,     
+    "regularization_step": 40*1,     
     "regularization_weight": 0.0,  
-    
+
     # Data Selection Mode
     "data_selection": "annulus",        ## "annulus" or "full_disk"
     "final_step_mode": "none",          ## "full" or "circle_only"
@@ -510,10 +510,17 @@ class WeightTransformer(eqx.Module):
         mask = idx[:, None] >= idx[None, :]
         return mask
 
+    def make_onestep_mask(self, seq_len):
+        """ Mask that allows each position to see only itself and the previous position"""
+        idx = jnp.arange(seq_len)
+        mask = (idx[:, None] - idx[None, :]) <= 1
+        return mask
+
     def __call__(self, x0, steps, key=None):
         traj_buffer = jnp.zeros((steps, x0.shape[0]))
         traj_buffer = traj_buffer.at[0].set(x0)
-        full_mask = self.make_causal_mask(steps)
+        # full_mask = self.make_causal_mask(steps)
+        full_mask = self.make_onestep_mask(steps)
         
         def scan_step(carry, step_idx):
             current_traj = carry
@@ -807,8 +814,13 @@ def gen_x0_batch(batch_size, key):
 
         # eps = jax.random.uniform(gen_key, shape=f.shape[0], minval=-1, maxval=1)
 
-        # x0_batch_list.append(f*0.0 + jnp.sign(eps)*0.5)
+        ## Small gaussian noise
+        # eps = jax.random.normal(gen_key, shape=f.shape) * 1e-2
+        # x0_batch_list.append(f + eps)
+
+        # x0_batch_list.append(f*0.0)
         x0_batch_list.append(f/100.0)
+        # x0_batch_list.append(f/1.0)
 
     x0_batch = jnp.stack(x0_batch_list) 
     return x0_batch
@@ -1004,20 +1016,25 @@ def train_step_fn(model, x0_batch, key):
 
     total_loss = total_data_loss + CONFIG["consistency_loss_weight"]*total_cons_loss
 
-    # ## Let's penalise large prediction trajectories at the very end
-    # final_preds = preds_batch[:, -1, :]
-    # l2_penalty = jnp.mean(jnp.sum(final_preds**2, axis=1))
-    # total_loss += 1e-2 * l2_penalty
+    # ## Let's penalise large prediction trajectories up to n_circles only
+    # inital_preds = preds_batch[:, :CONFIG["n_circles"], :]
+    # norm_loss = jnp.mean(jnp.sum(inital_preds**2, axis=(1,2)))
+    # total_loss += 1e-3 * norm_loss
 
     # ## Let's penalise large differences between consecutive steps (for the entire sequence)
     # diffs = preds_batch[:, 1:, :] - preds_batch[:, :-1, :]
     # smoothness_penalty = jnp.mean(jnp.sum(diffs**2, axis=(1,2)))
-    # total_loss += 1e-2 * smoothness_penalty
+    # total_loss += 1e-3 * smoothness_penalty
 
     # ## Let's penalise large values in the sequence (for the n_cirlles-1 step only)
-    # # abs_penalty = jnp.mean(jnp.sum(jnp.abs(preds_batch), axis=(1,2)))
-    # abs_penalty = jnp.mean(jnp.sum(jnp.abs(preds_batch[:, CONFIG["n_circles"]-1, :]), axis=1))
-    # total_loss += 1e-2 * abs_penalty
+    # abs_penalty = jnp.mean(jnp.sum(jnp.abs(preds_batch), axis=(1,2)))
+    # # abs_penalty = jnp.mean(jnp.sum(jnp.abs(preds_batch[:, CONFIG["n_circles"]-1, :]), axis=1))
+    # total_loss += 1e-3 * abs_penalty
+
+
+    ## Let's make sure no prediction is above 1 in absolute value
+    max_val = jnp.max(jnp.abs(preds_batch))
+    total_loss += 1e-1 * jax.nn.relu(max_val - 2.0)
 
     return total_loss
 
@@ -1204,9 +1221,9 @@ def predict_circle_specific_loss(final_batch_traj, X_data):
     circle_losses = {}
     n_points = X_data.shape[0]
 
-    # for circle_idx in range(CONFIG["transformer_target_step"]):
+    for circle_idx in range(CONFIG["transformer_target_step"]):
     # for circle_idx in [CONFIG["n_circles"]-1]:
-    for circle_idx in [CONFIG["transformer_target_step"]-1]:
+    # for circle_idx in [CONFIG["transformer_target_step"]-1]:
     # for circle_idx in [-1]:
     # for circle_idx in [175]:
         w = final_batch_traj[0, circle_idx]  
@@ -1218,8 +1235,14 @@ def predict_circle_specific_loss(final_batch_traj, X_data):
             new_mask = jnp.abs(X_data - x_mean) <= r
             circle_masks.append(new_mask.flatten())
 
-        circle_mask = circle_masks[circle_idx]
-        X_circle = X_data[circle_mask]
+        ## Outward circle idex is know. We want to plot th edata in the annulus between this circle and the previous one (if circle_idx>0)
+        in_circle_idx = circle_idx-1 if circle_idx > 0 else 0
+        circle_masks = jnp.array(circle_masks)
+        ring_mask = jnp.logical_and(circle_masks[circle_idx], ~circle_masks[in_circle_idx])
+        X_circle = X_data[ring_mask]
+
+        # circle_mask = circle_masks[circle_idx]
+        # X_circle = X_data[circle_mask]
 
         if X_circle.shape[0] == 0:
             continue  
