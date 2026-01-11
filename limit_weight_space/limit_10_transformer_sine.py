@@ -36,11 +36,11 @@ CONFIG = {
     "segments": 11,
     "x_range": [-1.5, 1.5],
     "train_seg_ids": [2, 3, 4, 5, 6, 7, 8], 
-    "width_size": 32,
+    "width_size": 24,
     "mlp_batch_size": 64,
 
     # Expansion Hyperparameters
-    "n_circles": 30*1,           
+    "n_circles": 30*2,           
     
     # --- TRANSFORMER HYPERPARAMETERS ---
     "lr": 5e-6,      
@@ -48,13 +48,13 @@ CONFIG = {
     "transformer_batch_size": 1,      
     
     # New Params
-    "transformer_d_model": 128,    # Embedding Dimension
-    "transformer_n_heads": 2,      # Number of Heads
-    "transformer_n_layers": 4,     # Number of Transformer Blocks
-    "transformer_d_ff": 256,       # Feedforward dimension inside block
-    "transformer_substeps": 64,     # Number of micro-steps per macro step
+    "transformer_d_model": 128*2,    # Embedding Dimension
+    "transformer_n_heads": 1,      # Number of Heads
+    "transformer_n_layers": 1,     # Number of Transformer Blocks
+    "transformer_d_ff": 1//1,       # Feedforward dimension inside block: TODO: not needed atm, see forward pass.
+    "transformer_substeps": 50,     # Number of micro-steps per macro step
     
-    "transformer_target_step": 60*1,    # Total steps to unroll
+    "transformer_target_step": 60*2,    # Total steps to unroll
     "scheduled_loss_weight": False,
 
     ## Consistency Loss Config
@@ -62,7 +62,7 @@ CONFIG = {
     "consistency_loss_weight": 0.0,
 
     # Regularization Config
-    "regularization_step": 40*1,     
+    "regularization_step": 40*2,     
     "regularization_weight": 0.0,  
 
     # Data Selection Mode
@@ -145,7 +145,7 @@ def gen_data(seed, n_samples, n_segments=3, x_range=[-3.0, 3.0], noise_std=0.1):
     
     # 2. Define the unchanging relation P(Y|X) (Concept)
     # y = sin(3x) + 0.5x is classic because it has both trend and periodicity
-    Y = np.sin(5 * X) + 0.5 * X
+    Y = np.sin(10 * X) + 0.5 * X
     
     # Add noise
     noise = np.random.normal(0, noise_std, n_samples)
@@ -280,8 +280,8 @@ class TransformerBlock(eqx.Module):
     def __call__(self, x, mask=None, key=None):
         attn_out = self.attention(x, x, x, mask=mask, key=key)
         x = eqx.filter_vmap(self.norm1)(x + attn_out)
-        mlp_out = jax.vmap(self.mlp)(x)
-        x = eqx.filter_vmap(self.norm2)(x + mlp_out)
+        # mlp_out = jax.vmap(self.mlp)(x)                   ## TODO: we don't need MLPs at all ?
+        # x = eqx.filter_vmap(self.norm2)(x + mlp_out)
         return x
 
 # class WeightTransformer(eqx.Module):
@@ -490,7 +490,8 @@ class WeightTransformer(eqx.Module):
             in_size=d_model*2,
             out_size=input_dim,
             width_size=d_model * 2, # Slightly wider hidden layer
-            depth=3,                # 1 hidden layer is usually enough for local steps
+            # width_size=(2*d_model + input_dim)//2, # Slightly wider hidden layer
+            depth=1,                # 1 hidden layer is usually enough for local steps
             activation=jax.nn.gelu,
             key=k_refine
         )
@@ -515,13 +516,20 @@ class WeightTransformer(eqx.Module):
         idx = jnp.arange(seq_len)
         mask = (idx[:, None] - idx[None, :]) <= 1
         return mask
+    def make_nsteps_mask(self, seq_len, n_steps):
+        idx = jnp.arange(seq_len)
+        mask = (idx[:, None] - idx[None, :]) <= n_steps
+        return mask
 
     def __call__(self, x0, steps, key=None):
         traj_buffer = jnp.zeros((steps, x0.shape[0]))
         traj_buffer = traj_buffer.at[0].set(x0)
         # full_mask = self.make_causal_mask(steps)
-        full_mask = self.make_onestep_mask(steps)
-        
+        # full_mask = self.make_onestep_mask(steps)
+        full_mask = self.make_nsteps_mask(steps, n_steps=2)
+        # full_mask = self.make_nsteps_mask(steps, n_steps=20)
+        # full_mask = self.make_nsteps_mask(steps, n_steps=CONFIG["transformer_target_step"])
+
         def scan_step(carry, step_idx):
             current_traj = carry
             
@@ -758,6 +766,7 @@ model_template = MLPModel(k_init)
 params_template, static = eqx.partition(model_template, eqx.is_array)
 flat_template, shapes, treedef, mask = flatten_pytree(params_template)
 input_dim = flat_template.shape[0]
+print(f"MLP Model Parameter Count: {input_dim}")
 
 # 2. Generate Batch of Initial States
 print(f"Generating {CONFIG['transformer_batch_size']} initial states...")
@@ -1031,10 +1040,9 @@ def train_step_fn(model, x0_batch, key):
     # # abs_penalty = jnp.mean(jnp.sum(jnp.abs(preds_batch[:, CONFIG["n_circles"]-1, :]), axis=1))
     # total_loss += 1e-3 * abs_penalty
 
-
     ## Let's make sure no prediction is above 1 in absolute value
     max_val = jnp.max(jnp.abs(preds_batch))
-    total_loss += 1e-1 * jax.nn.relu(max_val - 2.0)
+    total_loss += 1e-1 * jax.nn.relu(max_val - 20.0)
 
     return total_loss
 
