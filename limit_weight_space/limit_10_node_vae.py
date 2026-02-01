@@ -23,11 +23,11 @@ plt.rcParams['savefig.facecolor'] = 'white'
 
 # --- 1. CONFIGURATION ---
 TRAIN = True  
-RUN_DIR = "." 
+RUN_DIR = "."
 
 CONFIG = {
     # "seed": time.time_ns() % (2**32 - 1),
-    "seed": 2026,
+    "seed": 2028,
 
     "x_range": [-4.0, 4.0],  # Wider range to see the sine wave repeat
     "segments": 5,           # Split into 5 distinct vertical strips
@@ -47,8 +47,8 @@ CONFIG = {
     
     # --- TRANSFORMER HYPERPARAMETERS ---
     "lr": 5e-4,      
-    "transformer_epochs": 20000,
-    "print_every": 1000,
+    "transformer_epochs": 40000,
+    "print_every": 4000,
     "transformer_batch_size": 1,      
     
     # New Params
@@ -467,8 +467,8 @@ class NeuralODE(eqx.Module):
         # self.init_embd = eqx.nn.Linear(data_dim, self.embd_dim, key=key)
 
         self.func = eqx.nn.MLP(
-            in_size=data_dim+0, 
-            out_size=data_dim, 
+            in_size=data_dim*2, 
+            out_size=data_dim*2, 
             width_size=hidden_dim, 
             # width_size=int(data_dim*1.5), 
             depth=4,
@@ -503,7 +503,7 @@ class NeuralODE(eqx.Module):
         # Integration times
         # Assuming data step size is 1.0 (arbitrary units matching index)
         # ts = jnp.arange(steps + 1)
-        ts = jnp.linspace(0.0, 1.0, steps + 1)
+        ts = jnp.linspace(0.0, 1.0, (steps + 15)*1)
 
         # data_dim_8 = ((self.data_dim + 7) // 8) * 8
         # # print("All shapes invloved in ODE solve:", y0.shape, data_dim_8, self.data_dim)
@@ -523,20 +523,35 @@ class NeuralODE(eqx.Module):
 
             # y = jnp.concatenate([y, self.init_embd(y0)])  # Append fixed embedding to state
             # return self.func(y)
+
         
         term = diffrax.ODETerm(ode_func)
         solver = diffrax.Tsit5()
         # Step size controller
         stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
         
+
+        ## y0 must containt mean and stddev
+        y0 = jnp.concatenate([y0, jnp.zeros_like(y0)])  # Initial stddev = 0.0 
         sol = diffrax.diffeqsolve(
             term, solver, t0=ts[0], t1=ts[-1], dt0=0.1, y0=y0,
-            saveat=diffrax.SaveAt(ts=ts[1:]), # Save at 1, 2, ... steps
-            stepsize_controller=stepsize_controller
+            # saveat=diffrax.SaveAt(ts=ts[1:]), # Save at 1, 2, ... steps
+            saveat=diffrax.SaveAt(ts=ts[15::1]), # Save at 1, 2, ... steps
+            stepsize_controller=stepsize_controller,
+            max_steps=4096*1
         )
         
-        return sol.ys # Shape (steps, dim)
+        out = sol.ys # Shape (steps, dim)
         # return sol.ys[:, :self.data_dim]  # Remove padding if any
+        # return out
+
+        ## Usethe reparametrisation trick to sample from predicted mean and stddev
+        # out of shape (steps, data_dim*2)
+        means = out[:, :self.data_dim]
+        stddevs = out[:, self.data_dim:]
+        eps = jax.random.normal(key, shape=stddevs.shape)
+        samples = means + eps * stddevs
+        return samples
 
 
 #%%
@@ -612,8 +627,8 @@ def gen_x0_batch(batch_size, key):
         # x0_batch_list.append(f + eps)
 
         # x0_batch_list.append(f*0.0)
-        x0_batch_list.append(f/1000.0)
-        # x0_batch_list.append(f/1.0)
+        # x0_batch_list.append(f/100.0)
+        x0_batch_list.append(f/100.0)
 
     x0_batch = jnp.stack(x0_batch_list) 
     return x0_batch
@@ -640,7 +655,6 @@ tf_model = NeuralODE(
 )
 
 print(f"Transformer / Neural ODE Parameter Count: {count_params(tf_model)}")
-
 
 # opt = optax.adam(CONFIG["lr"]) 
 opt = optax.adabelief(CONFIG["lr"]) 
@@ -786,7 +800,8 @@ def train_step_fn(model, x0_batch, key):
     total_steps = CONFIG["transformer_target_step"]
     
     # VMAP over batch
-    preds_batch = jax.vmap(model, in_axes=(0, None, None))(x0_batch, total_steps, None) # (Batch, Steps, D)
+    keys = jax.random.split(key, x0_batch.shape[0])
+    preds_batch = jax.vmap(model, in_axes=(0, None, 0))(x0_batch, total_steps, keys) # (Batch, Steps, D)
 
     # step_indices = jnp.arange(total_steps)
     # preds_batch_data = preds_batch
@@ -800,6 +815,7 @@ def train_step_fn(model, x0_batch, key):
 
     # step_indices = jnp.arange(CONFIG["n_circles"])
     step_indices = jax.random.choice(key, CONFIG["n_circles"], shape=(2,), replace=False)
+    step_indices = jnp.sort(step_indices)
     preds_batch_data = preds_batch[:, step_indices, :]
 
     keys = jax.random.split(key, len(step_indices))
@@ -837,7 +853,7 @@ def train_step_fn(model, x0_batch, key):
 
     ## Let's make sure no prediction is above 1 in absolute value
     max_val = jnp.max(jnp.abs(preds_batch))
-    total_loss += 1e-1 * jax.nn.relu(max_val - 10.0)
+    total_loss += 1e-1 * jax.nn.relu(max_val - 20.0)
 
     return total_loss
 
@@ -884,7 +900,7 @@ if TRAIN:
     tf_model = best_model
 
     eval_key = jax.random.PRNGKey(42)
-    final_batch_traj = jax.vmap(tf_model, in_axes=(0, None, None))(x0_batch, CONFIG["transformer_target_step"], None)
+    final_batch_traj = jax.vmap(tf_model, in_axes=(0, None, None))(x0_batch, CONFIG["transformer_target_step"], eval_key)
     
     np.save(artefacts_path / "final_batch_traj.npy", final_batch_traj)
     np.save(artefacts_path / "loss_history.npy", np.array(loss_history))

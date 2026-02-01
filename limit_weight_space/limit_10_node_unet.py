@@ -466,31 +466,31 @@ class NeuralODE(eqx.Module):
         # self.embd_dim = 32
         # self.init_embd = eqx.nn.Linear(data_dim, self.embd_dim, key=key)
 
-        self.func = eqx.nn.MLP(
-            in_size=data_dim+0, 
-            out_size=data_dim, 
-            width_size=hidden_dim, 
-            # width_size=int(data_dim*1.5), 
-            depth=4,
-            activation=jax.nn.softplus,
-            key=key
-        )
+        # self.func = eqx.nn.MLP(
+        #     in_size=data_dim+0, 
+        #     out_size=data_dim, 
+        #     width_size=hidden_dim, 
+        #     # width_size=int(data_dim*1.5), 
+        #     depth=4,
+        #     activation=jax.nn.softplus,
+        #     key=key
+        # )
 
         ## Define func as a small Unet1D
         ## Data_dim must be a multiple of 8. Let's pick the closest multiple of 8 greater than data_dim
         self.data_dim = data_dim
         # data_dim = ((data_dim + 7) // 8) * 8
 
-        # self.func = Unet1D(
-        #     in_shape=(data_dim, 1),
-        #     out_shape=(data_dim, 1),
-        #     base_chans=32,
-        #     levels=3,
-        #     use_normalization=False,
-        #     key=key,
-        #     cond_dim=None,
-        #     use_conditioning=False
-        # )
+        self.func = Unet1D(
+            in_shape=(data_dim, 1),
+            out_shape=(data_dim, 1),
+            base_chans=32,
+            levels=3,
+            use_normalization=False,
+            key=key,
+            cond_dim=None,
+            use_conditioning=False
+        )
 
 
     def __call__(self, y0, steps, key=None):
@@ -514,12 +514,12 @@ class NeuralODE(eqx.Module):
 
         def ode_func(t, y, args):
             # y = jnp.concatenate([y, jnp.array([t])])  # Append time to state
-            return self.func(y)
+            # return self.func(y)
 
-            # y = y[:, None]
-            # out = self.func(t, y, args)
-            # # print("Inside ODE func shapes:", y.shape, out.shape)
-            # return out.flatten()
+            y = y[:, None]
+            out = self.func(t, y, args)
+            # print("Inside ODE func shapes:", y.shape, out.shape)
+            return out.flatten()
 
             # y = jnp.concatenate([y, self.init_embd(y0)])  # Append fixed embedding to state
             # return self.func(y)
