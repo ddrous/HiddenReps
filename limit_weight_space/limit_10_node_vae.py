@@ -47,8 +47,8 @@ CONFIG = {
     
     # --- TRANSFORMER HYPERPARAMETERS ---
     "lr": 5e-4,      
-    "transformer_epochs": 40000,
-    "print_every": 4000,
+    "transformer_epochs": 20000,
+    "print_every": 2000,
     "transformer_batch_size": 1,      
     
     # New Params
@@ -623,12 +623,12 @@ def gen_x0_batch(batch_size, key):
         # eps = jax.random.uniform(gen_key, shape=f.shape[0], minval=-1, maxval=1)
 
         ## Small gaussian noise
-        # eps = jax.random.normal(gen_key, shape=f.shape) * 1e-2
-        # x0_batch_list.append(f + eps)
+        eps = jax.random.normal(gen_key, shape=f.shape) * 1e-2
+        x0_batch_list.append(eps)
 
         # x0_batch_list.append(f*0.0)
         # x0_batch_list.append(f/100.0)
-        x0_batch_list.append(f/100.0)
+        # x0_batch_list.append(f/1000.0)
 
     x0_batch = jnp.stack(x0_batch_list) 
     return x0_batch
@@ -813,9 +813,9 @@ def train_step_fn(model, x0_batch, key):
     # ## Always add 0
     # step_indices = jnp.concatenate([jnp.array([0]), step_indices])
 
-    # step_indices = jnp.arange(CONFIG["n_circles"])
-    step_indices = jax.random.choice(key, CONFIG["n_circles"], shape=(2,), replace=False)
-    step_indices = jnp.sort(step_indices)
+    step_indices = jnp.arange(CONFIG["n_circles"])
+    # step_indices = jax.random.choice(key, CONFIG["n_circles"], shape=(25,), replace=False)
+    # step_indices = jnp.sort(step_indices)
     preds_batch_data = preds_batch[:, step_indices, :]
 
     keys = jax.random.split(key, len(step_indices))
