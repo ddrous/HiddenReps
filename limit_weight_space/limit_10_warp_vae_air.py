@@ -15,6 +15,8 @@ import shutil
 import sys
 import typing
 from typing import Optional, Tuple
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
 # Set plotting style
 sns.set(style="white", context="talk")
@@ -38,7 +40,8 @@ CONFIG = {
     "noise_std": 0.005,
     "segments": 11,
     "x_range": [-1.5, 1.5],
-    "train_seg_ids": [2, 3, 4, 5, 6, 7, 8], 
+    # "train_seg_ids": [2, 3, 4, 5, 6, 7, 8], 
+    "train_seg_ids": [0], 
     "width_size": 24,
     "mlp_batch_size": 64,
 
@@ -48,7 +51,8 @@ CONFIG = {
     
     # --- TRANSFORMER HYPERPARAMETERS ---
     "lr": 5e-5,      
-    "transformer_epochs": 25000,
+    # "transformer_epochs": 25000,
+    "transformer_epochs": 15000,
     "print_every": 2500,
     "transformer_batch_size": 1,      
 
@@ -206,17 +210,48 @@ def gen_data_linear(seed, n_samples, n_segments=3, local_structure="random",
     return data, np.concatenate(segment_ids)
 
 
+def gen_data_air():
+    data_path = "air_quality.csv"  # Update this path if needed
+    df = pd.read_csv(data_path)
+    
+    ## Normalise the dataframe (Optional, but can help with visualization)
+    # scaler = StandardScaler()
+    # df[['PT08.S3.NOx.', 'PT08.S5.O3.']] = scaler.fit_transform(df[['PT08.S3.NOx.', 'PT08.S5.O3.']])
+
+    ## x corresponds to O3 sensor, y corresponds to NOx sensor
+    X = df['PT08.S5.O3.'].values
+    Y = df['PT08.S3.NOx.'].values
+
+    ## Split in two segments based on O3 values (arbitrary threshold at 1.0 after normalization).
+    segs = (X > 1.0).astype(int)
+    # data = np.column_stack((X, Y))
+
+    train_seg_id = CONFIG["train_seg_ids"][0]
+    train_meanX = np.mean(X[segs == train_seg_id])
+    train_stdX = np.std(X[segs == train_seg_id])
+    X = (X - train_meanX) / train_stdX
+
+    train_meanY = np.mean(Y[segs == train_seg_id])
+    train_stdY = np.std(Y[segs == train_seg_id])
+    Y = (Y - train_meanY) / train_stdY
+
+    data = np.column_stack((X, Y))
+
+    return data, segs
+
 run_path = setup_run_dir()
 artefacts_path = run_path / "artefacts"
 plots_path = run_path / "plots"
 
 if TRAIN:
     SEED = CONFIG["seed"]
-    data, segs = gen_data(SEED, CONFIG["data_samples"], CONFIG["segments"], CONFIG["x_range"], CONFIG["noise_std"])
+    # data, segs = gen_data(SEED, CONFIG["data_samples"], CONFIG["segments"], CONFIG["x_range"], CONFIG["noise_std"])
 
     # data, segs = gen_data_linear(SEED, CONFIG["data_samples"], n_segments=CONFIG["segments"], 
     #                   local_structure="gradual_increase", x_range=CONFIG["x_range"], 
     #                   slope=0.5, base_intercept=-0.4, step_size=0.1, noise_std=CONFIG["noise_std"])
+
+    data, segs = gen_data_air()
 
     train_mask = np.isin(segs, CONFIG["train_seg_ids"])
     test_mask = ~train_mask
@@ -241,7 +276,8 @@ else:
     except FileNotFoundError:
         raise FileNotFoundError("Could not find data files in artefacts folder. Ensure TRAIN was run at least once.")
 
-x_mean = jnp.mean(X_train_full)
+# x_mean = jnp.mean(X_train_full)
+x_mean = jnp.min(X_train_full)
 print(f"Data Center (Mean): {x_mean:.4f}")
 
 # Precompute masks
@@ -625,7 +661,7 @@ class LinearRNN(eqx.Module):
         
         # y_init stores the two initial points needed for second-order recurrence
         # Shape: (2, data_dim)
-        self.y_init = jax.random.normal(key, shape=(2, problem_dim)) * 1e-2
+        self.y_init = jax.random.normal(key, shape=(2, problem_dim)) * 0e-2
 
     def __call__(self, y0, steps, key):
         # Initial state for the scan: (y_{t-1}, y_{t-2})
@@ -646,11 +682,11 @@ class LinearRNN(eqx.Module):
         # Use jax.lax.scan to iterate over the number of steps
         _, ys = jax.lax.scan(scan_fn, init_state, None, length=steps)
 
-        ## Sample from predicted mean and stddev
-        means = ys[:, :self.data_dim]
-        stddevs = ys[:, self.data_dim:2*self.data_dim]
-        eps = jax.random.normal(key, shape=stddevs.shape)
-        ys = means + eps * stddevs
+        # ## Sample from predicted mean and stddev
+        # means = ys[:, :self.data_dim]
+        # stddevs = ys[:, self.data_dim:2*self.data_dim]
+        # eps = jax.random.normal(key, shape=stddevs.shape)
+        # ys = means + eps * stddevs
 
         return ys
 
@@ -915,7 +951,13 @@ def train_step_fn(model, x0_batch, key):
     
     # VMAP over batch
     keys = jax.random.split(key, x0_batch.shape[0])
-    preds_batch = jax.vmap(model, in_axes=(0, None, 0))(x0_batch, total_steps, keys) # (Batch, Steps, D)
+    preds_batch = jax.vmap(model, in_axes=(0, None, 0))(x0_batch, total_steps, keys) # (Batch, Steps, D*3)
+
+    ## Extract and sample from the predicted mean and stddev
+    means = preds_batch[:, :, :input_dim]
+    stddevs = preds_batch[:, :, input_dim:2*input_dim]
+    eps = jax.random.normal(key, shape=stddevs.shape)
+    preds_batch = means + eps * stddevs
 
     # step_indices = jnp.arange(total_steps)
     # preds_batch_data = preds_batch
@@ -1029,6 +1071,8 @@ else:
 final_traj = final_batch_traj[0]
 
 #%%
+
+weight_dim = input_dim
 # --- 7. VISUALIZATION ---
 print("\n=== Generating Dashboards ===")
 x_grid = jnp.linspace(CONFIG['x_range'][0], CONFIG['x_range'][1], 300)[:, None]
@@ -1047,7 +1091,7 @@ ax2 = fig.add_subplot(gs[0, 1])
 traj_train_losses = []
 traj_test_losses = []
 for i in range(len(final_traj)):
-    w = final_traj[i]
+    w = final_traj[i, :weight_dim]
     p = unflatten_pytree(w, shapes, treedef, mask)
     m = eqx.combine(p, static)
     traj_train_losses.append(jnp.mean((m.predict(X_train_full) - Y_train_full)**2))
@@ -1067,7 +1111,7 @@ ax3.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1)
 cmap = plt.cm.coolwarm
 n_steps = len(final_traj)
 for i in range(0, n_steps, 1):
-    w = final_traj[i]
+    w = final_traj[i, :input_dim]
     p = unflatten_pytree(w, shapes, treedef, mask)
     m = eqx.combine(p, static)
     label = "Limit" if i==n_steps-1 else None
@@ -1075,7 +1119,7 @@ for i in range(0, n_steps, 1):
     ax3.plot(x_grid, m.predict(x_grid), color=cmap(i/n_steps), alpha=alpha, linewidth=1.5, label=label)
 
 ax3.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1)
-w_reg = final_traj[CONFIG["regularization_step"]]
+w_reg = final_traj[CONFIG["regularization_step"], :weight_dim]
 p_reg = unflatten_pytree(w_reg, shapes, treedef, mask)
 ax3.plot(x_grid, eqx.combine(p_reg, static).predict(x_grid), "--", color='red', linewidth=2, label="Reg Step")
 ax3.set_title("Function Evolution")
@@ -1100,7 +1144,7 @@ for i, step_idx in enumerate(steps_to_plot):
     ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1)
     
     for b in range(CONFIG["transformer_batch_size"]):
-        w = final_batch_traj[b, step_idx]
+        w = final_batch_traj[b, step_idx, :weight_dim]
         p = unflatten_pytree(w, shapes, treedef, mask)
         m = eqx.combine(p, static)
         pred = m.predict(x_grid)
@@ -1118,6 +1162,13 @@ plt.show()
 print("Generating Extended Parameter Trajectories Plot...")
 fig, ax = plt.subplots(figsize=(7, 10), nrows=1, ncols=1) 
 traj_seed_0 = final_batch_traj[0]
+
+## Extrat mean and stddev trajectories
+mean_traj = traj_seed_0[:, :weight_dim]
+stddev_traj = traj_seed_0[:, weight_dim:2*weight_dim]
+eps = jax.random.normal(eval_key, shape=stddev_traj.shape)
+traj_seed_0 = mean_traj + eps * stddev_traj
+
 # plot_ids = np.arange(100)  # First 100 parameters
 nb_plots = min(100, traj_seed_0.shape[1])
 plot_ids = jax.random.choice(jax.random.PRNGKey(42), traj_seed_0.shape[1], shape=(nb_plots,), replace=False)
@@ -1160,7 +1211,7 @@ def predict_circle_specific_loss(final_batch_traj, X_data):
     # for circle_idx in [CONFIG["transformer_target_step"]-1]:
     # for circle_idx in [-1]:
     # for circle_idx in [175]:
-        w = final_batch_traj[0, circle_idx]  
+        w = final_batch_traj[0, circle_idx, :weight_dim]    ## Only using the means  
         p = unflatten_pytree(w, shapes, treedef, mask)
         m = eqx.combine(p, static)
 
@@ -1206,4 +1257,148 @@ ax.legend()
 plt.tight_layout()
 plt.savefig(plots_path / "model_predictions_n_circles_circle_specific.png")
 plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+# %%
+
+print("Generating n_circles Model Prediction Plot (Circle-Specific Models)...")
+
+def predict_circle_uncertainty(final_batch_traj, X_data):
+    """
+    Computes mean and uncertainty for circle-specific linear models.
+    Assumes final_batch_traj shape is (Batch, Steps, 4) -> [mu_slope, mu_bias, std_slope, std_bias]
+    """
+    circle_stats = {}
+    
+    # Pre-calculate masks for all circles to ensure consistency
+    circle_masks = []
+    for r in all_radii:
+        new_mask = jnp.abs(X_data - x_mean) <= r
+        circle_masks.append(new_mask.flatten())
+    circle_masks = jnp.array(circle_masks)
+
+    for circle_idx in range(CONFIG["transformer_target_step"]):
+    # for circle_idx in [100, CONFIG["transformer_target_step"]-1]:
+        # Extract Mean and Std from the final dimension (Dim*2 = 4)
+        # We assume the ordering: [mu_slope, mu_intercept, sigma_slope, sigma_intercept]
+        # Adjust indices [0, 1] and [2, 3] if your specific flattening order differs.
+        
+        # Shape: (4,)
+        params = final_batch_traj[0, circle_idx, :] 
+        
+        mu_w = params[0] # Slope Mean
+        mu_b = params[1] # Intercept Mean
+        sig_w = params[2] # Slope Std
+        sig_b = params[3] # Intercept Std
+
+        # --- Annulus Logic ---
+        # If circle_idx is 0, we take the first circle mask.
+        # If circle_idx > 0, we take (Current Circle) AND (NOT Previous Circle)
+        if circle_idx == 0:
+            ring_mask = circle_masks[circle_idx]
+        else:
+            in_circle_idx = circle_idx - 1
+            ring_mask = jnp.logical_and(circle_masks[circle_idx], ~circle_masks[in_circle_idx])
+
+        X_circle = X_data[ring_mask]
+
+        if X_circle.shape[0] == 0:
+            continue
+            
+        # --- Closed Form Inference ---
+        # Mean: y = x * mu_w + mu_b
+        y_mean = X_circle * mu_w + mu_b
+        
+        # Variance: Var(y) = x^2 * sig_w^2 + sig_b^2
+        # Std: sqrt(Variance)
+        y_var = (X_circle ** 2) * (sig_w ** 2) + (sig_b ** 2)
+        y_std = jnp.sqrt(y_var)
+
+        # Store data for plotting
+        circle_stats[circle_idx] = (X_circle, y_mean, y_std)
+
+    return circle_stats
+
+# Run inference
+train_stats = predict_circle_uncertainty(final_batch_traj, X_train_full)
+test_stats = predict_circle_uncertainty(final_batch_traj, X_test)
+
+#%%
+# --- Plotting ---
+fig, ax = plt.subplots(figsize=(10, 6))
+
+# 1. Plot Background Data
+ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
+ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1, label="Test Data")
+
+# Helper function to plot bands
+def plot_uncertainty_bands(stats_dict, color_mean, color_band, label_prefix):
+    added_label = False
+    
+    for circle_idx, (X_seg, y_mu, y_sigma) in stats_dict.items():
+        # We must sort X to plot lines and fill_between correctly
+        sort_indices = jnp.argsort(X_seg.flatten())
+        X_sorted = X_seg[sort_indices].flatten()
+        mu_sorted = y_mu[sort_indices].flatten()
+        sigma_sorted = y_sigma[sort_indices].flatten()
+
+        # print("Aff distance from the mean are:", jnp.abs(X_sorted - x_mean).flatten()   )
+        
+        # Label only the first segment to avoid cluttering the legend
+        lbl = f"{label_prefix} Mean" if not added_label else None
+        
+        # Plot Mean
+        # ax.plot(X_sorted, mu_sorted, c=color_mean, linewidth=2, alpha=0.8, label=lbl)
+
+        ## Scatter plot mean instead of line plot
+        ax.scatter(X_sorted, mu_sorted, c=color_mean, s=5, alpha=0.8, label=lbl)
+        
+        # Plot Uncertainty (Mean +/- 2 Std)
+        # ax.fill_between(
+        #     X_sorted, 
+        #     mu_sorted - 2 * sigma_sorted, 
+        #     mu_sorted + 2 * sigma_sorted, 
+        #     color=color_band, 
+        #     alpha=0.3,
+        #     label=f"{label_prefix} Uncertainty" if not added_label else None
+        # )
+        # added_label = True
+        
+        ## We can't use fill_between with scatter, so for each point, we plot a vertical line
+        multiplier = 25
+        for x_pt, mu_pt, sigma_pt in zip(X_sorted, mu_sorted, sigma_sorted):
+            ax.vlines(x_pt, mu_pt - multiplier * sigma_pt, mu_pt + multiplier * sigma_pt, color=color_band, alpha=0.1, label=f"{label_prefix} Uncertainty" if not added_label else None)
+
+            added_label = True
+
+# 2. Plot Model Inference (Mean + 2 Std)
+# We usually only plot the Test predictions for clarity, but you can enable both.
+# Here I plot Test predictions in Red/Pink and Train in Green (Optional)
+
+# Plotting Test Set Inference (High contrast)
+plot_uncertainty_bands(test_stats, color_mean='red', color_band='red', label_prefix="Test Model")
+
+# Uncomment below if you also want to see the fit on Training data segments
+plot_uncertainty_bands(train_stats, color_mean='green', color_band='green', label_prefix="Train Model")
+
+ax.set_title(r"Model Predictions with Uncertainty ($\mu \pm 2\sigma$)")
+ax.set_ylim(jnp.min(Y_train_full)-1, jnp.max(Y_train_full)+1)
+ax.grid(True, alpha=0.3)
+ax.legend()
+
+plt.tight_layout()
+plt.savefig(plots_path / "model_predictions_uncertainty.png")
+plt.show()
+
 # %%
