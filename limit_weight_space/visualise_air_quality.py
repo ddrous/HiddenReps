@@ -14,7 +14,7 @@ df = pd.read_csv(data_path)
 ## Normalise the dataframe (Optional, but can help with visualization)
 from sklearn.preprocessing import StandardScaler
 scaler = StandardScaler()
-df[['PT08.S3.NOx.', 'PT08.S5.O3.']] = scaler.fit_transform(df[['PT08.S3.NOx.', 'PT08.S5.O3.']])
+# df[['PT08.S3.NOx.', 'PT08.S5.O3.']] = scaler.fit_transform(df[['PT08.S3.NOx.', 'PT08.S5.O3.']])
 
 
 # Display the first few rows to understand the structure

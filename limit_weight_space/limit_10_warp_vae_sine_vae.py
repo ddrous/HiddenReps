@@ -280,6 +280,7 @@ all_radii = jnp.concatenate([radii, fake_radii])
 # --- 4. MODEL DEFINITIONS ---
 
 width_size = CONFIG["width_size"]
+real_output_size = 1
 
 class MLPModel(eqx.Module):
     layers: list
@@ -293,7 +294,7 @@ class MLPModel(eqx.Module):
         #             #    eqx.nn.Linear(width_size, width_size, key=k4), jax.nn.relu,
         #                eqx.nn.Linear(width_size, 1, key=k3)]
 
-        self.layers = [eqx.nn.Linear(1, 1, use_bias=True, key=k1)]
+        self.layers = [eqx.nn.Linear(1, 2, use_bias=True, key=k1)]
 
     def __call__(self, x):
         for l in self.layers: x = l(x)
@@ -808,8 +809,16 @@ def get_functional_loss(flat_w, step_idx, key=None):
     params = unflatten_pytree(flat_w, shapes, treedef, mask)
     model = eqx.combine(params, static)
     
+    # y_pred = model.predict(X_train_full)
+    # residuals = (y_pred - Y_train_full) ** 2
+
+    ## y_pred contrains means and stddev, and we want a NLL loss
     y_pred = model.predict(X_train_full)
-    residuals = (y_pred - Y_train_full) ** 2
+    means = y_pred[:, 0:real_output_size]
+    stddev = y_pred[:, real_output_size:real_output_size*2]
+    residuals = 0.5 * jnp.log(2 * jnp.pi * (stddev ** 2 + 1e-6)) + 0.5 * ((Y_train_full - means) ** 2) / (stddev ** 2 + 1e-6)
+    # residuals = ((Y_train_full - means) ** 2) / (stddev ** 2 + 1e-6)
+
     # ## We don't want to use all of X_train_full, only a randmly selected subset, like a batch
     # n_data_points = X_train_full.shape[0]
     # if key is None:
@@ -835,7 +844,7 @@ def get_functional_loss(flat_w, step_idx, key=None):
         phase_mask = jax.lax.select(is_step_zero, current_circle_mask, annulus_mask)
     else:
         phase_mask = current_circle_mask
-        
+
     # Regularization
     is_reg_step = step_idx == CONFIG["regularization_step"]
     active_mask = jnp.zeros_like(current_circle_mask, dtype=bool)
@@ -943,7 +952,8 @@ def train_step_fn(model, x0_batch, key):
     means = preds_batch[:, :, :input_dim]
     stddevs = preds_batch[:, :, input_dim:2*input_dim]
     eps = jax.random.normal(key, shape=stddevs.shape)
-    preds_batch = means + eps * stddevs
+    # preds_batch = means + eps * stddevs
+    preds_batch = means
 
     # step_indices = jnp.arange(total_steps)
     # preds_batch_data = preds_batch
@@ -964,6 +974,7 @@ def train_step_fn(model, x0_batch, key):
     def loss_per_seq(seq):
         return jax.vmap(get_functional_loss)(seq, step_indices, keys)
     losses_batch = jax.vmap(loss_per_seq)(preds_batch_data) # (Batch, Steps)
+    # total_data_loss = jnp.mean(jnp.sum(losses_batch, axis=1))
     total_data_loss = jnp.mean(jnp.mean(losses_batch, axis=1))
 
     # Consistency Loss
@@ -995,7 +1006,7 @@ def train_step_fn(model, x0_batch, key):
 
     ## Let's make sure no prediction is above 1 in absolute value
     max_val = jnp.max(jnp.abs(preds_batch))
-    total_loss += 1e-1 * jax.nn.relu(max_val - 2.0)
+    # total_loss += 1e-1 * jax.nn.relu(max_val - 2.0)
 
     return total_loss
 
@@ -1067,10 +1078,13 @@ x_grid = jnp.linspace(CONFIG['x_range'][0], CONFIG['x_range'][1], 300)[:, None]
 fig = plt.figure(figsize=(20, 10))
 gs = fig.add_gridspec(2, 2)
 
+## Loss history is NLL, so can be zero or negative. Shift it up for log plotting
+shifted_loss_history = loss_history - np.min(loss_history) + 1e-2
+
 ax1 = fig.add_subplot(gs[0, 0])
-ax1.plot(loss_history, color='teal', linewidth=2)
+ax1.plot(shifted_loss_history, color='teal', linewidth=2)
 ax1.set_yscale('log')
-ax1.set_title("Training Loss")
+ax1.set_title("Training NLL Loss (Shifted to Avoid Zero)")
 ax1.grid(True, alpha=0.3)
 
 ax2 = fig.add_subplot(gs[0, 1])
@@ -1153,7 +1167,8 @@ traj_seed_0 = final_batch_traj[0]
 mean_traj = traj_seed_0[:, :weight_dim]
 stddev_traj = traj_seed_0[:, weight_dim:2*weight_dim]
 eps = jax.random.normal(eval_key, shape=stddev_traj.shape)
-traj_seed_0 = mean_traj + eps * stddev_traj
+# traj_seed_0 = mean_traj + eps * stddev_traj
+traj_seed_0 = mean_traj
 
 # plot_ids = np.arange(100)  # First 100 parameters
 nb_plots = min(100, traj_seed_0.shape[1])
@@ -1217,7 +1232,7 @@ def predict_circle_specific_loss(final_batch_traj, X_data):
 
         if X_circle.shape[0] == 0:
             continue  
-        y_pred = m.predict(X_circle)
+        y_pred = m.predict(X_circle)[:, 0:real_output_size]
         circle_losses[circle_idx] = (X_circle, y_pred)
     return circle_losses
 
@@ -1231,6 +1246,7 @@ ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1, label="Test Data")
 # X_circles of shape (N_circle, 1), y_pred of shape (N_circle, 1)
 
 for circle_idx, (X_circle, y_pred) in train_preds_cc.items():
+    # print(f"Circle {circle_idx}: X_circle shape: {X_circle.shape}, y_pred shape: {y_pred.shape}")
     ax.scatter(X_circle, y_pred, c='green', s=1, alpha=0.3)
 for circle_idx, (X_circle, y_pred) in test_preds_cc.items():
     ax.scatter(X_circle, y_pred, c='red', s=1, alpha=0.3)
@@ -1279,14 +1295,6 @@ def predict_circle_uncertainty(final_batch_traj, X_data):
         # Extract Mean and Std from the final dimension (Dim*2 = 4)
         # We assume the ordering: [mu_slope, mu_intercept, sigma_slope, sigma_intercept]
         # Adjust indices [0, 1] and [2, 3] if your specific flattening order differs.
-        
-        # Shape: (4,)
-        params = final_batch_traj[0, circle_idx, :] 
-        
-        mu_w = params[0] # Slope Mean
-        mu_b = params[1] # Intercept Mean
-        sig_w = params[2] # Slope Std
-        sig_b = params[3] # Intercept Std
 
         # --- Annulus Logic ---
         # If circle_idx is 0, we take the first circle mask.
@@ -1301,15 +1309,15 @@ def predict_circle_uncertainty(final_batch_traj, X_data):
 
         if X_circle.shape[0] == 0:
             continue
-            
-        # --- Closed Form Inference ---
-        # Mean: y = x * mu_w + mu_b
-        y_mean = X_circle * mu_w + mu_b
-        
-        # Variance: Var(y) = x^2 * sig_w^2 + sig_b^2
-        # Std: sqrt(Variance)
-        y_var = (X_circle ** 2) * (sig_w ** 2) + (sig_b ** 2)
-        y_std = jnp.sqrt(y_var)
+
+        w = final_batch_traj[0, circle_idx, :weight_dim]    ## Only using the means  
+        p = unflatten_pytree(w, shapes, treedef, mask)
+        m = eqx.combine(p, static)
+        y_pred = m.predict(X_circle)
+
+        # Extract Mean and Std Predictions
+        y_mean = y_pred[:, 0:real_output_size]
+        y_std = y_pred[:, real_output_size:real_output_size*2]
 
         # Store data for plotting
         circle_stats[circle_idx] = (X_circle, y_mean, y_std)
@@ -1360,9 +1368,11 @@ def plot_uncertainty_bands(stats_dict, color_mean, color_band, label_prefix):
         #     label=f"{label_prefix} Uncertainty" if not added_label else None
         # )
         # added_label = True
-        
+
+        # print("Min and Max of sigma for circle", circle_idx, "are:", jnp.min(sigma_sorted), jnp.max(sigma_sorted))
+
         ## We can't use fill_between with scatter, so for each point, we plot a vertical line
-        multiplier = 50
+        multiplier = 25
         for x_pt, mu_pt, sigma_pt in zip(X_sorted, mu_sorted, sigma_sorted):
             ax.vlines(x_pt, mu_pt - multiplier * sigma_pt, mu_pt + multiplier * sigma_pt, color=color_band, alpha=0.1, label=f"{label_prefix} Uncertainty" if not added_label else None)
 

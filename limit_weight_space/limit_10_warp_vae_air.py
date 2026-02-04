@@ -223,7 +223,7 @@ def gen_data_air():
     Y = df['PT08.S3.NOx.'].values
 
     ## Split in two segments based on O3 values (arbitrary threshold at 1.0 after normalization).
-    segs = (X > 1.0).astype(int)
+    segs = (X > 1500.0).astype(int)
     # data = np.column_stack((X, Y))
 
     train_seg_id = CONFIG["train_seg_ids"][0]
@@ -978,7 +978,7 @@ def train_step_fn(model, x0_batch, key):
     def loss_per_seq(seq):
         return jax.vmap(get_functional_loss)(seq, step_indices, keys)
     losses_batch = jax.vmap(loss_per_seq)(preds_batch_data) # (Batch, Steps)
-    total_data_loss = jnp.mean(jnp.sum(losses_batch, axis=1))
+    total_data_loss = jnp.mean(jnp.mean(losses_batch, axis=1))
 
     # Consistency Loss
     step_indices = jnp.arange(1, CONFIG["transformer_target_step"])
@@ -1376,7 +1376,7 @@ def plot_uncertainty_bands(stats_dict, color_mean, color_band, label_prefix):
         # added_label = True
         
         ## We can't use fill_between with scatter, so for each point, we plot a vertical line
-        multiplier = 25
+        multiplier = 50
         for x_pt, mu_pt, sigma_pt in zip(X_sorted, mu_sorted, sigma_sorted):
             ax.vlines(x_pt, mu_pt - multiplier * sigma_pt, mu_pt + multiplier * sigma_pt, color=color_band, alpha=0.1, label=f"{label_prefix} Uncertainty" if not added_label else None)
 
