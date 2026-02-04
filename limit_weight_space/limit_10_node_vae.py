@@ -474,8 +474,8 @@ class NeuralODE(eqx.Module):
         # self.init_embd = eqx.nn.Linear(data_dim, self.embd_dim, key=key)
 
         self.func = eqx.nn.MLP(
-            in_size=data_dim*3, 
-            out_size=data_dim*3, 
+            in_size=data_dim*4, 
+            out_size=data_dim*4, 
             width_size=hidden_dim, 
             # width_size=int(data_dim*2.5), 
             depth=4,
@@ -489,7 +489,7 @@ class NeuralODE(eqx.Module):
         # ## Initialize func to near identity
         # self.func = eqx.tree_at(lambda func: func.weight, func, jnp.eye(data_dim))
 
-        self.y0 = jax.random.normal(key, shape=(data_dim*3,)) * 1e-2
+        self.y0 = jax.random.normal(key, shape=(data_dim*4,)) * 1e-2
 
         ## Define func as a small Unet1D
         ## Data_dim must be a multiple of 8. Let's pick the closest multiple of 8 greater than data_dim
@@ -570,6 +570,57 @@ class NeuralODE(eqx.Module):
         samples = means + eps * stddevs
         # samples = means
         return samples
+
+
+class LinearRNN(eqx.Module):
+    A: jax.Array
+    B: jax.Array
+    y_init: jax.Array  # Contains [y_0, y_{-1}]
+    data_dim: int
+
+    def __init__(self, data_dim, hidden_dim, key):
+        self.data_dim = data_dim
+        
+        # Initialize A as Identity and B as Zeros
+        problem_dim = data_dim*3
+        self.A = jnp.eye(problem_dim)
+        self.B = jnp.zeros((problem_dim, problem_dim))
+        
+        # y_init stores the two initial points needed for second-order recurrence
+        # Shape: (2, data_dim)
+        self.y_init = jax.random.normal(key, shape=(2, problem_dim)) * 1e-2
+
+    def __call__(self, y0, steps, key):
+        # Initial state for the scan: (y_{t-1}, y_{t-2})
+        # We've initialized y_init such that y_init[0] is y_0 and y_init[1] is y_{-1}
+        init_state = (self.y_init[0], self.y_init[1])
+
+        def scan_fn(state, _):
+            y_prev1, y_prev2 = state
+            
+            # Recurrence: y_t = A y_{t-1} + B(y_{t-1} - y_{t-2})
+            y_next = self.A @ y_prev1 + self.B @ (y_prev1 - y_prev2)
+            
+            # New state shifts: y_next becomes y_{t-1}, y_prev1 becomes y_{t-2}
+            new_state = (y_next, y_prev1)
+            return new_state, y_next
+
+        # Use jax.lax.scan to iterate over the number of steps
+        _, ys = jax.lax.scan(scan_fn, init_state, None, length=steps)
+
+        ## Sample from predicted mean and stddev
+        means = ys[:, :self.data_dim]
+        stddevs = ys[:, self.data_dim:2*self.data_dim]
+        eps = jax.random.normal(key, shape=stddevs.shape)
+        ys = means + eps * stddevs
+
+        return ys
+
+# Example usage:
+# key = jax.random.PRNGKey(0)
+# model = LinearRNN(data_dim=16, key=key)
+# output = model(steps=10) # Shape: (10, 16)
+
 
 
 #%%
@@ -665,8 +716,15 @@ x0_batch = gen_x0_batch(CONFIG["transformer_batch_size"], gen_key)
 #     key=k_tf
 # )
 
-# # 3. Init NeuralODE Model
-tf_model = NeuralODE(
+# # # 3. Init NeuralODE Model
+# tf_model = NeuralODE(
+#     data_dim=input_dim,
+#     hidden_dim=CONFIG["transformer_d_model"],
+#     key=k_tf
+# )
+
+# 3. Init LinearRNN Model
+tf_model = LinearRNN(
     data_dim=input_dim,
     hidden_dim=CONFIG["transformer_d_model"],
     key=k_tf
