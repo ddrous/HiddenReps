@@ -34,7 +34,7 @@ CONFIG = {
     "train_seg_ids": [1, 2, 3], # Train on the middle
 
     # Data & MLP Hyperparameters
-    "data_samples": 2000,
+    "data_samples": 10000,
     "noise_std": 0.005,
     "segments": 11,
     "x_range": [-1.5, 1.5],
@@ -43,14 +43,15 @@ CONFIG = {
     "mlp_batch_size": 64,
 
     # Expansion Hyperparameters
-    "n_circles": 30*2,           
+    "n_circles": 30*10,           
+    "warmup_steps": 0,
     
     # --- TRANSFORMER HYPERPARAMETERS ---
-    "lr": 5e-4,      
-    "transformer_epochs": 20000,
-    "print_every": 2000,
+    "lr": 5e-5,      
+    "transformer_epochs": 10000,
+    "print_every": 1000,
     "transformer_batch_size": 1,      
-    
+
     # New Params
     "transformer_d_model": 128*4,    # Embedding Dimension
     "transformer_n_heads": 1,      # Number of Heads
@@ -58,7 +59,7 @@ CONFIG = {
     "transformer_d_ff": 1//1,       # Feedforward dimension inside block: TODO: not needed atm, see forward pass.
     "transformer_substeps": 50,     # Number of micro-steps per macro step
     
-    "transformer_target_step": 60*2,    # Total steps to unroll
+    "transformer_target_step": 60*10,    # Total steps to unroll
     "scheduled_loss_weight": False,
 
     ## Consistency Loss Config
@@ -66,7 +67,7 @@ CONFIG = {
     "consistency_loss_weight": 0.0,
 
     # Regularization Config
-    "regularization_step": 40*2,     
+    "regularization_step": 40*10,     
     "regularization_weight": 0.0,  
 
     # Data Selection Mode
@@ -227,10 +228,14 @@ class MLPModel(eqx.Module):
         k1, k2, k3, k4 = jax.random.split(key, 4)
         ## Overwite k1 to k3 with fixed seeds for reproducibility TODO
         # k1, k2, k3 = jax.random.split(jax.random.PRNGKey(42), 3)
-        self.layers = [eqx.nn.Linear(1, width_size, key=k1), jax.nn.relu,
-                       eqx.nn.Linear(width_size, width_size, key=k2), jax.nn.relu,
-                       eqx.nn.Linear(width_size, width_size, key=k4), jax.nn.relu,
-                       eqx.nn.Linear(width_size, 1, key=k3)]
+
+        # self.layers = [eqx.nn.Linear(1, width_size, key=k1), jax.nn.relu,
+        #                eqx.nn.Linear(width_size, width_size, key=k2), jax.nn.relu,
+        #                eqx.nn.Linear(width_size, width_size, key=k4), jax.nn.relu,
+        #                eqx.nn.Linear(width_size, 1, key=k3)]
+
+        self.layers = [eqx.nn.Linear(1, 1, use_bias=True, key=k1)]
+
     def __call__(self, x):
         for l in self.layers: x = l(x)
         return x
@@ -461,20 +466,30 @@ class NeuralODE(eqx.Module):
     data_dim: int
     # embd_dim: int
     # init_embd: eqx.nn.Linear
+
+    y0: jax.Array
      
     def __init__(self, data_dim, hidden_dim, key):
         # self.embd_dim = 32
         # self.init_embd = eqx.nn.Linear(data_dim, self.embd_dim, key=key)
 
         self.func = eqx.nn.MLP(
-            in_size=data_dim*2, 
-            out_size=data_dim*2, 
+            in_size=data_dim*3, 
+            out_size=data_dim*3, 
             width_size=hidden_dim, 
-            # width_size=int(data_dim*1.5), 
+            # width_size=int(data_dim*2.5), 
             depth=4,
             activation=jax.nn.softplus,
             key=key
         )
+
+        # self.y0 = jax.random.normal(key, shape=(data_dim*2,)) * 1e-2
+
+        # self.func = eqx.nn.Linear(data_dim*3, data_dim*3, use_bias=False, key=key)
+        # ## Initialize func to near identity
+        # self.func = eqx.tree_at(lambda func: func.weight, func, jnp.eye(data_dim))
+
+        self.y0 = jax.random.normal(key, shape=(data_dim*3,)) * 1e-2
 
         ## Define func as a small Unet1D
         ## Data_dim must be a multiple of 8. Let's pick the closest multiple of 8 greater than data_dim
@@ -503,7 +518,7 @@ class NeuralODE(eqx.Module):
         # Integration times
         # Assuming data step size is 1.0 (arbitrary units matching index)
         # ts = jnp.arange(steps + 1)
-        ts = jnp.linspace(0.0, 1.0, (steps + 15)*1)
+        ts = jnp.linspace(0.0, 1.0, (steps + CONFIG["warmup_steps"]))
 
         # data_dim_8 = ((self.data_dim + 7) // 8) * 8
         # # print("All shapes invloved in ODE solve:", y0.shape, data_dim_8, self.data_dim)
@@ -532,11 +547,13 @@ class NeuralODE(eqx.Module):
         
 
         ## y0 must containt mean and stddev
-        y0 = jnp.concatenate([y0, jnp.zeros_like(y0)])  # Initial stddev = 0.0 
+        # y0 = jnp.concatenate([y0, jnp.zeros_like(y0)])  # Initial stddev = 0.0 
+        y0 = self.y0
+
         sol = diffrax.diffeqsolve(
             term, solver, t0=ts[0], t1=ts[-1], dt0=0.1, y0=y0,
             # saveat=diffrax.SaveAt(ts=ts[1:]), # Save at 1, 2, ... steps
-            saveat=diffrax.SaveAt(ts=ts[15::1]), # Save at 1, 2, ... steps
+            saveat=diffrax.SaveAt(ts=ts[CONFIG["warmup_steps"]::1]), # Save at 1, 2, ... steps
             stepsize_controller=stepsize_controller,
             max_steps=4096*1
         )
@@ -548,9 +565,10 @@ class NeuralODE(eqx.Module):
         ## Usethe reparametrisation trick to sample from predicted mean and stddev
         # out of shape (steps, data_dim*2)
         means = out[:, :self.data_dim]
-        stddevs = out[:, self.data_dim:]
+        stddevs = out[:, self.data_dim:2*self.data_dim]
         eps = jax.random.normal(key, shape=stddevs.shape)
         samples = means + eps * stddevs
+        # samples = means
         return samples
 
 
@@ -853,7 +871,7 @@ def train_step_fn(model, x0_batch, key):
 
     ## Let's make sure no prediction is above 1 in absolute value
     max_val = jnp.max(jnp.abs(preds_batch))
-    total_loss += 1e-1 * jax.nn.relu(max_val - 20.0)
+    total_loss += 1e-1 * jax.nn.relu(max_val - 2.0)
 
     return total_loss
 
@@ -1005,7 +1023,8 @@ print("Generating Extended Parameter Trajectories Plot...")
 fig, ax = plt.subplots(figsize=(7, 10), nrows=1, ncols=1) 
 traj_seed_0 = final_batch_traj[0]
 # plot_ids = np.arange(100)  # First 100 parameters
-plot_ids = jax.random.choice(jax.random.PRNGKey(42), traj_seed_0.shape[1], shape=(100,), replace=False)
+nb_plots = min(100, traj_seed_0.shape[1])
+plot_ids = jax.random.choice(jax.random.PRNGKey(42), traj_seed_0.shape[1], shape=(nb_plots,), replace=False)
 
 # plot_up_to = CONFIG["n_circles"]
 plot_up_to = CONFIG["transformer_target_step"]
@@ -1091,3 +1110,4 @@ ax.legend()
 plt.tight_layout()
 plt.savefig(plots_path / "model_predictions_n_circles_circle_specific.png")
 plt.show()
+# %%
