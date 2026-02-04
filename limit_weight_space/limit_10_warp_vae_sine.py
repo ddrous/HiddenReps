@@ -964,7 +964,7 @@ def train_step_fn(model, x0_batch, key):
     def loss_per_seq(seq):
         return jax.vmap(get_functional_loss)(seq, step_indices, keys)
     losses_batch = jax.vmap(loss_per_seq)(preds_batch_data) # (Batch, Steps)
-    total_data_loss = jnp.mean(jnp.mean(losses_batch, axis=1))
+    total_data_loss = jnp.mean(jnp.sum(losses_batch, axis=1))
 
     # Consistency Loss
     step_indices = jnp.arange(1, CONFIG["transformer_target_step"])
