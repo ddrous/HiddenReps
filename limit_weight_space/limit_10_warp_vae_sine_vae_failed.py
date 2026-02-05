@@ -22,10 +22,6 @@ from sklearn.preprocessing import StandardScaler
 sns.set(style="white", context="talk")
 plt.rcParams['savefig.facecolor'] = 'white'
 
-## Jax config stop on NaNs
-# jax.config.update("jax_disable_jit", True)
-# jax.config.update("jax_debug_nans", True)
-
 
 # --- 1. CONFIGURATION ---
 TRAIN = True  
@@ -40,7 +36,7 @@ CONFIG = {
     "train_seg_ids": [1, 2, 3], # Train on the middle
 
     # Data & MLP Hyperparameters
-    "data_samples": 2000,
+    "data_samples": 10000,
     "noise_std": 0.005,
     "segments": 11,
     "x_range": [-1.5, 1.5],
@@ -49,12 +45,12 @@ CONFIG = {
     "mlp_batch_size": 64,
 
     # Expansion Hyperparameters
-    "n_circles": 30*2,           
+    "n_circles": 30*10,           
     "warmup_steps": 0,
     
     # --- TRANSFORMER HYPERPARAMETERS ---
     "lr": 5e-5,      
-    "transformer_epochs": 70000,
+    "transformer_epochs": 25000,
     "print_every": 2500,
     "transformer_batch_size": 1,      
 
@@ -64,9 +60,8 @@ CONFIG = {
     "transformer_n_layers": 1,     # Number of Transformer Blocks
     "transformer_d_ff": 1//1,       # Feedforward dimension inside block: TODO: not needed atm, see forward pass.
     "transformer_substeps": 50,     # Number of micro-steps per macro step
-    "kl_weight": 1e-1,          # Weight on KL divergence loss
-
-    "transformer_target_step": 60*2,    # Total steps to unroll
+    
+    "transformer_target_step": 60*10,    # Total steps to unroll
     "scheduled_loss_weight": False,
 
     ## Consistency Loss Config
@@ -74,7 +69,7 @@ CONFIG = {
     "consistency_loss_weight": 0.0,
 
     # Regularization Config
-    "regularization_step": 40*2,     
+    "regularization_step": 40*10,     
     "regularization_weight": 0.0,  
 
     # Data Selection Mode
@@ -299,13 +294,202 @@ class MLPModel(eqx.Module):
         #             #    eqx.nn.Linear(width_size, width_size, key=k4), jax.nn.relu,
         #                eqx.nn.Linear(width_size, 1, key=k3)]
 
-        self.layers = [eqx.nn.Linear(1, 1, use_bias=True, key=k1)]
+        self.layers = [eqx.nn.Linear(1, 2, use_bias=True, key=k1)]
 
     def __call__(self, x):
         for l in self.layers: x = l(x)
         return x
     def predict(self, x):
         return jax.vmap(self)(x)
+
+
+
+
+
+class ResidualBlock(eqx.Module):
+    conv1: eqx.nn.Conv1d
+    conv2: eqx.nn.Conv1d
+    norm1: Optional[eqx.nn.GroupNorm]
+    norm2: Optional[eqx.nn.GroupNorm]
+    emb_proj: Optional[eqx.nn.Linear]
+    act: typing.Callable
+    use_conditioning: bool
+    use_normalization: bool
+
+    def __init__(self, in_channels, out_channels, emb_dim, use_conditioning, use_normalization, key):
+        self.use_conditioning = use_conditioning
+        self.use_normalization = use_normalization
+        
+        k1, k2, k3 = jax.random.split(key, 3)
+        
+        # V-Net style: Input + Conv-Act-Conv(Input)
+        self.conv1 = eqx.nn.Conv1d(in_channels, out_channels, kernel_size=3, padding="same", key=k1)
+        self.conv2 = eqx.nn.Conv1d(out_channels, out_channels, kernel_size=3, padding="same", key=k2)
+        
+        if use_normalization:
+            self.norm1 = eqx.nn.GroupNorm(min(8, out_channels), out_channels)
+            self.norm2 = eqx.nn.GroupNorm(min(8, out_channels), out_channels)
+        else:
+            self.norm1 = self.norm2 = None
+            
+        if use_conditioning:
+            self.emb_proj = eqx.nn.Linear(emb_dim, out_channels, key=k3)
+        else:
+            self.emb_proj = None
+            
+        self.act = jax.nn.silu
+
+    def __call__(self, x, emb: Optional[jax.Array] = None):
+        h = x
+        
+        # Block 1
+        if self.use_normalization: h = self.norm1(h)
+        h = self.act(h)
+        h = self.conv1(h)
+        
+        # Inject conditioning
+        if self.use_conditioning and emb is not None:
+            # emb: (emb_dim,) -> proj -> (out_channels,) -> (out_channels, 1)
+            h = h + self.emb_proj(emb)[:, None]
+        
+        # Block 2
+        if self.use_normalization: h = self.norm2(h)
+        h = self.act(h)
+        h = self.conv2(h)
+        
+        # Residual alignment
+        if x.shape[0] != h.shape[0]:
+            # Project x to match hidden channels if necessary
+            x = eqx.nn.Conv1d(x.shape[0], h.shape[0], kernel_size=1, key=jax.random.PRNGKey(0))(x)
+            
+        return x + h
+
+class Unet1D(eqx.Module):
+    # Projections
+    t_proj: Optional[eqx.nn.Linear] # Simplified time embedding
+    cond_proj: Optional[eqx.nn.Linear]
+    
+    # Layers
+    init_conv: eqx.nn.Conv1d
+    down_blocks: list
+    down_samples: list
+    mid_block: ResidualBlock
+    up_samples: list
+    up_blocks: list
+    final_conv: eqx.nn.Conv1d
+    
+    # Config
+    use_conditioning: bool
+
+    def __init__(self, 
+                 in_shape: Tuple[int, int], 
+                 out_shape: Tuple[int, int],
+                 base_chans: int, 
+                 levels: int, 
+                 use_normalization: bool = False,
+                 key: jax.random.PRNGKey = jax.random.PRNGKey(0), 
+                 cond_dim: Optional[int] = None, 
+                 use_conditioning: bool = False):
+        
+        self.use_conditioning = use_conditioning
+        c_in, _ = in_shape
+        c_out, _ = out_shape
+        keys = jax.random.split(key, 100)
+        
+        # --- Conditioning ---
+        emb_dim = 0
+        if self.use_conditioning:
+            if cond_dim is None: raise ValueError("cond_dim required if use_conditioning=True")
+            emb_dim = base_chans * 4
+            # Simple Linear time embedding (can be replaced with Sinusoidal if needed)
+            self.t_proj = eqx.nn.Linear(1, emb_dim, key=keys[0]) 
+            self.cond_proj = eqx.nn.Linear(cond_dim, emb_dim, key=keys[1])
+        else:
+            self.t_proj = self.cond_proj = None
+
+        # --- Encoder ---
+        self.init_conv = eqx.nn.Conv1d(c_in, base_chans, kernel_size=3, padding="same", key=keys[2])
+        
+        self.down_blocks = []
+        self.down_samples = []
+        
+        curr_ch = base_chans
+        for i in range(levels):
+            # ResBlock keeps channels same, Downsample doubles them usually, 
+            # but standard UNet: Conv(C->C) -> Down(C->2C) is common, 
+            # or Down(C->C) -> Conv(C->2C).
+            # Here: Block(C->C) -> Down(C->C) -> Next Level starts with 2C expansion logic?
+            # Simpler: Block(C->C) -> Down(C->2C)
+            
+            self.down_blocks.append(
+                ResidualBlock(curr_ch, curr_ch, emb_dim, use_conditioning, use_normalization, keys[10+i])
+            )
+            # Downsample doubles channels
+            self.down_samples.append(
+                eqx.nn.Conv1d(curr_ch, curr_ch * 2, kernel_size=3, stride=2, padding=1, key=keys[20+i])
+            )
+            curr_ch *= 2
+
+        # --- Middle ---
+        self.mid_block = ResidualBlock(curr_ch, curr_ch, emb_dim, use_conditioning, use_normalization, keys[50])
+
+        # --- Decoder ---
+        self.up_samples = []
+        self.up_blocks = []
+        
+        for i in range(levels):
+            # Upsample halves channels (2C -> C)
+            target_ch = curr_ch // 2
+            self.up_samples.append(
+                eqx.nn.ConvTranspose1d(curr_ch, target_ch, kernel_size=4, stride=2, padding=1, key=keys[60+i])
+            )
+            # Block takes (C_skip + C_up) -> C_target
+            self.up_blocks.append(
+                ResidualBlock(target_ch * 2, target_ch, emb_dim, use_conditioning, use_normalization, keys[70+i])
+            )
+            curr_ch = target_ch
+            
+        self.final_conv = eqx.nn.Conv1d(base_chans, c_out, kernel_size=1, key=keys[90])
+
+    def __call__(self, t, y, arg):
+        # 1. Conditioning
+        emb = None
+        if self.use_conditioning:
+            t = jnp.array([t]) if jnp.ndim(t) == 0 else t.reshape(1)
+            t_emb = jax.nn.silu(self.t_proj(t))
+            c_emb = jax.nn.silu(self.cond_proj(arg))
+            emb = t_emb + c_emb
+
+        # 2. Encoder
+        x = self.init_conv(y)
+        skips = []
+        
+        for block, down in zip(self.down_blocks, self.down_samples):
+            x = block(x, emb)
+            skips.append(x)
+            x = down(x)
+            
+        # 3. Middle
+        x = self.mid_block(x, emb)
+        
+        # 4. Decoder
+        # Reverse skips to match upsamples
+        for up, block, skip in zip(self.up_samples, self.up_blocks, reversed(skips)):
+            x = up(x)
+            
+            # --- FIX: Handle Shape Mismatch ---
+            # If x is smaller than skip (due to odd length downsampling), pad x
+            if x.shape[-1] < skip.shape[-1]:
+                diff = skip.shape[-1] - x.shape[-1]
+                x = jnp.pad(x, ((0,0), (0, diff)))
+            # If x is larger (rare with correct padding but possible), crop x
+            elif x.shape[-1] > skip.shape[-1]:
+                x = x[:, :skip.shape[-1]]
+                
+            x = jnp.concatenate([x, skip], axis=0) # Channel concat
+            x = block(x, emb)
+            
+        return self.final_conv(x)
 
 
 # ## Let's just test the Unet1D forward pass
@@ -337,6 +521,116 @@ def count_params(module):
 
 #%%
 
+class NeuralODE(eqx.Module):
+    func: eqx.nn.MLP
+    data_dim: int
+    # embd_dim: int
+    # init_embd: eqx.nn.Linear
+
+    y0: jax.Array
+     
+    def __init__(self, data_dim, hidden_dim, key):
+        # self.embd_dim = 32
+        # self.init_embd = eqx.nn.Linear(data_dim, self.embd_dim, key=key)
+
+        self.func = eqx.nn.MLP(
+            in_size=data_dim*4, 
+            out_size=data_dim*4, 
+            width_size=hidden_dim, 
+            # width_size=int(data_dim*2.5), 
+            depth=4,
+            activation=jax.nn.softplus,
+            key=key
+        )
+
+        # self.y0 = jax.random.normal(key, shape=(data_dim*2,)) * 1e-2
+
+        # self.func = eqx.nn.Linear(data_dim*3, data_dim*3, use_bias=False, key=key)
+        # ## Initialize func to near identity
+        # self.func = eqx.tree_at(lambda func: func.weight, func, jnp.eye(data_dim))
+
+        self.y0 = jax.random.normal(key, shape=(data_dim*4,)) * 1e-2
+
+        ## Define func as a small Unet1D
+        ## Data_dim must be a multiple of 8. Let's pick the closest multiple of 8 greater than data_dim
+        self.data_dim = data_dim
+        # data_dim = ((data_dim + 7) // 8) * 8
+
+        # self.func = Unet1D(
+        #     in_shape=(data_dim, 1),
+        #     out_shape=(data_dim, 1),
+        #     base_chans=32,
+        #     levels=3,
+        #     use_normalization=False,
+        #     key=key,
+        #     cond_dim=None,
+        #     use_conditioning=False
+        # )
+
+
+    def __call__(self, y0, steps, key=None):
+        # Neural ODE logic differs: it doesn't take 'future' for teacher forcing usually.
+        # It integrates from the last history point.
+        
+        # Initial condition: last point of history
+        # y0 = history[-1]
+                
+        # Integration times
+        # Assuming data step size is 1.0 (arbitrary units matching index)
+        # ts = jnp.arange(steps + 1)
+        ts = jnp.linspace(0.0, 1.0, (steps + CONFIG["warmup_steps"]))
+
+        # data_dim_8 = ((self.data_dim + 7) // 8) * 8
+        # # print("All shapes invloved in ODE solve:", y0.shape, data_dim_8, self.data_dim)
+        # # Pad y0 to data_dim_8
+        # if y0.shape[0] < data_dim_8:
+        #     pad_width = data_dim_8 - y0.shape[0]
+        #     y0 = jnp.pad(y0, (0, pad_width))
+
+        def ode_func(t, y, args):
+            # y = jnp.concatenate([y, jnp.array([t])])  # Append time to state
+            return self.func(y)
+
+            # y = y[:, None]
+            # out = self.func(t, y, args)
+            # # print("Inside ODE func shapes:", y.shape, out.shape)
+            # return out.flatten()
+
+            # y = jnp.concatenate([y, self.init_embd(y0)])  # Append fixed embedding to state
+            # return self.func(y)
+
+        
+        term = diffrax.ODETerm(ode_func)
+        solver = diffrax.Tsit5()
+        # Step size controller
+        stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
+        
+
+        ## y0 must containt mean and stddev
+        # y0 = jnp.concatenate([y0, jnp.zeros_like(y0)])  # Initial stddev = 0.0 
+        y0 = self.y0
+
+        sol = diffrax.diffeqsolve(
+            term, solver, t0=ts[0], t1=ts[-1], dt0=0.1, y0=y0,
+            # saveat=diffrax.SaveAt(ts=ts[1:]), # Save at 1, 2, ... steps
+            saveat=diffrax.SaveAt(ts=ts[CONFIG["warmup_steps"]::1]), # Save at 1, 2, ... steps
+            stepsize_controller=stepsize_controller,
+            max_steps=4096*1
+        )
+        
+        out = sol.ys # Shape (steps, dim)
+        # return sol.ys[:, :self.data_dim]  # Remove padding if any
+        # return out
+
+        ## Usethe reparametrisation trick to sample from predicted mean and stddev
+        # out of shape (steps, data_dim*2)
+        means = out[:, :self.data_dim]
+        stddevs = out[:, self.data_dim:2*self.data_dim]
+        eps = jax.random.normal(key, shape=stddevs.shape)
+        samples = means + eps * stddevs
+        # samples = means
+        return samples
+
 
 class LinearRNN(eqx.Module):
     A: jax.Array
@@ -356,19 +650,10 @@ class LinearRNN(eqx.Module):
         # Shape: (2, data_dim)
         self.y_init = jax.random.normal(key, shape=(2, problem_dim)) * 0e-2
 
-        # # y_init_mean = jnp.zeros((data_dim,)) 
-        # y_init_mean = jax.random.normal(key, shape=(data_dim,)) * 1e-2
-        # y_init_sigma = jnp.ones((data_dim,))*(-3)
-        # y_init = jnp.concatenate([y_init_mean, y_init_sigma, jnp.zeros(problem_dim-2*data_dim,)])  # Shape: (data_dim*3)
-        # self.y_init = jnp.repeat(y_init[None, :], 2, axis=0)  # Shape: (2, data_dim*3)
-
     def __call__(self, y0, steps, key):
         # Initial state for the scan: (y_{t-1}, y_{t-2})
         # We've initialized y_init such that y_init[0] is y_0 and y_init[1] is y_{-1}
         init_state = (self.y_init[0], self.y_init[1])
-
-        # init_state1 = jnp.concatenate([y0, jnp.zeros((self.data_dim*3 - y0.shape[0],))])
-        # init_state = (init_state1, init_state1)
 
         def scan_fn(state, _):
             y_prev1, y_prev2 = state
@@ -519,255 +804,20 @@ opt_state = opt.init(eqx.filter(tf_model, eqx.is_array))
 #%%
 # --- 6. END-TO-END TRAINING LOOP ---
 
-# def negative_log_likelihood(theta_mu, theta_sigma, X, Y=None):
-#     """Computes the negative log-likelihood of the observed data under a Gaussian model.
-#         We use Bayesian inference intending to maginalise over all possible thetas that could have generated the data.
-#         We use a the Laplace approximation, linearising the model around the predicted theta_mu and using the predicted theta_sigma as the variance of the Gaussian. 
-#     """
-
-#     # print("Actual values ot theta and sigma:", theta_mu, theta_sigma)
-
-#     ## First, we want to write f(x;\theta) = f(x;theta_mu) + grad_theta f(x;theta_mu) @ (theta - theta_mu)
-#     def model_fn(theta, x):
-#         params = unflatten_pytree(theta, shapes, treedef, mask)
-#         model = eqx.combine(params, static)
-#         return model.predict(x)     ## Shape (nb_data_points, output_dim)
-
-#     mean_y_pred = model_fn(theta_mu, X)  # Shape: (n_data_points, output_dim)
-#     jacobian = eqx.filter_jacfwd(model_fn)(theta_mu, X)  # Shape: (n_data_points, output_dim, input_dim)
-
-#     ## Next we calculate the covaraance matrix Cov(y) = J @ Cov(theta) @ J^T + sigma^2 I
-#     # theta_cov = jnp.diag(theta_sigma**2)  # Shape: (input_dim, input_dim)
-#     theta_cov = jnp.diag(theta_sigma**2) + jnp.eye(theta_sigma.shape[0]) * 1e-6   # Add small value to diagonal for numerical stability
-
-#     # cov_y_pred = jacobian @ theta_cov @ jnp.transpose(jacobian, (0, 2, 1)) + jnp.eye(mean_y_pred.shape[0]) * 1e-6  # Shape: (n_data_points, output_dim, output_dim)
-#     cov_y_pred = jacobian @ theta_cov @ jnp.transpose(jacobian, (0, 2, 1)) 
-
-#     # print("Covy squeezed:", cov_y_pred.squeeze())
-
-#     if Y is None:
-#         return None, mean_y_pred, cov_y_pred
-
-#     ## Finally, we compute the negative log-likelihood of the observed data under the predicted Gaussian distribution
-#     diff = Y - mean_y_pred  # Shape: (n_data_points, output_dim)
-#     inv_cov_y_pred = jnp.linalg.inv(cov_y_pred)  # Shape: (n_data_points, output_dim, output_dim)
-
-#     # We should have one term for each data point, but we can average them together
-#     diff_expanded = diff[:, :, None]  # Shape: (n_data_points, output_dim, 1)
-#     nll = 0.5 * jnp.sum(diff_expanded * (inv_cov_y_pred @ diff_expanded), axis=(1, 2)) + 0.5 * jnp.log(jnp.linalg.det(cov_y_pred) + 1e-6)
-
-#     return nll, mean_y_pred, cov_y_pred
-
-
-def negative_log_likelihood(theta_mu, log_theta_sigma, X, Y, use_inverse=True, noise_sigma=1e-3):
-    """
-    Computes the NLL of the observed data under a linearized Laplace approximation.
-    
-    Args:
-        theta_mu: Mean parameters (flat vector).
-        log_theta_sigma: Log standard deviation of parameters (flat vector).
-        X: Inputs (N, input_dim).
-        Y: Targets (N, output_dim).
-        use_inverse: If True, uses direct matrix inversion (simpler but less stable).
-                     If False, uses Cholesky decomposition (standard, stable).
-        [shapes, treedef, mask, static]: Context variables for model reconstruction.
-    """
-    
-    # --- 0. Helper to reconstruct and predict ---
-    def model_fn(theta, x):
-        # Reconstruct params from flat vector
-        params = unflatten_pytree(theta, shapes, treedef, mask)
-        model = eqx.combine(params, static)
-        return model.predict(x)     ## Vectorized predict: Shape (N, p)
-
-    N = X.shape[0]
-
-    # --- 1. Linearize Model (Mean & Jacobian) ---
-    # mean_y: (N, p)
-    # jacobian: (N, p, d) where p is output_dim, d is param_dim
-    mean_y = model_fn(theta_mu, X)
-    jacobian = jax.jacfwd(model_fn)(theta_mu, X)
-
-    p = mean_y.shape[-1] # output dimension
-
-    # --- 2. Construct Output Covariance ---
-    # Theta variance (diagonal)
-    # theta_var = jnp.exp(log_theta_sigma * 2) + 1e-6
-    # theta_var = jnp.exp(log_theta_sigma * 2)
-    theta_var = log_theta_sigma ** 2
-    # theta_std = jnp.sqrt(theta_var)
-    theta_std = log_theta_sigma
-
-    # Optimization: Instead of full matrix multiply J @ Cov @ J.T,
-    # we scale J by std_dev and do J_scaled @ J_scaled.T
-    # scaled_jacobian shape: (N, p, d)
-    scaled_jacobian = jacobian * theta_std[None, None, :]
-    
-    # Cov_y = J_scaled @ J_scaled^T + Noise
-    # Result shape: (N, p, p)
-    cov_y = jnp.einsum('npd,nqd->npq', scaled_jacobian, scaled_jacobian)
-    
-    # Add observation noise (Nugget) for stability
-    noise_variance = noise_sigma ** 2
-    cov_y = cov_y + jnp.eye(p) * noise_variance
-
-    if Y is None:
-        return None, mean_y, cov_y
-
-    # --- 3. Compute Residuals ---
-    diff = Y - mean_y # (N, p)
-
-    # --- 4. Calculate NLL (Branching Logic) ---
-    
-    if use_inverse:
-        # METHOD A: Direct Inverse
-        # 1. Invert Covariance
-        cov_inv = jnp.linalg.inv(cov_y) # (N, p, p)
-        
-        # 2. Quadratic Form: 0.5 * (y-mu)^T @ inv @ (y-mu)
-        # diff is (N, p), we need (N, 1, p) @ (N, p, p) @ (N, p, 1) -> (N, 1, 1)
-        # Using einsum for cleaner batch operation:
-        quad_form = 0.5 * jnp.einsum('np,npq,nq->n', diff, cov_inv, diff)
-        
-        # 3. Log Determinant
-        _, log_det = jnp.linalg.slogdet(cov_y) # (N,)
-        log_det_term = 0.5 * log_det
-        
-    else:
-        # METHOD B: Cholesky Solve (Numerically Stable)
-        # 1. Cholesky Decomposition: cov = L @ L.T
-        L = jnp.linalg.cholesky(cov_y) # (N, p, p)
-        
-        # 2. Solve for Quadratic Form
-        # We want: diff^T @ Cov^-1 @ diff
-        # Since Cov = L @ L.T, Cov^-1 = L^-T @ L^-1
-        # Let z = L^-1 @ diff  =>  L @ z = diff
-        
-        # Solve Lz = diff (Triangular solve)
-        # L is lower triangular. shape (N, p, p), diff is (N, p) -> (N, p, 1)
-        # We need to reshape diff for generic solve or use vmap
-        def solve_single(Li, diffi):
-            # z = Li \ diffi
-            z = jax.lax.linalg.triangular_solve(Li, diffi[:, None], lower=True, left_side=True)
-            return jnp.squeeze(z) # back to vector
-
-        z = jax.vmap(solve_single)(L, diff)
-        
-        # Quad form is 0.5 * ||z||^2
-        quad_form = 0.5 * jnp.sum(z**2, axis=-1)
-        
-        # 3. Log Determinant using Cholesky
-        # log(det(Cov)) = 2 * sum(log(diag(L)))
-        log_det_term = jnp.sum(jnp.log(jnp.diagonal(L, axis1=1, axis2=2)), axis=-1)
-
-    # --- 5. Combine Terms ---
-    all_nll = quad_form + log_det_term
-    
-    # Add constant terms: 0.5 * N * p * log(2*pi)
-    # constant_term = 0.5 * N * p * jnp.log(2 * jnp.pi)
-    # all_nll += 0.5 * N * p * jnp.log(2 * jnp.pi)
-    
-    return all_nll, mean_y, cov_y
-
-def compute_kl_divergence(mu, sigma):
-    """
-    Computes KL(q||p) where q = N(mu, sigma^2) and p = N(0, 1).
-    Formula: 0.5 * sum(sigma^2 + mu^2 - 1 - log(sigma^2))
-    """
-    # Ensure sigma is positive and adds stability
-    var = sigma**2 + 1e-6
-    log_var = jnp.log(var)
-    
-    kl = 0.5 * jnp.sum(var + mu**2 - 1.0 - log_var)
-    return kl
-
-def compute_kl_divergence_emp(mu, sigma, emp_means):
-    """
-    Computes KL(q||p) where q = N(mu, sigma^2) and p = N(empirical_means, I).
-    """
-    var = sigma**2 + 1e-6
-    log_var = jnp.log(var)
-    
-    kl = 0.5 * jnp.sum(var + (mu - emp_means)**2 - 1.0 - log_var)
-    return kl
-
-def compute_output_kl(pred_mean, pred_cov, prior_mean=0.0, prior_sigma=3.0):
-    """
-    Computes KL divergence between predicted Gaussian and a fixed Prior Gaussian.
-    
-    Args:
-        pred_mean: (N, D) Predicted means
-        pred_cov: (N, D, D) Predicted covariance matrices
-        prior_mean: Scalar or (D,) target mean (default 0.0)
-        prior_sigma: Scalar target standard deviation (default 3.0)
-    """
-    N, D = pred_mean.shape
-    
-    # 1. Define Prior Parameters
-    # Covariance of prior is diagonal: sigma^2 * I
-    prior_var = prior_sigma ** 2
-    
-    # 2. Compute Terms
-    
-    # A) Trace Term: tr(Sigma_prior^-1 @ Sigma_pred)
-    # Since Sigma_prior is scalar diagonal, this is just tr(Sigma_pred) / prior_var
-    # We can just sum the diagonal elements of pred_cov
-    tr_term = jnp.trace(pred_cov, axis1=-2, axis2=-1) / prior_var
-    
-    # B) Quadratic Term: (mu_1 - mu_0)^T @ Sigma_prior^-1 @ (mu_1 - mu_0)
-    # Similarly, divides by prior_var
-    diff = pred_mean - prior_mean
-    quad_term = jnp.sum(diff**2, axis=-1) / prior_var
-    
-    # C) Log Det Term: log(|Sigma_prior| / |Sigma_pred|)
-    # log(|Sigma_prior|) = D * log(prior_var)
-    log_det_prior = D * jnp.log(prior_var)
-    
-    # Use slogdet for stability on the predicted covariance
-    _, log_det_pred = jnp.linalg.slogdet(pred_cov)
-    
-    log_det_term = log_det_prior - log_det_pred
-    
-    # 3. Combine
-    # KL = 0.5 * (trace + quad + log_det - dimensionality)
-    kl = 0.5 * (tr_term + quad_term + log_det_term - D)
-    
-    return jnp.mean(kl) # Average over batch
-    # return kl
-
 def get_functional_loss(flat_w, step_idx, key=None):
     # Unflatten MLP
-    # params = unflatten_pytree(flat_w, shapes, treedef, mask)
-    # model = eqx.combine(params, static)
+    params = unflatten_pytree(flat_w, shapes, treedef, mask)
+    model = eqx.combine(params, static)
     
     # y_pred = model.predict(X_train_full)
     # residuals = (y_pred - Y_train_full) ** 2
 
     ## y_pred contrains means and stddev, and we want a NLL loss
-    # y_pred = model.predict(X_train_full)
-    # means = y_pred[:, 0:real_output_size]
-    # stddev = y_pred[:, real_output_size:real_output_size*2]
-    # residuals = 0.5 * jnp.log(2 * jnp.pi * (stddev ** 2 + 1e-6)) + 0.5 * ((Y_train_full - means) ** 2) / (stddev ** 2 + 1e-6)
-    # # residuals = ((Y_train_full - means) ** 2) / (stddev ** 2 + 1e-6)
-
-    ## Let's compute teh NL by approximate marginalisation over \theta
-    means_theta, sigmas_theta = flat_w[:input_dim], flat_w[input_dim:2*input_dim]
-    # residuals, _, _ = negative_log_likelihood(means_theta, sigmas_theta, X_train_full, Y_train_full)
-
-    theta = jax.random.normal(key, shape=sigmas_theta.shape) * sigmas_theta + means_theta  # Sample theta from predicted distribution
-    params = unflatten_pytree(theta, shapes, treedef, mask)
-    model = eqx.combine(params, static)
-    residuals = (model.predict(X_train_full) - Y_train_full) ** 2
-
-    ## Compute KL divergence between predicted theta distribution and prior (N(0, I))
-    # kl_div = compute_kl_divergence(means_theta, sigmas_theta)
-
-    ## Compute KL divergence between predicted y distribution and N(Y_train_full, I)
-    _, mean_y, cov_y = negative_log_likelihood(means_theta, sigmas_theta, X_train_full, Y=None, use_inverse=True, noise_sigma=1e-3)
-    std_y = jnp.sqrt(jnp.diagonal(cov_y, axis1=1, axis2=2))
-    # kl_div = compute_kl_divergence_emp(mean_y.flatten(), std_y.flatten(), Y_train_full.flatten())
-    # kl_div = compute_kl_divergence(mean_y.flatten(), std_y.flatten())
-    kl_div = compute_output_kl(mean_y, cov_y, prior_mean=jnp.mean(Y_train_full), prior_sigma=3.0)
+    y_pred = model.predict(X_train_full)
+    means = y_pred[:, 0:real_output_size]
+    stddev = y_pred[:, real_output_size:real_output_size*2]
+    residuals = 0.5 * jnp.log(2 * jnp.pi * (stddev ** 2 + 1e-6)) + 0.5 * ((Y_train_full - means) ** 2) / (stddev ** 2 + 1e-6)
+    # residuals = ((Y_train_full - means) ** 2) / (stddev ** 2 + 1e-6)
 
     # ## We don't want to use all of X_train_full, only a randmly selected subset, like a batch
     # n_data_points = X_train_full.shape[0]
@@ -839,14 +889,10 @@ def get_functional_loss(flat_w, step_idx, key=None):
 
     mask_sum = jnp.sum(active_mask)
     base_loss = jnp.sum(residuals * active_mask[:, None]) / (mask_sum + 1e-6)
-
+    
     eff_weight = jax.lax.select(is_reg_step, CONFIG["regularization_weight"], 1.0)
-
+    
     final_loss = base_loss * eff_weight
-
-    ## Add the KL loss
-    final_loss = final_loss + CONFIG["kl_weight"] * kl_div
-    # final_loss = final_loss + 1e-4 * kl_div
 
     if not CONFIG["scheduled_loss_weight"]:
         return final_loss
@@ -902,12 +948,12 @@ def train_step_fn(model, x0_batch, key):
     keys = jax.random.split(key, x0_batch.shape[0])
     preds_batch = jax.vmap(model, in_axes=(0, None, 0))(x0_batch, total_steps, keys) # (Batch, Steps, D*3)
 
-    # ## Extract and sample from the predicted mean and stddev
-    # means = preds_batch[:, :, :input_dim]
-    # stddevs = preds_batch[:, :, input_dim:2*input_dim]
-    # eps = jax.random.normal(key, shape=stddevs.shape)
-    # # preds_batch = means + eps * stddevs
-    # preds_batch = means
+    ## Extract and sample from the predicted mean and stddev
+    means = preds_batch[:, :, :input_dim]
+    stddevs = preds_batch[:, :, input_dim:2*input_dim]
+    eps = jax.random.normal(key, shape=stddevs.shape)
+    # preds_batch = means + eps * stddevs
+    preds_batch = means
 
     # step_indices = jnp.arange(total_steps)
     # preds_batch_data = preds_batch
@@ -938,12 +984,10 @@ def train_step_fn(model, x0_batch, key):
     def cons_loss_per_seq(seq):
         # return jax.vmap(get_disconsistency_loss)(seq[:-1], seq[1:], step_indices[:-1], keys)
         return jax.vmap(get_consistency_loss)(seq[1:-1], seq[2:], step_indices[1:-1], keys)
-    # cons_losses_batch = jax.vmap(cons_loss_per_seq)(preds_batch_cons) 
-    # total_cons_loss = jnp.mean(jnp.sum(cons_losses_batch, axis=1))
+    cons_losses_batch = jax.vmap(cons_loss_per_seq)(preds_batch_cons) 
+    total_cons_loss = jnp.mean(jnp.sum(cons_losses_batch, axis=1))
 
-    # total_loss = total_data_loss + CONFIG["consistency_loss_weight"]*total_cons_loss
-
-    total_loss = total_data_loss
+    total_loss = total_data_loss + CONFIG["consistency_loss_weight"]*total_cons_loss
 
     # ## Let's penalise large prediction trajectories up to n_circles only
     # inital_preds = preds_batch[:, :CONFIG["n_circles"], :]
@@ -1035,11 +1079,10 @@ fig = plt.figure(figsize=(20, 10))
 gs = fig.add_gridspec(2, 2)
 
 ## Loss history is NLL, so can be zero or negative. Shift it up for log plotting
-# shifted_loss_history = loss_history - np.min(loss_history) + 1e-2
+shifted_loss_history = loss_history - np.min(loss_history) + 1e-2
 
 ax1 = fig.add_subplot(gs[0, 0])
-ax1.plot(loss_history, color='teal', linewidth=2)
-# ax1.set_yscale('symlog')
+ax1.plot(shifted_loss_history, color='teal', linewidth=2)
 ax1.set_yscale('log')
 ax1.set_title("Training NLL Loss (Shifted to Avoid Zero)")
 ax1.grid(True, alpha=0.3)
@@ -1124,8 +1167,8 @@ traj_seed_0 = final_batch_traj[0]
 mean_traj = traj_seed_0[:, :weight_dim]
 stddev_traj = traj_seed_0[:, weight_dim:2*weight_dim]
 eps = jax.random.normal(eval_key, shape=stddev_traj.shape)
-traj_seed_0 = mean_traj + eps * stddev_traj
-# traj_seed_0 = mean_traj
+# traj_seed_0 = mean_traj + eps * stddev_traj
+traj_seed_0 = mean_traj
 
 # plot_ids = np.arange(100)  # First 100 parameters
 nb_plots = min(100, traj_seed_0.shape[1])
@@ -1267,28 +1310,14 @@ def predict_circle_uncertainty(final_batch_traj, X_data):
         if X_circle.shape[0] == 0:
             continue
 
-        w = final_batch_traj[0, circle_idx, :]    ## Only using the means  
-        # p = unflatten_pytree(w, shapes, treedef, mask)
-        # m = eqx.combine(p, static)
-        # y_pred = m.predict(X_circle)
+        w = final_batch_traj[0, circle_idx, :weight_dim]    ## Only using the means  
+        p = unflatten_pytree(w, shapes, treedef, mask)
+        m = eqx.combine(p, static)
+        y_pred = m.predict(X_circle)
 
         # Extract Mean and Std Predictions
-        # y_mean = y_pred[:, 0:real_output_size]
-        # y_std = y_pred[:, real_output_size:real_output_size*2]
-
-        # Calculte the means and stddev using nll loss
-        theta_mean = w[:weight_dim]
-        theta_std = w[weight_dim:2*weight_dim]
-        _, y_mean, cov_y_pred = negative_log_likelihood(theta_mean, theta_std, X_circle, Y=None, use_inverse=True, noise_sigma=1e-3)
-        y_std = jnp.sqrt(jnp.diagonal(cov_y_pred, axis1=1, axis2=2))[:, 0]  # Extract stddev for the output dimension
-
-        # ## Let's assume the model is linear: y = theta_0 * x + theta_1. Then the mean and stddev of y can be calculated directly from the mean and stddev of theta.
-        # theta_mean = w[:weight_dim]
-        # theta_std = w[weight_dim:2*weight_dim]
-        # slope_mean, intercept_mean = theta_mean
-        # slope_std, intercept_std = theta_std
-        # y_mean = slope_mean * X_circle.flatten() + intercept_mean
-        # y_std = jnp.sqrt((X_circle.flatten() * slope_std) ** 2 + intercept_std ** 2)  # Propagate uncertainty through the linear model
+        y_mean = y_pred[:, 0:real_output_size]
+        y_std = y_pred[:, real_output_size:real_output_size*2]
 
         # Store data for plotting
         circle_stats[circle_idx] = (X_circle, y_mean, y_std)
@@ -1343,7 +1372,7 @@ def plot_uncertainty_bands(stats_dict, color_mean, color_band, label_prefix):
         # print("Min and Max of sigma for circle", circle_idx, "are:", jnp.min(sigma_sorted), jnp.max(sigma_sorted))
 
         ## We can't use fill_between with scatter, so for each point, we plot a vertical line
-        multiplier = 2
+        multiplier = 25
         for x_pt, mu_pt, sigma_pt in zip(X_sorted, mu_sorted, sigma_sorted):
             ax.vlines(x_pt, mu_pt - multiplier * sigma_pt, mu_pt + multiplier * sigma_pt, color=color_band, alpha=0.1, label=f"{label_prefix} Uncertainty" if not added_label else None)
 
@@ -1359,7 +1388,7 @@ plot_uncertainty_bands(test_stats, color_mean='red', color_band='red', label_pre
 # Uncomment below if you also want to see the fit on Training data segments
 plot_uncertainty_bands(train_stats, color_mean='green', color_band='green', label_prefix="Train Model")
 
-ax.set_title(r"Model Predictions with Uncertainty ($\mu \pm mult \sigma$)")
+ax.set_title(r"Model Predictions with Uncertainty ($\mu \pm 2\sigma$)")
 ax.set_ylim(jnp.min(Y_train_full)-1, jnp.max(Y_train_full)+1)
 ax.grid(True, alpha=0.3)
 ax.legend()
