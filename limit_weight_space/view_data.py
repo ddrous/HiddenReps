@@ -43,18 +43,18 @@ CONFIG = {
     "data_samples": 2000,
     "noise_std": 0.005,
     "segments": 11,
-    "x_range": [-1.5, 1.5],
-    "train_seg_ids": [2, 3, 4, 5, 6, 7, 8], 
+    "x_range": [0.175, 1.5],
+    "train_seg_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8], 
     "width_size": 24,
     "mlp_batch_size": 64,
 
     # Expansion Hyperparameters
     "n_circles": 30*2,           
     "warmup_steps": 0,
-    
+
     # --- TRANSFORMER HYPERPARAMETERS ---
     "lr": 5e-5,      
-    "transformer_epochs": 70000,
+    "transformer_epochs": 7000*5,
     "print_every": 2500,
     "transformer_batch_size": 1,      
 
@@ -64,7 +64,7 @@ CONFIG = {
     "transformer_n_layers": 1,     # Number of Transformer Blocks
     "transformer_d_ff": 1//1,       # Feedforward dimension inside block: TODO: not needed atm, see forward pass.
     "transformer_substeps": 50,     # Number of micro-steps per macro step
-    "kl_weight": 1e-2,          # Weight on KL divergence loss
+    "kl_weight": 1e-1,          # Weight on KL divergence loss
 
     "transformer_target_step": 60*2,    # Total steps to unroll
     "scheduled_loss_weight": False,
@@ -157,7 +157,7 @@ def gen_data(seed, n_samples, n_segments=3, x_range=[-3.0, 3.0], noise_std=0.1):
     
     # 2. Define the unchanging relation P(Y|X) (Concept)
     # y = sin(3x) + 0.5x is classic because it has both trend and periodicity
-    Y = np.cos(10 * X) + 0.5 * X
+    Y = np.sin(10 * X) + 0.5 * X
     
     # Add noise
     noise = np.random.normal(0, noise_std, n_samples)
@@ -267,7 +267,7 @@ else:
     except FileNotFoundError:
         raise FileNotFoundError("Could not find data files in artefacts folder. Ensure TRAIN was run at least once.")
 
-x_mean = jnp.mean(X_train_full)
+x_mean = jnp.min(X_train_full)
 # x_mean = jnp.min(X_train_full)
 print(f"Data Center (Mean): {x_mean:.4f}")
 
@@ -755,6 +755,7 @@ def get_functional_loss(flat_w, step_idx, key=None):
     # residuals, _, _ = negative_log_likelihood(means_theta, sigmas_theta, X_train_full, Y_train_full)
 
     theta = jax.random.normal(key, shape=sigmas_theta.shape) * sigmas_theta + means_theta  # Sample theta from predicted distribution
+    # theta = means_theta  ## Let's just use the mean for now, to see if it can learn anything at all. TODO
     params = unflatten_pytree(theta, shapes, treedef, mask)
     model = eqx.combine(params, static)
     residuals = (model.predict(X_train_full) - Y_train_full) ** 2
@@ -1117,7 +1118,7 @@ plt.show()
 
 #%% Special plot paramter trajectories
 print("Generating Extended Parameter Trajectories Plot...")
-fig, ax = plt.subplots(figsize=(7, 10), nrows=1, ncols=1) 
+fig, ax = plt.subplots(figsize=(10, 4), nrows=1, ncols=1) 
 traj_seed_0 = final_batch_traj[0]
 
 ## Extrat mean and stddev trajectories
@@ -1144,12 +1145,12 @@ for idx in plot_ids:
 
 
 
-## Plot vertical lines (One for the n_circles step, one for the regularization step
-ax.axvline(CONFIG["n_circles"], color='k', linestyle='--', label="End of Data")
-ax.axvline(CONFIG["regularization_step"], color='red', linestyle=':', label="Reg Step")
+# ## Plot vertical lines (One for the n_circles step, one for the regularization step
+# ax.axvline(CONFIG["n_circles"], color='k', linestyle='--', label="End of Data")
+# ax.axvline(CONFIG["regularization_step"], color='red', linestyle=':', label="Reg Step")
 
 ax.set_title("Parameter Trajectories")
-ax.set_xlabel("Step")
+ax.set_xlabel("Sequence Step")
 ax.set_ylabel("Parameter Value")
 plt.tight_layout()
 plt.savefig(plots_path / "extended_parameter_trajectories.png")
@@ -1157,6 +1158,10 @@ plt.show()
 
 #%% Model Predictions Corresponding to Circles plot
 print("Generating n_circles Model Prediction Plot (Circle-Specific Models)...")
+
+## Increase the font size of everything in the plot
+plt.rcParams.update({'font.size': 14})
+
 # step_idx = 35 
 dists = jnp.abs(X_train_full - x_mean).flatten()
 
@@ -1197,25 +1202,34 @@ train_preds_cc = predict_circle_specific_loss(final_batch_traj, X_train_full)
 test_preds_cc = predict_circle_specific_loss(final_batch_traj, X_test)
 
 fig, ax = plt.subplots(figsize=(10, 6))     
-ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
-ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1, label="Test Data")
+# ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
+ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1)
+# ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1, label="Test Data")
+ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1)
 
 # X_circles of shape (N_circle, 1), y_pred of shape (N_circle, 1)
 
 for circle_idx, (X_circle, y_pred) in train_preds_cc.items():
     # print(f"Circle {circle_idx}: X_circle shape: {X_circle.shape}, y_pred shape: {y_pred.shape}")
-    ax.scatter(X_circle, y_pred, c='green', s=1, alpha=0.3)
+    ax.scatter(X_circle, y_pred, c='green', s=1, alpha=0.3, label="Train" if circle_idx==1 else None)
 for circle_idx, (X_circle, y_pred) in test_preds_cc.items():
-    ax.scatter(X_circle, y_pred, c='red', s=1, alpha=0.3)
+    ax.scatter(X_circle, y_pred, c='red', s=1, alpha=0.3, label="Test" if circle_idx==CONFIG["n_circles"]-1 else None)
 
+ax.set_xlabel(r"$x$")
+ax.set_ylabel(r"$y$")
 # ax.set_title(f"Model Predictions Corresponding to Circles (Circle-Specific Models)")
-ax.set_title(f"Model Predictions At Final Time Step")
+ax.set_title(f"Model Predictions")
 ax.set_ylim(jnp.min(Y_train_full)-1, jnp.max(Y_train_full)+1)
 ax.grid(True, alpha=0.3)
 ax.legend()
 plt.tight_layout()
 plt.savefig(plots_path / "model_predictions_n_circles_circle_specific.png")
-plt.show()
+# plt.show()
+
+plt.draw()
+
+## Save as PDF
+plt.savefig(plots_path / "model_predictions_n_circles_circle_specific.pdf")
 
 
 
@@ -1233,7 +1247,7 @@ plt.show()
 
 print("Generating n_circles Model Prediction Plot (Circle-Specific Models)...")
 
-def predict_circle_uncertainty(final_batch_traj, X_data, Y_data=None):
+def predict_circle_uncertainty(final_batch_traj, X_data):
     """
     Computes mean and uncertainty for circle-specific linear models.
     Assumes final_batch_traj shape is (Batch, Steps, 4) -> [mu_slope, mu_bias, std_slope, std_bias]
@@ -1290,67 +1304,45 @@ def predict_circle_uncertainty(final_batch_traj, X_data, Y_data=None):
         # y_mean = slope_mean * X_circle.flatten() + intercept_mean
         # y_std = jnp.sqrt((X_circle.flatten() * slope_std) ** 2 + intercept_std ** 2)  # Propagate uncertainty through the linear model
 
-        Y_circle = Y_data[ring_mask]  # True labels for the points in the current circle
         # Store data for plotting
-        circle_stats[circle_idx] = (X_circle, Y_circle, y_mean, y_std)
+        circle_stats[circle_idx] = (X_circle, y_mean, y_std)
 
     return circle_stats
 
 # Run inference
-train_stats = predict_circle_uncertainty(final_batch_traj, X_train_full, Y_train_full)
-test_stats = predict_circle_uncertainty(final_batch_traj, X_test, Y_test)
+train_stats = predict_circle_uncertainty(final_batch_traj, X_train_full)
+test_stats = predict_circle_uncertainty(final_batch_traj, X_test)
 
 #%%
 # --- Plotting ---
 fig, ax = plt.subplots(figsize=(10, 6))
 
-## Increase the label size of the legend for better visibility
-plt.rcParams['legend.fontsize'] = 18
-## Increase markersize
-plt.rcParams['lines.markersize'] = 10
-
-# # 1. Plot Background Data
-# ax.scatter(X_train_full, Y_train_full, c='blue', s=20, alpha=0.9, label="Train Data", marker='x')
-# ax.scatter(X_test, Y_test, c='orange', s=20, alpha=0.9, label="Test Data", marker='x')
-
-## Let's plot the true data as a line (train and test combined), to better see the fit of the model, and avoid overcrowding the plot with points
-X_combined = jnp.concatenate([X_train_full, X_test])
-Y_combined = jnp.concatenate([Y_train_full, Y_test])
-sort_indices = jnp.argsort(X_combined.flatten())
-X_sorted = X_combined[sort_indices].flatten()
-Y_sorted = Y_combined[sort_indices].flatten()
-ax.plot(X_sorted, Y_sorted, c='k', linewidth=4, alpha=1, label="True Func.")
-
-## y_lim is betwen -4 and 4
-ax.set_ylim(-2.5, 2.5)
+# 1. Plot Background Data
+ax.scatter(X_train_full, Y_train_full, c='blue', s=10, alpha=0.1, label="Train Data")
+ax.scatter(X_test, Y_test, c='orange', s=10, alpha=0.1, label="Test Data")
 
 # Helper function to plot bands
 def plot_uncertainty_bands(stats_dict, color_mean, color_band, label_prefix):
     added_label = False
-    total_mse = 0.
-
-    for circle_idx, (X_seg, Y_seg, y_mu, y_sigma) in stats_dict.items():
+    
+    for circle_idx, (X_seg, y_mu, y_sigma) in stats_dict.items():
         # We must sort X to plot lines and fill_between correctly
         sort_indices = jnp.argsort(X_seg.flatten())
         X_sorted = X_seg[sort_indices].flatten()
         mu_sorted = y_mu[sort_indices].flatten()
         sigma_sorted = y_sigma[sort_indices].flatten()
 
-        ## Calculat the MSE and add it to the total
-        mse = jnp.mean((mu_sorted - Y_seg[sort_indices].flatten())**2)
-        total_mse += mse
-
         # print("Aff distance from the mean are:", jnp.abs(X_sorted - x_mean).flatten()   )
         
         # Label only the first segment to avoid cluttering the legend
-        lbl = f"Mean {label_prefix}" if not added_label else None
+        lbl = f"{label_prefix} Mean" if not added_label else None
         
         # Plot Mean
         # ax.plot(X_sorted, mu_sorted, c=color_mean, linewidth=2, alpha=0.8, label=lbl)
 
         ## Scatter plot mean instead of line plot
-        ax.scatter(X_sorted, mu_sorted, c=color_mean, s=50, alpha=0.6, label=lbl, linewidth=2, marker='+')
-
+        ax.scatter(X_sorted, mu_sorted, c=color_mean, s=5, alpha=0.8, label=lbl)
+        
         # Plot Uncertainty (Mean +/- 2 Std)
         # ax.fill_between(
         #     X_sorted, 
@@ -1366,42 +1358,34 @@ def plot_uncertainty_bands(stats_dict, color_mean, color_band, label_prefix):
 
         ## We can't use fill_between with scatter, so for each point, we plot a vertical line
         multiplier = 2
-        added_label = True
-
         for x_pt, mu_pt, sigma_pt in zip(X_sorted, mu_sorted, sigma_sorted):
-            ax.vlines(x_pt, mu_pt - multiplier * sigma_pt, mu_pt + multiplier * sigma_pt, color=color_band, alpha=0.08, label=f"{label_prefix} Uncertainty" if not added_label else None)
+            ax.vlines(x_pt, mu_pt - multiplier * sigma_pt, mu_pt + multiplier * sigma_pt, color=color_band, alpha=0.1, label=f"{label_prefix} Uncertainty" if not added_label else None)
 
             added_label = True
-
-    print(f"Mean MSE for {label_prefix}: {total_mse / len(stats_dict):.4f}")
-
 
 # 2. Plot Model Inference (Mean + 2 Std)
 # We usually only plot the Test predictions for clarity, but you can enable both.
 # Here I plot Test predictions in Red/Pink and Train in Green (Optional)
 
-# Uncomment below if you also want to see the fit on Training data segments
-plot_uncertainty_bands(train_stats, color_mean='green', color_band='green', label_prefix="Train Pred.")
-
 # Plotting Test Set Inference (High contrast)
-plot_uncertainty_bands(test_stats, color_mean='red', color_band='red', label_prefix="Test Pred.")
+plot_uncertainty_bands(test_stats, color_mean='red', color_band='red', label_prefix="Test Model")
 
+# Uncomment below if you also want to see the fit on Training data segments
+plot_uncertainty_bands(train_stats, color_mean='green', color_band='green', label_prefix="Train Model")
 
-
-
-# ax.set_title(r"Model Predictions with Uncertainty ($\mu \pm mult \sigma$)")
-ax.set_title("Ours", fontsize=26)
+ax.set_title(r"(d) Model Predictions with Uncertainty ($\mu \pm 2 \sigma$)", fontsize=24)
 ax.set_ylim(jnp.min(Y_train_full)-1, jnp.max(Y_train_full)+1)
-ax.grid(True, alpha=0.1)
-plt.xlabel(r"$x$")
-plt.ylabel(r"$y$")
-ax.legend(loc='lower right')
+ax.grid(True, alpha=0.3)
+# ax.legend()
+
+ax.set_xlabel(r"$x$")
+ax.set_ylabel(r"$y$")
 
 plt.tight_layout()
-# plt.savefig(plots_path / "model_predictions_uncertainty.png")
+plt.savefig(plots_path / "model_predictions_uncertainty.png")
 # plt.show()
-
 plt.draw()
-plt.savefig(plots_path / "oosseq_predictions.pdf")  # Save with higher resolution
+## Save as PDF as well
+plt.savefig(plots_path / "model_predictions_uncertainty.pdf")
 
 # %%
