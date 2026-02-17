@@ -14,3 +14,7 @@ limit_weight_space/experiments/*
 limit_weight_space/nohup.log
 
 torch/checkpoints/*
+
+*DS_Store
+*.npy
+*.parquet
