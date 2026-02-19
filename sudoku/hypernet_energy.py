@@ -87,13 +87,15 @@ class SudokuINR(eqx.Module):
     def __init__(self, key):
         # Keeping it small so the HyperNetwork can handle the parameter vector
         # Input (2) -> Hidden (32) -> Hidden (32) -> Output (10)
+
+        hidden_size = 32
         k1, k2, k3 = jax.random.split(key, 3)
         self.layers = [
-            eqx.nn.Linear(2, 32, key=k1),
+            eqx.nn.Linear(2, hidden_size, key=k1),
             jax.nn.gelu,
-            eqx.nn.Linear(32, 32, key=k2),
+            eqx.nn.Linear(hidden_size, hidden_size, key=k2),
             jax.nn.gelu,
-            eqx.nn.Linear(32, 10, key=k3) 
+            eqx.nn.Linear(hidden_size, 10, key=k3) 
         ]
 
     def __call__(self, x):
@@ -243,7 +245,7 @@ def outer_loop_loss(energy_model, inr_init, coords, puzzle_indices, mask):
     return validity_loss
 
 def train_hypernetwork(steps=1000):
-    key = jax.random.PRNGKey(4205)
+    key = jax.random.PRNGKey(1205)
     m_key, t_key = jax.random.split(key)
     
     # 1. Setup Models
@@ -283,9 +285,9 @@ def train_hypernetwork(steps=1000):
         energy_model = eqx.apply_updates(energy_model, updates)
         
         history.append(loss)
-        if i % 500 == 0:
+        if (i+1) % 500 == 0:
             # print(f"Step {i:4d} | Validation Loss: {loss:.5f}")
-            print(f"Time {time.strftime('%H:%M:%S')} | Step {i:4d} | Validation Loss: {loss:.5f}")
+            print(f"Time {time.strftime('%H:%M:%S')} | Step {i+1:4d} | Validation Loss: {loss:.5f}")
             
     return energy_model, history
 
