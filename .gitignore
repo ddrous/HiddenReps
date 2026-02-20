@@ -18,3 +18,7 @@ torch/checkpoints/*
 *DS_Store
 *.npy
 *.parquet
+
+
+latent_action_models/data/*
+latent_action_models/experiments/*
