@@ -37,12 +37,14 @@ RUN_DIR = "./experiments/YOUR_RUN_FOLDER"  # Specify if TRAIN = False
 
 CONFIG = {
     "seed": 2027,
-    "nb_epochs": 10,
+    "nb_epochs": 25,
     "batch_size": 16,
     "learning_rate": 1e-5,
     "print_every": 5,
     "p_forcing": 0.5,
     "inf_context_ratio": 0.5,
+    "nb_loss_steps_full": 12,
+    "nb_loss_steps_init": 12,
     "rec_feat_dim": 1024,
     "root_width": 32,
     "root_depth": 2,
@@ -50,6 +52,8 @@ CONFIG = {
 }
 
 key = jax.random.PRNGKey(CONFIG["seed"])
+torch.manual_seed(CONFIG["seed"])
+np.random.seed(CONFIG["seed"])
 
 def setup_run_dir(base_dir="experiments"):
     if TRAIN:
@@ -82,7 +86,7 @@ def numpy_collate(batch):
     videos = videos.astype(np.float32)
     if videos.max() > 2.0:
         videos = videos / 255.0  
-        
+
     ## Subsample the video, and rescalle between -1 and 1
     # videos = videos[:, :, ::2, ::2]
     # videos = videos * 2.0 - 1.0
@@ -196,7 +200,8 @@ class WARP(eqx.Module):
     B: jax.Array
     hypernet_phi: CNNEncoder
     controlnet_psi: CNNEncoder
-    
+    theta_base: jax.Array
+
     root_structure: RootMLP = eqx.field(static=True)
     unravel_fn: callable = eqx.field(static=True)
     d_theta: int = eqx.field(static=True)
@@ -216,7 +221,9 @@ class WARP(eqx.Module):
         self.d_theta = flat_params.shape[0]
         self.root_structure = template_root
         
-        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_phi, hidden_width=32, depth=4)
+        self.theta_base = flat_params
+
+        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta*2, spatial_shape=(H, W), key=k_phi, hidden_width=128, depth=4)
         self.controlnet_psi = CNNEncoder(in_channels=C, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=16, depth=3)
         
         self.A = jnp.eye(self.d_theta)
@@ -241,8 +248,11 @@ class WARP(eqx.Module):
         
         init_gt_frame = ref_video[0]
         init_gt_frame_chw = jnp.transpose(init_gt_frame, (2, 0, 1)) 
-        theta_0 = self.hypernet_phi(init_gt_frame_chw)
-        
+        # theta_0 = self.hypernet_phi(init_gt_frame_chw)
+
+        theta_mu, theta_scale = jnp.split(self.hypernet_phi(init_gt_frame_chw), 2, axis=-1)
+        theta_0 = self.theta_base*(1+theta_scale) + theta_mu
+
         def scan_step(state, scan_inputs):
             gt_curr_frame, step_idx = scan_inputs
             theta, prev_frame_selected, k = state
@@ -315,40 +325,86 @@ if TRAIN:
 
     @eqx.filter_jit
     def train_step(model, opt_state, keys, ref_videos, coords_grid, p_forcing):
+        # def loss_fn(m):
+        #     pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"])
+        #     # loss_full = jnp.mean(jnp.abs(pred_videos[:, 1:] - ref_videos[:, 1:]))
+
+        #     # loss_t0 = jnp.mean(jnp.abs(pred_videos[:, 0] - ref_videos[:, 0]))
+        #     # return loss_full + 1.0 * loss_t0
+
+        #     # loss_full = jnp.mean(jnp.abs(pred_videos - ref_videos))
+        #     # return loss_full
+
+        #     ## MSE
+        #     loss_full = jnp.mean((pred_videos - ref_videos)**2)
+
+        #     # Pick a random frame from the chunk
+        #     k_rand, _ = jax.random.split(key)
+        #     rand_idx = jax.random.randint(k_rand, (), 0, ref_videos.shape[0])
+        #     rand_gt_frame = ref_videos[:, rand_idx]
+            
+        #     # Route it directly through the initialization module
+        #     # theta_rand = m.optimize_theta0(rand_gt_frame, coords_grid.reshape(-1, 2))
+        #     theta_rand = eqx.filter_vmap(m.hypernet_phi)(jnp.transpose(rand_gt_frame, (0, 3, 1, 2)))
+
+        #     ## Render the randomly initialized state
+        #     H, W, C = ref_videos.shape[2:]
+        #     thetas_frame_rand = jnp.tile(theta_rand[:, None, :], (1, H*W, 1))
+        #     # thetas_frame_rand = theta_rand
+        #     pred_flat_rand = eqx.filter_vmap(m.render_pixels, in_axes=(0, None))(thetas_frame_rand, coords_grid.reshape(-1, 2))
+
+        #     pred_frame_rand = pred_flat_rand.reshape(ref_videos.shape[0], H, W, C)
+
+        #     loss_ae = jnp.mean((pred_frame_rand - rand_gt_frame)**2)
+
+        #     # return loss_full + loss_ae
+        #     return loss_ae
+
         def loss_fn(m):
-            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"])
-            # loss_full = jnp.mean(jnp.abs(pred_videos[:, 1:] - ref_videos[:, 1:]))
+            # Split the first key to generate random indices for our subsampling
+            k_full, k_init = jax.random.split(keys[0], 2)
+            
+            # 1. Standard Forward Pass
+            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0)
 
-            # loss_t0 = jnp.mean(jnp.abs(pred_videos[:, 0] - ref_videos[:, 0]))
-            # return loss_full + 1.0 * loss_t0
+            # --- SEQUENCE LOSS---
+            # Pick random steps for the full sequence loss
+            full_indices = jax.random.choice(k_full, ref_videos.shape[1], shape=(CONFIG["nb_loss_steps_full"],), replace=False)
+            pred_selected = pred_videos[:, full_indices]
+            ref_selected = ref_videos[:, full_indices]
+            
+            loss_full = jnp.mean((pred_selected - ref_selected)**2)
 
-            # loss_full = jnp.mean(jnp.abs(pred_videos - ref_videos))
-            # return loss_full
-
-            ## MSE
-            loss_full = jnp.mean((pred_videos - ref_videos)**2)
-
-            # Pick a random frame from the chunk
-            k_rand, _ = jax.random.split(key)
-            rand_idx = jax.random.randint(k_rand, (), 0, ref_videos.shape[0])
-            rand_gt_frame = ref_videos[:, rand_idx]
+            # --- AUXILIARY HYPERNET LOSS ---
+            # Pick random frames to force the initialization module to reconstruct
+            rand_indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(CONFIG["nb_loss_steps_init"],), replace=False)
+            rand_gt_frames = ref_videos[:, rand_indices] # Shape: (Batch, N_init, H, W, C)
+            
+            B, N_init, H, W, C = rand_gt_frames.shape
+            
+            # Flatten Batch and N_init dimensions to easily vmap through the networks
+            flat_gt_frames = rand_gt_frames.reshape(B * N_init, H, W, C)
+            flat_gt_frames_chw = jnp.transpose(flat_gt_frames, (0, 3, 1, 2))
             
             # Route it directly through the initialization module
-            # theta_rand = m.optimize_theta0(rand_gt_frame, coords_grid.reshape(-1, 2))
-            theta_rand = eqx.filter_vmap(m.hypernet_phi)(jnp.transpose(rand_gt_frame, (0, 3, 1, 2)))
+            theta_rand = eqx.filter_vmap(m.hypernet_phi)(flat_gt_frames_chw) # Shape: (B * N_init, D_theta)
 
-            ## Render the randomly initialized state
-            H, W, C = ref_videos.shape[2:]
-            thetas_frame_rand = jnp.tile(theta_rand[:, None, :], (1, H*W, 1))
-            # thetas_frame_rand = theta_rand
+            ## scale back the theta_rand using the learned scale and shift from the hypernet
+            theta_mu, theta_scale = jnp.split(theta_rand, 2, axis=-1)
+            theta_rand = m.theta_base*(1+theta_scale) + theta_mu
+
+            # Render the randomly initialized states
+            thetas_frame_rand = jnp.tile(theta_rand[:, None, :], (1, H * W, 1))
             pred_flat_rand = eqx.filter_vmap(m.render_pixels, in_axes=(0, None))(thetas_frame_rand, coords_grid.reshape(-1, 2))
 
-            pred_frame_rand = pred_flat_rand.reshape(ref_videos.shape[0], H, W, C)
+            # Reshape back to (Batch, N_init, H, W, C) to compare against ground truth
+            pred_frame_rand = pred_flat_rand.reshape(B, N_init, H, W, C)
 
-            loss_ae = jnp.mean((pred_frame_rand - rand_gt_frame)**2)
+            loss_ae = jnp.mean((pred_frame_rand - rand_gt_frames)**2)
+            # loss_ae = jnp.mean(jnp.abs(pred_frame_rand - rand_gt_frames))
 
-            return loss_full + loss_ae
-            # return loss_ae
+            # return loss_full + loss_ae
+            return loss_ae
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
         updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
