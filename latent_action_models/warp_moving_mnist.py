@@ -37,16 +37,16 @@ RUN_DIR = "./experiments/YOUR_RUN_FOLDER"  # Specify if TRAIN = False
 
 CONFIG = {
     "seed": 2027,
-    "nb_epochs": 35,
-    "batch_size": 12,
-    "learning_rate": 1e-7,
+    "nb_epochs": 10,
+    "batch_size": 16,
+    "learning_rate": 1e-5,
     "print_every": 5,
-    "p_forcing": 0.0,
+    "p_forcing": 0.5,
     "inf_context_ratio": 0.5,
     "rec_feat_dim": 1024,
-    "root_width": 24,
+    "root_width": 32,
     "root_depth": 2,
-    "num_fourier_freqs": 3
+    "num_fourier_freqs": 6
 }
 
 key = jax.random.PRNGKey(CONFIG["seed"])
@@ -84,8 +84,8 @@ def numpy_collate(batch):
         videos = videos / 255.0  
         
     ## Subsample the video, and rescalle between -1 and 1
-    videos = videos[:, :, ::2, ::2]
-    videos = videos * 2.0 - 1.0
+    # videos = videos[:, :, ::2, ::2]
+    # videos = videos * 2.0 - 1.0
 
     return videos
 
@@ -216,7 +216,7 @@ class WARP(eqx.Module):
         self.d_theta = flat_params.shape[0]
         self.root_structure = template_root
         
-        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_phi, hidden_width=16, depth=3)
+        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_phi, hidden_width=32, depth=4)
         self.controlnet_psi = CNNEncoder(in_channels=C, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=16, depth=3)
         
         self.A = jnp.eye(self.d_theta)
@@ -268,10 +268,16 @@ class WARP(eqx.Module):
             new_state = (theta_next, frame_t, subk)
             return new_state, pred_frame
             
-        init_frame = jnp.zeros((H, W, C))
+        # init_frame = jnp.zeros((H, W, C))
+        # init_state = (theta_0, init_frame, key)
+        # scan_inputs = (ref_video, jnp.arange(T))
+        # _, pred_video = jax.lax.scan(scan_step, init_state, scan_inputs)
+
+        init_frame = ref_video[0]
         init_state = (theta_0, init_frame, key)
-        scan_inputs = (ref_video, jnp.arange(T))
+        scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
         _, pred_video = jax.lax.scan(scan_step, init_state, scan_inputs)
+
         return pred_video
 
     def __call__(self, ref_videos, p_forcing, keys, coords_grid, inf_context_ratio):
@@ -310,8 +316,8 @@ if TRAIN:
     @eqx.filter_jit
     def train_step(model, opt_state, keys, ref_videos, coords_grid, p_forcing):
         def loss_fn(m):
-            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0)
-            loss_full = jnp.mean(jnp.abs(pred_videos[:, 1:] - ref_videos[:, 1:]))
+            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"])
+            # loss_full = jnp.mean(jnp.abs(pred_videos[:, 1:] - ref_videos[:, 1:]))
 
             # loss_t0 = jnp.mean(jnp.abs(pred_videos[:, 0] - ref_videos[:, 0]))
             # return loss_full + 1.0 * loss_t0
@@ -342,6 +348,7 @@ if TRAIN:
             loss_ae = jnp.mean((pred_frame_rand - rand_gt_frame)**2)
 
             return loss_full + loss_ae
+            # return loss_ae
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
         updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
