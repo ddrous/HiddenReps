@@ -37,7 +37,7 @@ RUN_DIR = "./experiments/YOUR_RUN_FOLDER"  # Specify if TRAIN = False
 
 CONFIG = {
     "seed": 2027,
-    "nb_epochs": 50,
+    "nb_epochs": 35,
     "batch_size": 12,
     "learning_rate": 1e-7,
     "print_every": 5,
@@ -216,7 +216,7 @@ class WARP(eqx.Module):
         self.d_theta = flat_params.shape[0]
         self.root_structure = template_root
         
-        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_phi, hidden_width=32, depth=4)
+        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_phi, hidden_width=16, depth=3)
         self.controlnet_psi = CNNEncoder(in_channels=C, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=16, depth=3)
         
         self.A = jnp.eye(self.d_theta)
@@ -316,8 +316,32 @@ if TRAIN:
             # loss_t0 = jnp.mean(jnp.abs(pred_videos[:, 0] - ref_videos[:, 0]))
             # return loss_full + 1.0 * loss_t0
 
-            loss_full = jnp.mean(jnp.abs(pred_videos - ref_videos))
-            return loss_full
+            # loss_full = jnp.mean(jnp.abs(pred_videos - ref_videos))
+            # return loss_full
+
+            ## MSE
+            loss_full = jnp.mean((pred_videos - ref_videos)**2)
+
+            # Pick a random frame from the chunk
+            k_rand, _ = jax.random.split(key)
+            rand_idx = jax.random.randint(k_rand, (), 0, ref_videos.shape[0])
+            rand_gt_frame = ref_videos[:, rand_idx]
+            
+            # Route it directly through the initialization module
+            # theta_rand = m.optimize_theta0(rand_gt_frame, coords_grid.reshape(-1, 2))
+            theta_rand = eqx.filter_vmap(m.hypernet_phi)(jnp.transpose(rand_gt_frame, (0, 3, 1, 2)))
+
+            ## Render the randomly initialized state
+            H, W, C = ref_videos.shape[2:]
+            thetas_frame_rand = jnp.tile(theta_rand[:, None, :], (1, H*W, 1))
+            # thetas_frame_rand = theta_rand
+            pred_flat_rand = eqx.filter_vmap(m.render_pixels, in_axes=(0, None))(thetas_frame_rand, coords_grid.reshape(-1, 2))
+
+            pred_frame_rand = pred_flat_rand.reshape(ref_videos.shape[0], H, W, C)
+
+            loss_ae = jnp.mean((pred_frame_rand - rand_gt_frame)**2)
+
+            return loss_full + loss_ae
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
         updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
