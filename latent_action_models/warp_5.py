@@ -37,7 +37,7 @@ RUN_DIR = "./" if not TRAIN else None
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 20,
+    "nb_epochs": 3,
     "batch_size": 8,
     "learning_rate": 1e-5,
     "print_every": 5,
@@ -223,7 +223,7 @@ class WARP(eqx.Module):
     A: jax.Array
     B: jax.Array
     hypernet_phi: CNNEncoder
-    controlnet_psi: CNNEncoder
+    # controlnet_psi: CNNEncoder
     theta_base: jax.Array
 
     root_structure: RootMLP = eqx.field(static=True)
@@ -248,10 +248,11 @@ class WARP(eqx.Module):
         self.theta_base = flat_params
 
         self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta*2, spatial_shape=(H, W), key=k_phi, hidden_width=128, depth=4)
-        self.controlnet_psi = CNNEncoder(in_channels=C*1, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=128, depth=4)
+        # self.controlnet_psi = CNNEncoder(in_channels=C*1, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=128, depth=4)
         
         self.A = jnp.eye(self.d_theta*2)
-        self.B = jnp.zeros((self.d_theta*2, CONFIG["rec_feat_dim"]))
+        # self.B = jnp.zeros((self.d_theta*2, CONFIG["rec_feat_dim"]))
+        self.B = jnp.zeros((self.d_theta*2, H*W*C))
 
     def render_pixels(self, thetas, coords):
         def render_pt(theta, coord):
@@ -304,7 +305,9 @@ class WARP(eqx.Module):
 
             ## Difference first, then controlnet
             diff_signal = frame_t - prev_frame_selected
-            dx_feat = self.controlnet_psi(diff_signal.transpose(2, 0, 1)) / jnp.sqrt(diff_signal.size)
+            # dx_feat = self.controlnet_psi(diff_signal.transpose(2, 0, 1)) / jnp.sqrt(diff_signal.size)
+            dx_feat = diff_signal.flatten()
+            # dx_feat = diff_signal.flatten() / jnp.sqrt(diff_signal.size)
 
             # concat_feats = jnp.concatenate([frame_t, prev_frame_selected], axis=-1)
             # dx_feat = self.controlnet_psi(concat_feats.transpose(2, 0, 1)) / jnp.sqrt(concat_feats.size)

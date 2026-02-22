@@ -16,7 +16,7 @@ from jax.flatten_util import ravel_pytree
 
 import torch
 from torchvision import datasets
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 import seaborn as sns
 sns.set(style="white", context="talk")
@@ -37,18 +37,26 @@ RUN_DIR = "./" if not TRAIN else None
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 20,
-    "batch_size": 8,
-    "learning_rate": 1e-5,
-    "print_every": 5,
-    "p_forcing": 0.25,
-    "inf_context_ratio": 0.5,
+    "nb_epochs": 10000,
+    "batch_size": 1,
+    "learning_rate": 1e-6,
+    "print_every": 500,
+    "p_forcing": 0.0,
+    "inf_context_ratio": 0.0,
     "nb_loss_steps_full": 12,
     "nb_loss_steps_init": 12,
-    "rec_feat_dim": 256,
+    "rec_feat_dim": 16,
     "root_width": 32,
     "root_depth": 2,
-    "num_fourier_freqs": 6
+    "num_fourier_freqs": 6,
+
+    # --- NEW: Plateau Scheduler Config ---
+    "lr_patience": 50000,      # Number of batches to wait before reducing LR
+    "lr_cooldown": 0,       # Number of batches to wait after reducing before checking again
+    "lr_factor": 0.5,        # Multiply LR by this factor when plateaued
+    "lr_rtol": 1e-3,         # Relative tolerance to consider a change as an "improvement"
+    "lr_accum_size": 5,     # Average loss over this many steps to smooth out batch noise
+    "lr_min_scale": 1e-2     # Floor limit so learning rate doesn't drop to absolute zero
 }
 
 key = jax.random.PRNGKey(CONFIG["seed"])
@@ -92,18 +100,23 @@ def numpy_collate(batch):
     if videos.max() > 2.0:
         videos = videos / 255.0  
 
-    ## Subsample the video, and rescalle between -1 and 1
-    # videos = videos[:, :, ::2, ::2]
-    # videos = videos * 2.0 - 1.0
-
     return videos
 
 print("Loading Moving MNIST Dataset...")
 try:
     data_path = './data' if TRAIN else '../../data'
     dataset = datasets.MovingMNIST(root=data_path, split=None, download=True)
-    train_loader = DataLoader(dataset, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=numpy_collate, drop_last=True)
-    
+    # train_loader = DataLoader(dataset, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=numpy_collate, drop_last=True)
+
+    testing_subset = Subset(dataset, range(CONFIG["batch_size"]))
+    train_loader = DataLoader(
+        testing_subset, 
+        batch_size=CONFIG["batch_size"], 
+        shuffle=False, 
+        collate_fn=numpy_collate, 
+        drop_last=True
+    )
+
     sample_batch = next(iter(train_loader))
     B, nb_frames, H, W, C = sample_batch.shape
     print(f"Batched Video shape: {sample_batch.shape}")
@@ -146,11 +159,7 @@ def plot_pred_ref_videos(video, ref_video, title="Render", save_name=None):
         plt.savefig(plots_path / save_name)
     plt.show()
 
-
 def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=None):
-    """ Plot pred and ref every two frames to visualize the rollout quality across the entire sequence. 
-    Top row is the predicted frames, bottom row is the reference GT frames.
-    """
     nb_frames = video.shape[0]
     fig, axes = plt.subplots(2, 1+(nb_frames//2), figsize=(20, 6))
     indices_to_plot = list(np.arange(0, nb_frames, 2)) + [nb_frames-1]
@@ -162,7 +171,6 @@ def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=Non
     if save_name:
         plt.savefig(plots_path / save_name)
     plt.show()
-
 
 #%% Cell 3: Model Definition
 def fourier_encode(x, num_freqs):
@@ -224,7 +232,7 @@ class WARP(eqx.Module):
     B: jax.Array
     hypernet_phi: CNNEncoder
     controlnet_psi: CNNEncoder
-    theta_base: jax.Array
+    # theta_base: jax.Array
 
     root_structure: RootMLP = eqx.field(static=True)
     unravel_fn: callable = eqx.field(static=True)
@@ -245,20 +253,22 @@ class WARP(eqx.Module):
         self.d_theta = flat_params.shape[0]
         self.root_structure = template_root
         
-        self.theta_base = flat_params
+        # self.theta_base = flat_params
 
-        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta*2, spatial_shape=(H, W), key=k_phi, hidden_width=128, depth=4)
+        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta*1, spatial_shape=(H, W), key=k_phi, hidden_width=128, depth=4)
         self.controlnet_psi = CNNEncoder(in_channels=C*1, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=128, depth=4)
         
-        self.A = jnp.eye(self.d_theta*2)
-        self.B = jnp.zeros((self.d_theta*2, CONFIG["rec_feat_dim"]))
+        # self.A = jnp.eye(self.d_theta*2)
+        self.A = jax.random.normal(k_A, (self.d_theta*1, self.d_theta*1)) * 0.0001
+        # self.B = jnp.zeros((self.d_theta*1, CONFIG["rec_feat_dim"]))
+        self.B = jax.random.normal(k_B, (self.d_theta*1, CONFIG["rec_feat_dim"])) * 0.0001
 
     def render_pixels(self, thetas, coords):
         def render_pt(theta, coord):
             root = self.unravel_fn(theta)
             encoded_coord = fourier_encode(coord, self.num_freqs)
             out = root(encoded_coord)
-            
+
             gray_fg = jax.nn.sigmoid(out[0:1])
             gray_bg = jax.nn.sigmoid(out[1:2])
             alpha   = jax.nn.sigmoid(out[2:3])
@@ -269,24 +279,21 @@ class WARP(eqx.Module):
         H, W, C = self.frame_shape
         flat_coords = coords_grid.reshape(-1, 2)
         T = ref_video.shape[0]
-        
+
         init_gt_frame = ref_video[0]
         init_gt_frame_chw = jnp.transpose(init_gt_frame, (2, 0, 1)) 
         theta_0 = self.hypernet_phi(init_gt_frame_chw)
-
-        # theta_mu, theta_scale = jnp.split(self.hypernet_phi(init_gt_frame_chw), 2, axis=-1)
-        # theta_0 = self.theta_base*(1+theta_scale) + theta_mu
 
         def scan_step(state, scan_inputs):
             gt_curr_frame, step_idx = scan_inputs
             theta, prev_frame_selected, k = state
             k, subk = jax.random.split(k)
 
-            ## split and compute theta witht he FIlM projection
-            theta_mu, theta_scale = jnp.split(theta, 2, axis=-1)
-            theta_scaled = self.theta_base*(1+theta_scale) + theta_mu
+            # ## split and compute theta with the FiLM projection
+            # theta_mu, theta_scale = jnp.split(theta, 2, axis=-1)
+            # theta_scaled = self.theta_base*(1+theta_scale) + theta_mu
 
-            thetas_frame = jnp.tile(theta_scaled, (H*W, 1))
+            thetas_frame = jnp.tile(theta, (H*W, 1))
             pred_flat = self.render_pixels(thetas_frame, flat_coords)
             pred_frame = pred_flat.reshape(H, W, C)
             
@@ -297,28 +304,19 @@ class WARP(eqx.Module):
             use_gt = jnp.logical_or(is_context, is_forced)
             frame_t = jnp.where(use_gt, gt_curr_frame, pred_frame)
             
-            # frame_t_feats = self.controlnet_psi(jnp.transpose(frame_t, (2, 0, 1)))
-            # prev_frame_selected_feats = self.controlnet_psi(jnp.transpose(prev_frame_selected, (2, 0, 1)))
-            # # dx_feat = (frame_t_feats - prev_frame_selected_feats) / jnp.sqrt(frame_t_feats.size)
-            # dx_feat = (frame_t_feats - prev_frame_selected_feats)
+            # ## Difference first, then controlnet
+            # diff_signal = frame_t - prev_frame_selected
+            # dx_feat = self.controlnet_psi(diff_signal.transpose(2, 0, 1)) / jnp.sqrt(diff_signal.size)
 
-            ## Difference first, then controlnet
-            diff_signal = frame_t - prev_frame_selected
-            dx_feat = self.controlnet_psi(diff_signal.transpose(2, 0, 1)) / jnp.sqrt(diff_signal.size)
-
-            # concat_feats = jnp.concatenate([frame_t, prev_frame_selected], axis=-1)
-            # dx_feat = self.controlnet_psi(concat_feats.transpose(2, 0, 1)) / jnp.sqrt(concat_feats.size)
+            frame_t_feats = self.controlnet_psi(frame_t.transpose(2, 0, 1))
+            prev_frame_feats = self.controlnet_psi(prev_frame_selected.transpose(2, 0, 1))
+            # dx_feat = (frame_t_feats - prev_frame_feats) / jnp.sqrt(frame_t_feats.size)
+            dx_feat = (frame_t_feats - prev_frame_feats)
 
             theta_next = self.A @ theta + self.B @ dx_feat
-            # theta_next = self.A @ theta
-            
+
             new_state = (theta_next, frame_t, subk)
             return new_state, pred_frame
-            
-        # init_frame = jnp.zeros((H, W, C))
-        # init_state = (theta_0, init_frame, key)
-        # scan_inputs = (ref_video, jnp.arange(T))
-        # _, pred_video = jax.lax.scan(scan_step, init_state, scan_inputs)
 
         init_frame = ref_video[0]
         init_state = (theta_0, init_frame, key)
@@ -327,58 +325,7 @@ class WARP(eqx.Module):
 
         return pred_video
 
-    # def _get_thetas_and_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
-    #     H, W, C = self.frame_shape
-    #     flat_coords = coords_grid.reshape(-1, 2)
-    #     T = ref_video.shape[0]
-        
-    #     init_gt_frame = ref_video[0]
-    #     init_gt_frame_chw = jnp.transpose(init_gt_frame, (2, 0, 1)) 
-    #     # theta_0 = self.hypernet_phi(init_gt_frame_chw)
-
-    #     theta_mu, theta_scale = jnp.split(self.hypernet_phi(init_gt_frame_chw), 2, axis=-1)
-    #     theta_0 = self.theta_base*(1+theta_scale) + theta_mu
-
-    #     ## Apply the controlnet tot the input difference between the current GT frame and the previous GT frame (instead of the predicted frame)
-    #     diff_signal = ref_video[1:] - ref_video[:-1]
-    #     diff_signal = jnp.concatenate([jnp.zeros_like(diff_signal[:1]), diff_signal], axis=0)
-    #     controlnet_feats = jax.vmap(self.controlnet_psi)(diff_signal.transpose(0, 3, 1, 2)) / jnp.sqrt(diff_signal.size)
-
-    #     def scan_step(state, scan_inputs):
-    #         controlnet_feat, step_idx = scan_inputs
-    #         theta, k = state
-    #         k, subk = jax.random.split(k)
-
-    #         thetas_frame = jnp.tile(theta, (H*W, 1))
-    #         pred_flat = self.render_pixels(thetas_frame, flat_coords)
-    #         pred_frame = pred_flat.reshape(H, W, C)
-            
-    #         t_ratio = step_idx / (T - 1)
-    #         is_context = t_ratio <= inf_context_ratio
-    #         is_forced = jax.random.bernoulli(subk, p_forcing)
-            
-    #         use_gt = jnp.logical_or(is_context, is_forced)
-    #         # frame_t = jnp.where(use_gt, gt_curr_frame, pred_frame)
-
-    #         # controlnet_feat = self.controlnet_psi(jnp.transpose(gt_curr_frame - prev_gt_frame, (2, 0, 1))) / jnp.sqrt(gt_curr_frame.size)
-
-    #         theta_next = self.A @ theta + self.B @ controlnet_feat
-            
-    #         new_state = (theta_next, subk)
-    #         return new_state, pred_frame
-
-    #     init_frame = ref_video[0]
-    #     init_state = (theta_0, key)
-    #     scan_inputs = (controlnet_feats, jnp.arange(T))
-    #     _, pred_video = jax.lax.scan(scan_step, init_state, scan_inputs)
-
-    #     return pred_video
-
     def __call__(self, ref_videos, p_forcing, keys, coords_grid, inf_context_ratio):
-        """
-        Embeds the batched forward process natively. 
-        If a single video is provided (ndim==4), it automatically inflates the batch dim.
-        """
         is_single = (ref_videos.ndim == 4)
         if is_single:
             ref_videos = ref_videos[None, ...]
@@ -396,8 +343,6 @@ class WARP(eqx.Module):
 def evaluate(m, batch, p_forcing, keys, coords, context_ratio):
     return m(batch, p_forcing, keys, coords, context_ratio)
 
-
-
 #%% Cell 4: Initialization & Training/Loading Logic
 key, subkey = jax.random.split(key)
 model = WARP(CONFIG["root_width"], CONFIG["root_depth"], CONFIG["num_fourier_freqs"], (H, W, C), subkey)
@@ -408,57 +353,29 @@ print(f"Total Trainable Parameters in WARP: {count_trainable_params(model)}")
 if TRAIN:
     print(f"\n🚀 Starting WARP Training -> Saving to {run_path}")
     
-    # scheduler = optax.exponential_decay(CONFIG["learning_rate"], transition_steps=len(train_loader)*CONFIG["nb_epochs"], decay_rate=0.1)
-    scheduler = CONFIG["learning_rate"]
-    optimizer = optax.adam(scheduler)
+    # --- NEW: Chain Adam with the Plateau Scheduler ---
+    optimizer = optax.chain(
+        optax.adam(CONFIG["learning_rate"]),
+        optax.contrib.reduce_on_plateau(
+            patience=CONFIG["lr_patience"],
+            cooldown=CONFIG["lr_cooldown"],
+            factor=CONFIG["lr_factor"],
+            rtol=CONFIG["lr_rtol"],
+            accumulation_size=CONFIG["lr_accum_size"],
+            min_scale=CONFIG["lr_min_scale"]
+        )
+    )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
     @eqx.filter_jit
     def train_step(model, opt_state, keys, ref_videos, coords_grid, p_forcing):
-        # def loss_fn(m):
-        #     pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"])
-        #     # loss_full = jnp.mean(jnp.abs(pred_videos[:, 1:] - ref_videos[:, 1:]))
-
-        #     # loss_t0 = jnp.mean(jnp.abs(pred_videos[:, 0] - ref_videos[:, 0]))
-        #     # return loss_full + 1.0 * loss_t0
-
-        #     # loss_full = jnp.mean(jnp.abs(pred_videos - ref_videos))
-        #     # return loss_full
-
-        #     ## MSE
-        #     loss_full = jnp.mean((pred_videos - ref_videos)**2)
-
-        #     # Pick a random frame from the chunk
-        #     k_rand, _ = jax.random.split(key)
-        #     rand_idx = jax.random.randint(k_rand, (), 0, ref_videos.shape[0])
-        #     rand_gt_frame = ref_videos[:, rand_idx]
-            
-        #     # Route it directly through the initialization module
-        #     # theta_rand = m.optimize_theta0(rand_gt_frame, coords_grid.reshape(-1, 2))
-        #     theta_rand = eqx.filter_vmap(m.hypernet_phi)(jnp.transpose(rand_gt_frame, (0, 3, 1, 2)))
-
-        #     ## Render the randomly initialized state
-        #     H, W, C = ref_videos.shape[2:]
-        #     thetas_frame_rand = jnp.tile(theta_rand[:, None, :], (1, H*W, 1))
-        #     # thetas_frame_rand = theta_rand
-        #     pred_flat_rand = eqx.filter_vmap(m.render_pixels, in_axes=(0, None))(thetas_frame_rand, coords_grid.reshape(-1, 2))
-
-        #     pred_frame_rand = pred_flat_rand.reshape(ref_videos.shape[0], H, W, C)
-
-        #     loss_ae = jnp.mean((pred_frame_rand - rand_gt_frame)**2)
-
-        #     # return loss_full + loss_ae
-        #     return loss_ae
-
         def loss_fn(m):
-            # Split the first key to generate random indices for our subsampling
             k_full, k_init = jax.random.split(keys[0], 2)
             
             # 1. Standard Forward Pass
             pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0)
 
             # --- SEQUENCE LOSS---
-            # Pick random steps for the full sequence loss
             full_indices = jax.random.choice(k_full, ref_videos.shape[1], shape=(CONFIG["nb_loss_steps_full"],), replace=False)
             pred_selected = pred_videos[:, full_indices]
             ref_selected = ref_videos[:, full_indices]
@@ -466,59 +383,62 @@ if TRAIN:
             loss_full = jnp.mean((pred_selected - ref_selected)**2)
 
             # --- AUXILIARY HYPERNET LOSS ---
-            # Pick random frames to force the initialization module to reconstruct
             rand_indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(CONFIG["nb_loss_steps_init"],), replace=False)
-            rand_gt_frames = ref_videos[:, rand_indices] # Shape: (Batch, N_init, H, W, C)
+            rand_gt_frames = ref_videos[:, rand_indices] 
             
             B, N_init, H, W, C = rand_gt_frames.shape
             
-            # Flatten Batch and N_init dimensions to easily vmap through the networks
             flat_gt_frames = rand_gt_frames.reshape(B * N_init, H, W, C)
             flat_gt_frames_chw = jnp.transpose(flat_gt_frames, (0, 3, 1, 2))
             
-            # Route it directly through the initialization module
-            theta_rand = eqx.filter_vmap(m.hypernet_phi)(flat_gt_frames_chw) # Shape: (B * N_init, D_theta)
+            theta_rand = eqx.filter_vmap(m.hypernet_phi)(flat_gt_frames_chw) 
 
-            ## scale back the theta_rand using the learned scale and shift from the hypernet
-            theta_mu, theta_scale = jnp.split(theta_rand, 2, axis=-1)
-            theta_rand = m.theta_base*(1+theta_scale) + theta_mu
-
-            # Render the randomly initialized states
+            # ## scale back the theta_rand using the learned scale and shift from the hypernet
+            # theta_mu, theta_scale = jnp.split(theta_rand, 2, axis=-1)
+            # theta_rand = m.theta_base*(1+theta_scale) + theta_mu
+ 
             thetas_frame_rand = jnp.tile(theta_rand[:, None, :], (1, H * W, 1))
             pred_flat_rand = eqx.filter_vmap(m.render_pixels, in_axes=(0, None))(thetas_frame_rand, coords_grid.reshape(-1, 2))
 
-            # Reshape back to (Batch, N_init, H, W, C) to compare against ground truth
             pred_frame_rand = pred_flat_rand.reshape(B, N_init, H, W, C)
 
             loss_ae = jnp.mean((pred_frame_rand - rand_gt_frames)**2)
-            # loss_ae = jnp.mean(jnp.abs(pred_frame_rand - rand_gt_frames))
 
-            # return loss_full + loss_ae
             return loss_full + 1*loss_ae
-            # return loss_ae
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
+        
+        # --- NEW: Pass the loss value into the optimizer update ---
+        updates, opt_state = optimizer.update(
+            grads, opt_state, eqx.filter(model, eqx.is_inexact_array), value=loss_val
+        )
         model = eqx.apply_updates(model, updates)
         return model, opt_state, loss_val
 
     all_losses = []
+    lr_scales = []
     start_time = time.time()
 
     for epoch in range(CONFIG["nb_epochs"]):
-        print(f"\nEPOCH: {epoch+1}")
+        # print(f"\nEPOCH: {epoch+1}")
         epoch_losses = []
         
-        pbar = tqdm(train_loader)
-        for batch_idx, batch_videos in enumerate(pbar):
+        # pbar = tqdm(train_loader)
+        # for batch_idx, batch_videos in enumerate(pbar):
+        for batch_idx, batch_videos in enumerate(train_loader):
             key, subkey = jax.random.split(key)
             batch_keys = jax.random.split(subkey, CONFIG["batch_size"])
             
             model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, CONFIG["p_forcing"])
             epoch_losses.append(loss)
             
-            if batch_idx % CONFIG["print_every"] == 0:
-                pbar.set_description(f"Loss: {loss:.4f}")
+            # --- NEW: Extract and record the current learning rate scale ---
+            current_scale = optax.tree_utils.tree_get(opt_state, "scale")
+            lr_scales.append(current_scale)
+
+            # sparse_plot = (epoch+1)%(CONFIG["nb_epochs"]//2) == 0
+            # if (batch_idx % CONFIG["print_every"]) == 0:
+            #     pbar.set_description(f"Loss: {loss:.4f} | LR Scale: {current_scale:.4f}")
                 
         all_losses.extend(epoch_losses)
         
@@ -527,17 +447,13 @@ if TRAIN:
             eqx.tree_serialise_leaves(artefacts_path / f"tf_model_ep{epoch+1}.eqx", model)
 
         ## Generate intermediate visualizations at the end of each epoch
-        val_keys = jax.random.split(key, CONFIG["batch_size"])
-        val_videos = evaluate(model,
-                              sample_batch, 
-                              0.0, 
-                              val_keys, 
-                              coords_grid, 
-                              CONFIG["inf_context_ratio"])
-        plot_pred_ref_videos_rollout(val_videos[0], 
-                                     sample_batch[0], 
-                                     title=f"Pred", 
-                                     save_name=f"pred_ref_epoch{epoch+1}.png")
+        if (epoch+1) % (CONFIG["nb_epochs"]//10)==0:
+            val_keys = jax.random.split(key, CONFIG["batch_size"])
+            val_videos = evaluate(model,sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"])
+            plot_pred_ref_videos_rollout(val_videos[0], 
+                                        sample_batch[0], 
+                                        title=f"Pred", 
+                                        save_name=f"pred_ref_epoch{epoch+1}.png")
 
     wall_time = time.time() - start_time
     print("\nWall time for WARP training in h:m:s:", time.strftime("%H:%M:%S", time.gmtime(wall_time)))
@@ -545,34 +461,49 @@ if TRAIN:
     # Save final artifacts
     eqx.tree_serialise_leaves(artefacts_path / "tf_model_final.eqx", model)
     np.save(artefacts_path / "loss_history.npy", np.array(all_losses))
+    np.save(artefacts_path / "lr_history.npy", np.array(lr_scales))
 
 else:
     print(f"\n📥 Loading WARP model from {artefacts_path}")
     model = eqx.tree_deserialise_leaves(artefacts_path / "tf_model_final.eqx", model)
     try:
         all_losses = np.load(artefacts_path / "loss_history.npy").tolist()
+        lr_scales = np.load(artefacts_path / "lr_history.npy").tolist()
     except FileNotFoundError:
         all_losses = []
+        lr_scales = []
         print("Warning: loss_history.npy not found.")
 
 #%% Cell 5: Final Visualizations
 print("\n=== Generating Dashboards ===")
 
 if len(all_losses) > 0:
-    plt.figure(figsize=(8, 4))
-    plt.plot(all_losses)
-    plt.yscale('log')
-    plt.title("Moving MNIST Batched Loss History")
-    plt.xlabel("Iteration")
-    plt.ylabel("Loss")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(plots_path / "loss_history.png")
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    
+    # Plot standard loss history on the left axis
+    color1 = 'teal'
+    ax1.plot(all_losses, color=color1, alpha=0.8, label="Total Loss")
+    ax1.set_yscale('log')
+    ax1.set_xlabel("Iteration")
+    ax1.set_ylabel("Loss", color=color1)
+    ax1.tick_params(axis='y', labelcolor=color1)
+    ax1.grid(True)
+    
+    # Plot LR Scale on the right axis to see when reductions triggered
+    ax2 = ax1.twinx()  
+    color2 = 'crimson'
+    if len(lr_scales) > 0:
+        ax2.plot(lr_scales, color=color2, linewidth=2, label="LR Scale Multiplier")
+        ax2.set_ylabel("LR Scale", color=color2)
+        ax2.tick_params(axis='y', labelcolor=color2)
+    
+    plt.title("Training Loss and Adaptive Learning Rate Decay")
+    fig.tight_layout()
+    plt.savefig(plots_path / "loss_and_lr_history.png")
     plt.show()
 
 # Plot Matrix A
 A_final = model.A
-# subsample_step = max(1, model.d_theta // 1) 
 subsample_step = max(1, 1) 
 vmin, vmax = -1e-4, 1e-4
 
@@ -594,17 +525,7 @@ sample_batch = next(iter(train_loader))
 
 # Run inference utilizing the newly embedded `__call__` interface (handles batched transparently)
 val_keys = jax.random.split(key, CONFIG["batch_size"])
-# final_videos = eqx.filter_jit(model)(sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"])
-
-final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.5)
-# final_videos = eqx.filter_jit(model)(sample_batch, 1.0, val_keys, coords_grid, 1.0)
-
-# plot_pred_ref_videos(
-#     final_videos[0], 
-#     sample_batch[0], 
-#     title=f"Final (Ctx Ratio={CONFIG['inf_context_ratio']})", 
-#     save_name="inference_context_forecast.png"
-# )
+final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.0)
 
 plot_pred_ref_videos_rollout(
     final_videos[0], 
