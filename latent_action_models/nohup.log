@@ -1,0 +1,31 @@
+/home/gb21553/Projects/HiddenReps/latent_action_models/warp_9.py:351: UserWarning: A JAX array is being set as static! This can result in unexpected behavior and is usually a mistake to do.
+  model = WARP(CONFIG["root_width"], CONFIG["root_depth"], CONFIG["num_fourier_freqs"], (H, W, C), subkey)
+Loading Moving MNIST Dataset...
+Batched Video shape: (8, 20, 64, 64, 1)
+Total Trainable Parameters in WARP: 95189309
+
+🚀 Starting WARP Training -> Saving to experiments/260223-004032
+
+EPOCH: 1
+
+EPOCH: 2
+
+EPOCH: 3
+
+EPOCH: 4
+
+EPOCH: 5
+
+EPOCH: 6
+
+EPOCH: 7
+
+EPOCH: 8
+
+EPOCH: 9
+
+EPOCH: 10
+
+Wall time for WARP training in h:m:s: 00:38:52
+
+=== Generating Dashboards ===

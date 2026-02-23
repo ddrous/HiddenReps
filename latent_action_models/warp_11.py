@@ -39,26 +39,29 @@ SINGLE_BATCH = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 10,
-    "batch_size": 8 if not SINGLE_BATCH else 8,
-    "learning_rate": 1e-6,
-    "print_every": 500,
-    "p_forcing": 0.0,
+    "nb_epochs": 100,
+    "batch_size": 2 if not SINGLE_BATCH else 8,
+    "learning_rate": 1e-5, 
+    "print_every": 100,
+    "p_forcing": 0.25,
     "inf_context_ratio": 0.5,
     "nb_loss_steps_full": 12,
-    "nb_loss_steps_init": 12,
-    "rec_feat_dim": 16,
+    
+    # --- LSTM Dynamics Config ---
+    "lstm_input_dim": 128,   # Size of the encoded frame vector
+    "lstm_hidden_dim": 128,  # Size of the Custom LSTM hidden state
+    
     "root_width": 32,
     "root_depth": 2,
     "num_fourier_freqs": 6,
 
-    # --- NEW: Plateau Scheduler Config ---
-    "lr_patience": 500,      # Number of batches to wait before reducing LR
-    "lr_cooldown": 0,       # Number of batches to wait after reducing before checking again
-    "lr_factor": 0.5,        # Multiply LR by this factor when plateaued
-    "lr_rtol": 1e-3,         # Relative tolerance to consider a change as an "improvement"
-    "lr_accum_size": 5,     # Average loss over this many steps to smooth out batch noise
-    "lr_min_scale": 1e-2     # Floor limit so learning rate doesn't drop to absolute zero
+    # --- Plateau Scheduler Config ---
+    "lr_patience": 500,      
+    "lr_cooldown": 0,       
+    "lr_factor": 0.5,        
+    "lr_rtol": 1e-3,         
+    "lr_accum_size": 5,     
+    "lr_min_scale": 1e-5     
 }
 
 key = jax.random.PRNGKey(CONFIG["seed"])
@@ -71,7 +74,6 @@ def setup_run_dir(base_dir="experiments"):
         run_path = Path(base_dir) / timestamp
         run_path.mkdir(parents=True, exist_ok=True)
 
-        ## Copy this script to the run directory
         current_script = Path(__file__)
         if current_script.exists():
             shutil.copy(current_script, run_path / "main.py")
@@ -99,9 +101,7 @@ def numpy_collate(batch):
         videos = np.transpose(videos, (0, 1, 3, 4, 2))
         
     videos = videos.astype(np.float32)
-    if videos.max() > 2.0:
-        videos = videos / 255.0  
-
+    # RAW PIXELS: Retaining range [0, 255] for categorical classification
     return videos
 
 print("Loading Moving MNIST Dataset...")
@@ -133,7 +133,8 @@ X_grid, Y_grid = jnp.meshgrid(x_coords, y_coords)
 coords_grid = jnp.stack([X_grid, Y_grid], axis=-1) 
 
 def sbimshow(img, title="", ax=None):
-    img = np.clip(img, 0.0, 1.0)
+    # Normalize to [0, 1] purely for Matplotlib rendering
+    img = np.clip(img / 255.0, 0.0, 1.0)
     if img.shape[-1] == 1:
         img = np.repeat(img, 3, axis=-1)
     if ax is None:
@@ -144,23 +145,6 @@ def sbimshow(img, title="", ax=None):
         ax.imshow(img)
         ax.set_title(title)
         ax.axis('off')
-
-def plot_pred_ref_videos(video, ref_video, title="Render", save_name=None):
-    fig, ax = plt.subplots(2, 3, figsize=(12, 8))
-    t_mid = len(video) // 2
-    t_end = len(video) - 1
-    
-    sbimshow(video[0], title=f"{title} t=0", ax=ax[0, 0])
-    sbimshow(video[t_mid], title=f"{title} t={t_mid}", ax=ax[0, 1])
-    sbimshow(video[t_end], title=f"{title} t={t_end}", ax=ax[0, 2])
-
-    sbimshow(ref_video[0], title="Ref t=0", ax=ax[1, 0])
-    sbimshow(ref_video[t_mid], title=f"Ref t={t_mid}", ax=ax[1, 1])
-    sbimshow(ref_video[t_end], title=f"Ref t={t_end}", ax=ax[1, 2])
-    plt.tight_layout()
-    if save_name:
-        plt.savefig(plots_path / save_name)
-    plt.show()
 
 def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=None):
     nb_frames = video.shape[0]
@@ -182,6 +166,48 @@ def fourier_encode(x, num_freqs):
     angles = angles.reshape(*x.shape[:-1], -1)
     return jnp.concatenate([x, jnp.sin(angles), jnp.cos(angles)], axis=-1)
 
+# --- NEW: Custom Latent Dynamics Implementation ---
+class CustomLSTMCell(eqx.Module):
+    weight_ih: eqx.nn.Linear
+    weight_hh: eqx.nn.Linear
+
+    def __init__(self, input_size, hidden_size, key):
+        k1, k2 = jax.random.split(key)
+        self.weight_ih = eqx.nn.Linear(input_size, 4 * hidden_size, key=k1)
+        self.weight_hh = eqx.nn.Linear(hidden_size, 4 * hidden_size, use_bias=False, key=k2)
+
+    def __call__(self, x, state):
+        h, c = state
+        gates = self.weight_ih(x) + self.weight_hh(h)
+        i, f, g, o = jnp.split(gates, 4, axis=-1)
+        
+        i = jax.nn.sigmoid(i)
+        f = jax.nn.sigmoid(f + 1.0)  # Forget gate bias initialized to 1 for long-range stability
+        g = jax.nn.tanh(g)
+        o = jax.nn.sigmoid(o)
+        
+        c_next = f * c + i * g
+        h_next = o * jax.nn.tanh(c_next)
+        
+        return h_next, c_next
+
+class ARModel(eqx.Module):
+    """Wrapper that can easily swap between LSTM, GRU, or other Recurrent logic."""
+    cell: eqx.Module
+    cell_type: str = eqx.field(static=True)
+
+    def __init__(self, input_dim, hidden_dim, cell_type="lstm", *, key):
+        self.cell_type = cell_type.lower()
+        if self.cell_type == "lstm":
+            self.cell = CustomLSTMCell(input_dim, hidden_dim, key=key)
+        elif self.cell_type == "gru":
+            raise NotImplementedError("Custom GRU Cell can be added here seamlessly.")
+        else:
+            raise ValueError(f"Unknown cell type: {cell_type}")
+
+    def __call__(self, x, state):
+        return self.cell(x, state)
+
 class RootMLP(eqx.Module):
     layers: list
 
@@ -198,6 +224,7 @@ class RootMLP(eqx.Module):
         return self.layers[-1](x)
 
 class CNNEncoder(eqx.Module):
+    """Encodes the 2D frame down to a flat vector for the AR Model."""
     layers: list
     
     def __init__(self, in_channels, out_dim, spatial_shape, key, hidden_width=16, depth=3):
@@ -231,102 +258,119 @@ class CNNEncoder(eqx.Module):
         return x
 
 class WARP(eqx.Module):
-    A: jax.Array
-    B: jax.Array
-    hypernet_phi: CNNEncoder
-    controlnet_psi: CNNEncoder
+    # 1. Base Weights
     theta_base: jax.Array
+    
+    # 2. Dynamics Model Components
+    frame_encoder: CNNEncoder
+    ar_model: ARModel
+    decoder: eqx.nn.MLP
+    
+    # 3. Initial States
+    h_init: jax.Array
+    c_init: jax.Array
 
+    # Constants & Structure
     root_structure: RootMLP = eqx.field(static=True)
     unravel_fn: callable = eqx.field(static=True)
     d_theta: int = eqx.field(static=True)
     num_freqs: int = eqx.field(static=True)
     frame_shape: tuple = eqx.field(static=True)
 
-    def __init__(self, root_width, root_depth, num_freqs, frame_shape, key):
-        k_root, k_A, k_B, k_phi, k_psi = jax.random.split(key, 5)
+    def __init__(self, root_width, root_depth, num_freqs, frame_shape, lstm_in_dim, lstm_hid_dim, key):
+        k_root, k_enc, k_lstm, k_dec = jax.random.split(key, 4)
         self.num_freqs = num_freqs
         self.frame_shape = frame_shape
         H, W, C = frame_shape
         
         coord_dim = 2 + 2 * 2 * num_freqs 
-        template_root = RootMLP(coord_dim, 3, root_width, root_depth, k_root)
+        
+        # Root outputs 256 dimensions for CE class logits
+        template_root = RootMLP(coord_dim, 256, root_width, root_depth, k_root)
 
         flat_params, self.unravel_fn = ravel_pytree(template_root)
         self.d_theta = flat_params.shape[0]
         self.root_structure = template_root
         
+        # Learnable parameters
         self.theta_base = flat_params
+        self.h_init = jnp.zeros(lstm_hid_dim)
+        self.c_init = jnp.zeros(lstm_hid_dim)
 
-        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta*2, spatial_shape=(H, W), key=k_phi, hidden_width=128, depth=4)
-        self.controlnet_psi = CNNEncoder(in_channels=C*1, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=128, depth=4)
+        # Architectural Modules
+        self.frame_encoder = CNNEncoder(
+            in_channels=C, out_dim=lstm_in_dim, spatial_shape=(H, W), key=k_enc, hidden_width=16, depth=3
+        )
         
-        # self.A = jnp.eye(self.d_theta*2)
-        # self.A = jax.random.normal(k_A, (self.d_theta*2, self.d_theta*2)) * 0.0001
-        self.A = jax.random.normal(k_A, (self.d_theta*2, self.d_theta*2)) * 0
-        self.B = jnp.zeros((self.d_theta*2, CONFIG["rec_feat_dim"]))
+        self.ar_model = ARModel(
+            input_dim=lstm_in_dim, hidden_dim=lstm_hid_dim, cell_type="lstm", key=k_lstm
+        )
+        
+        self.decoder = eqx.nn.MLP(
+            in_size=lstm_hid_dim, out_size=self.d_theta * 2, width_size=256, depth=2, key=k_dec
+        )
 
     def render_pixels(self, thetas, coords):
         def render_pt(theta, coord):
             root = self.unravel_fn(theta)
             encoded_coord = fourier_encode(coord, self.num_freqs)
             out = root(encoded_coord)
-            
-            gray_fg = jax.nn.sigmoid(out[0:1])
-            gray_bg = jax.nn.sigmoid(out[1:2])
-            alpha   = jax.nn.sigmoid(out[2:3])
-            return alpha * gray_fg + (1.0 - alpha) * gray_bg
+            return out # Returns raw logits
         return jax.vmap(render_pt)(thetas, coords)
 
     def _get_thetas_and_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
         H, W, C = self.frame_shape
         flat_coords = coords_grid.reshape(-1, 2)
         T = ref_video.shape[0]
-        
-        init_gt_frame = ref_video[0]
-        init_gt_frame_chw = jnp.transpose(init_gt_frame, (2, 0, 1)) 
-        theta_0 = self.hypernet_phi(init_gt_frame_chw)
 
         def scan_step(state, scan_inputs):
+            h, c, prev_frame_selected, k = state
             gt_curr_frame, step_idx = scan_inputs
-            theta, prev_frame_selected, k = state
             k, subk = jax.random.split(k)
 
-            ## split and compute theta with the FiLM projection
-            theta_mu, theta_scale = jnp.split(theta, 2, axis=-1)
-            theta_scaled = self.theta_base*(1+theta_scale) + theta_mu
+            # 1. Encode previous frame into AR input space
+            prev_frame_chw = jnp.transpose(prev_frame_selected, (2, 0, 1))
+            ar_input = self.frame_encoder(prev_frame_chw)
 
-            thetas_frame = jnp.tile(theta_scaled, (H*W, 1))
-            pred_flat = self.render_pixels(thetas_frame, flat_coords)
-            pred_frame = pred_flat.reshape(H, W, C)
+            # 2. Update Autoregressive Dynamics
+            h_next, c_next = self.ar_model(ar_input, (h, c))
+
+            # 3. Decode state to Weight Space Modulation
+            theta_decoded = self.decoder(h_next)
+            theta_mu, theta_scale = jnp.split(theta_decoded, 2, axis=-1)
             
+            # FiLM the learned base parameters
+            theta_scaled = self.theta_base * (1 + theta_scale) + theta_mu
+
+            # 4. Render Categorical Logits
+            thetas_frame = jnp.tile(theta_scaled, (H*W, 1))
+            logits_flat = self.render_pixels(thetas_frame, flat_coords)
+            logits_frame = logits_flat.reshape(H, W, 256)
+            
+            # Extract expected pixel value [0, 255] for autoregressive feedback & plotting
+            probs_flat = jax.nn.softmax(logits_flat, axis=-1)
+            pred_pixels_flat = jnp.sum(probs_flat * jnp.arange(256), axis=-1, keepdims=True)
+            pred_frame = pred_pixels_flat.reshape(H, W, C)
+            
+            # 5. Context/Teacher Forcing Decision
             t_ratio = step_idx / (T - 1)
             is_context = t_ratio <= inf_context_ratio
             is_forced = jax.random.bernoulli(subk, p_forcing)
             
             use_gt = jnp.logical_or(is_context, is_forced)
-            frame_t = jnp.where(use_gt, gt_curr_frame, pred_frame)
+            frame_for_next_step = jnp.where(use_gt, gt_curr_frame, pred_frame)
             
-            # ## Difference first, then controlnet
-            # diff_signal = frame_t - prev_frame_selected
-            # dx_feat = self.controlnet_psi(diff_signal.transpose(2, 0, 1)) / jnp.sqrt(diff_signal.size)
+            new_state = (h_next, c_next, frame_for_next_step, subk)
+            return new_state, (logits_frame, pred_frame)
 
-            frame_t_feats = self.controlnet_psi(frame_t.transpose(2, 0, 1))
-            prev_frame_feats = self.controlnet_psi(prev_frame_selected.transpose(2, 0, 1))
-            # dx_feat = (frame_t_feats - prev_frame_feats) / jnp.sqrt(frame_t_feats.size)
-            dx_feat = (frame_t_feats - prev_frame_feats)
+        # Initial conditions: Feed a zeroed-out frame to the dynamics model to predict step 0. 
+        init_frame = jnp.zeros_like(ref_video[0])
+        init_state = (self.h_init, self.c_init, init_frame, key)
+        
+        scan_inputs = (ref_video, jnp.arange(T))
+        _, (pred_logits, pred_pixels) = jax.lax.scan(scan_step, init_state, scan_inputs)
 
-            theta_next = self.A @ theta + self.B @ dx_feat
-
-            new_state = (theta_next, frame_t, subk)
-            return new_state, pred_frame
-
-        init_frame = ref_video[0]
-        init_state = (theta_0, init_frame, key)
-        scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
-        _, pred_video = jax.lax.scan(scan_step, init_state, scan_inputs)
-
-        return pred_video
+        return pred_logits, pred_pixels
 
     def __call__(self, ref_videos, p_forcing, keys, coords_grid, inf_context_ratio):
         is_single = (ref_videos.ndim == 4)
@@ -334,29 +378,34 @@ class WARP(eqx.Module):
             ref_videos = ref_videos[None, ...]
             keys = keys[None, ...] if keys.ndim == 1 else keys
             
-        # Execute mapped function across batch dimension
         batched_fn = jax.vmap(self._get_thetas_and_preds_single, in_axes=(0, None, 0, None, None))
-        preds = batched_fn(ref_videos, p_forcing, keys, coords_grid, inf_context_ratio)
+        pred_logits, pred_pixels = batched_fn(ref_videos, p_forcing, keys, coords_grid, inf_context_ratio)
         
         if is_single:
-            return preds[0]
-        return preds
+            return pred_logits[0], pred_pixels[0]
+        return pred_logits, pred_pixels
 
 @eqx.filter_jit
 def evaluate(m, batch, p_forcing, keys, coords, context_ratio):
     return m(batch, p_forcing, keys, coords, context_ratio)
 
-#%% Cell 4: Initialization & Training/Loading Logic
+#%% Cell 4: Initialization & Training
 key, subkey = jax.random.split(key)
-model = WARP(CONFIG["root_width"], CONFIG["root_depth"], CONFIG["num_fourier_freqs"], (H, W, C), subkey)
-A_init = model.A.copy()
+model = WARP(
+    CONFIG["root_width"], 
+    CONFIG["root_depth"], 
+    CONFIG["num_fourier_freqs"], 
+    (H, W, C), 
+    CONFIG["lstm_input_dim"],
+    CONFIG["lstm_hidden_dim"],
+    subkey
+)
 
 print(f"Total Trainable Parameters in WARP: {count_trainable_params(model)}")
 
 if TRAIN:
     print(f"\n🚀 Starting WARP Training -> Saving to {run_path}")
     
-    # --- NEW: Chain Adam with the Plateau Scheduler ---
     optimizer = optax.chain(
         optax.adam(CONFIG["learning_rate"]),
         optax.contrib.reduce_on_plateau(
@@ -373,45 +422,29 @@ if TRAIN:
     @eqx.filter_jit
     def train_step(model, opt_state, keys, ref_videos, coords_grid, p_forcing):
         def loss_fn(m):
-            k_full, k_init = jax.random.split(keys[0], 2)
+            k_full = keys[0]
             
-            # 1. Standard Forward Pass
-            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0)
+            # Forward Pass returns (Logits, Pixels)
+            pred_logits, _ = m(ref_videos, p_forcing, keys, coords_grid, 0.0)
 
-            # --- SEQUENCE LOSS---
+            # Sample sequence steps for CE Loss
             full_indices = jax.random.choice(k_full, ref_videos.shape[1], shape=(CONFIG["nb_loss_steps_full"],), replace=False)
-            pred_selected = pred_videos[:, full_indices]
+            
+            pred_logits_selected = pred_logits[:, full_indices]
             ref_selected = ref_videos[:, full_indices]
             
-            loss_full = jnp.mean((pred_selected - ref_selected)**2)
-
-            # --- AUXILIARY HYPERNET LOSS ---
-            rand_indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(CONFIG["nb_loss_steps_init"],), replace=False)
-            rand_gt_frames = ref_videos[:, rand_indices] 
+            # Format targets to integers and squeeze out the single channel dim
+            labels_seq = ref_selected.astype(jnp.int32).squeeze(-1) 
             
-            B, N_init, H, W, C = rand_gt_frames.shape
-            
-            flat_gt_frames = rand_gt_frames.reshape(B * N_init, H, W, C)
-            flat_gt_frames_chw = jnp.transpose(flat_gt_frames, (0, 3, 1, 2))
-            
-            theta_rand = eqx.filter_vmap(m.hypernet_phi)(flat_gt_frames_chw) 
+            loss_full = jnp.mean(optax.softmax_cross_entropy_with_integer_labels(
+                logits=pred_logits_selected, 
+                labels=labels_seq
+            ))
 
-            ## scale back the theta_rand using the learned scale and shift from the hypernet
-            theta_mu, theta_scale = jnp.split(theta_rand, 2, axis=-1)
-            theta_rand = m.theta_base*(1+theta_scale) + theta_mu
-
-            thetas_frame_rand = jnp.tile(theta_rand[:, None, :], (1, H * W, 1))
-            pred_flat_rand = eqx.filter_vmap(m.render_pixels, in_axes=(0, None))(thetas_frame_rand, coords_grid.reshape(-1, 2))
-
-            pred_frame_rand = pred_flat_rand.reshape(B, N_init, H, W, C)
-
-            loss_ae = jnp.mean((pred_frame_rand - rand_gt_frames)**2)
-
-            return loss_full + 1*loss_ae
+            return loss_full
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
         
-        # --- NEW: Pass the loss value into the optimizer update ---
         updates, opt_state = optimizer.update(
             grads, opt_state, eqx.filter(model, eqx.is_inexact_array), value=loss_val
         )
@@ -425,35 +458,37 @@ if TRAIN:
     for epoch in range(CONFIG["nb_epochs"]):
         if not SINGLE_BATCH:
             print(f"\nEPOCH: {epoch+1}")
-        epoch_losses = []
         
-        # pbar = tqdm(train_loader)
-        # for batch_idx, batch_videos in enumerate(pbar):
-        for batch_idx, batch_videos in enumerate(train_loader):
+        epoch_losses = []
+        # for batch_idx, batch_videos in enumerate(train_loader):
+        pbar = tqdm(train_loader)
+        for batch_idx, batch_videos in enumerate(pbar):
             key, subkey = jax.random.split(key)
             batch_keys = jax.random.split(subkey, CONFIG["batch_size"])
             
             model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, CONFIG["p_forcing"])
             epoch_losses.append(loss)
             
-            # --- NEW: Extract and record the current learning rate scale ---
             current_scale = optax.tree_utils.tree_get(opt_state, "scale")
             lr_scales.append(current_scale)
 
             # if not SINGLE_BATCH and (batch_idx % CONFIG["print_every"]) == 0:
-            #     pbar.set_description(f"Loss: {loss:.4f} | LR Scale: {current_scale:.4f}")
+            #     print(f"Batch {batch_idx} | Loss: {loss:.4f} | LR Scale: {current_scale:.4f}")
+
+            if not SINGLE_BATCH and (batch_idx % CONFIG["print_every"]) == 0:
+                pbar.set_description(f"Loss: {loss:.4f} | LR Scale: {current_scale:.4f}")
 
         all_losses.extend(epoch_losses)
         
-        # Periodically save model over the training process
+        # Save checkpoints
         if epoch in [4, CONFIG["nb_epochs"]//2, 2*CONFIG["nb_epochs"]//3]:
             eqx.tree_serialise_leaves(artefacts_path / f"tf_model_ep{epoch+1}.eqx", model)
 
-        ## Generate intermediate visualizations at the end of each epoch
-        if (epoch+1) % (CONFIG["nb_epochs"]//10)==0:
+        # Generate eval frames periodically
+        if (epoch+1) % (CONFIG["nb_epochs"]//10)==0 or epoch == 0:
             val_keys = jax.random.split(key, CONFIG["batch_size"])
-            val_videos = evaluate(model,sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"])
-            plot_pred_ref_videos_rollout(val_videos[0], 
+            _, val_pixels = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"])
+            plot_pred_ref_videos_rollout(val_pixels[0], 
                                         sample_batch[0], 
                                         title=f"Pred", 
                                         save_name=f"pred_ref_epoch{epoch+1}.png")
@@ -461,7 +496,6 @@ if TRAIN:
     wall_time = time.time() - start_time
     print("\nWall time for WARP training in h:m:s:", time.strftime("%H:%M:%S", time.gmtime(wall_time)))
     
-    # Save final artifacts
     eqx.tree_serialise_leaves(artefacts_path / "tf_model_final.eqx", model)
     np.save(artefacts_path / "loss_history.npy", np.array(all_losses))
     np.save(artefacts_path / "lr_history.npy", np.array(lr_scales))
@@ -483,16 +517,14 @@ print("\n=== Generating Dashboards ===")
 if len(all_losses) > 0:
     fig, ax1 = plt.subplots(figsize=(10, 5))
     
-    # Plot standard loss history on the left axis
     color1 = 'teal'
-    ax1.plot(all_losses, color=color1, alpha=0.8, label="Total Loss")
+    ax1.plot(all_losses, color=color1, alpha=0.8, label="Cross-Entropy Loss")
     ax1.set_yscale('log')
     ax1.set_xlabel("Iteration")
     ax1.set_ylabel("Loss", color=color1)
     ax1.tick_params(axis='y', labelcolor=color1)
     ax1.grid(True)
     
-    # Plot LR Scale on the right axis to see when reductions triggered
     ax2 = ax1.twinx()  
     color2 = 'crimson'
     if len(lr_scales) > 0:
@@ -505,34 +537,15 @@ if len(all_losses) > 0:
     plt.savefig(plots_path / "loss_and_lr_history.png")
     plt.show()
 
-# Plot Matrix A
-A_final = model.A
-subsample_step = max(1, 1) 
-vmin, vmax = -1e-4, 1e-4
-
-fig, axes = plt.subplots(1, 2, figsize=(20, 9))
-im1 = axes[0].imshow(A_init[::subsample_step, ::subsample_step], cmap='viridis', vmin=vmin, vmax=vmax)
-axes[0].set_title(f"Recurrence Matrix A (Init)\nSubsampled step={subsample_step}")
-plt.colorbar(im1, ax=axes[0])
-
-im2 = axes[1].imshow(A_final[::subsample_step, ::subsample_step], cmap='viridis', vmin=vmin, vmax=vmax)
-axes[1].set_title(f"Recurrence Matrix A (Final)\nSubsampled step={subsample_step}")
-plt.colorbar(im2, ax=axes[1])
-
-plt.tight_layout()
-plt.savefig(plots_path / "recurrence_matrix_A.png")
-plt.show()
-
 #%%
 sample_batch = next(iter(train_loader))
 
-# Run inference utilizing the newly embedded `__call__` interface (handles batched transparently)
 val_keys = jax.random.split(key, CONFIG["batch_size"])
-final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.0)
+_, final_pixels = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.5)
 
 plot_pred_ref_videos_rollout(
-    final_videos[2], 
-    sample_batch[2], 
+    final_pixels[0], 
+    sample_batch[0], 
     title=f"Pred", 
     save_name="inference_forecast_rollout.png"
 )
