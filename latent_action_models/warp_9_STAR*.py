@@ -39,17 +39,17 @@ SINGLE_BATCH = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 10,
-    "batch_size": 8 if not SINGLE_BATCH else 8,
-    "learning_rate": 1e-6,
-    "print_every": 500,
-    "p_forcing": 0.0,
+    "nb_epochs": 25,
+    "batch_size": 48 if not SINGLE_BATCH else 8,
+    "learning_rate": 5e-6,
+    "print_every": 5,
+    "p_forcing": 0.25,
     "inf_context_ratio": 0.5,
-    "nb_loss_steps_full": 12,
-    "nb_loss_steps_init": 12,
-    "rec_feat_dim": 16,
-    "root_width": 32,
-    "root_depth": 2,
+    "nb_loss_steps_full": 20,
+    "nb_loss_steps_init": 20,
+    "rec_feat_dim": 32,
+    "root_width": 12,
+    "root_depth": 5,
     "num_fourier_freqs": 6,
 
     # --- NEW: Plateau Scheduler Config ---
@@ -195,6 +195,7 @@ class RootMLP(eqx.Module):
     def __call__(self, x):
         for layer in self.layers[:-1]:
             x = jax.nn.relu(layer(x))
+            # x = jnp.sin(layer(x))
         return self.layers[-1](x)
 
 class CNNEncoder(eqx.Module):
@@ -250,7 +251,7 @@ class WARP(eqx.Module):
         H, W, C = frame_shape
         
         coord_dim = 2 + 2 * 2 * num_freqs 
-        template_root = RootMLP(coord_dim, 3, root_width, root_depth, k_root)
+        template_root = RootMLP(coord_dim, 1, root_width, root_depth, k_root)
 
         flat_params, self.unravel_fn = ravel_pytree(template_root)
         self.d_theta = flat_params.shape[0]
@@ -258,12 +259,13 @@ class WARP(eqx.Module):
         
         self.theta_base = flat_params
 
-        self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta*2, spatial_shape=(H, W), key=k_phi, hidden_width=128, depth=4)
-        self.controlnet_psi = CNNEncoder(in_channels=C*1, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=128, depth=4)
+        # self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta*2, spatial_shape=(H, W), key=k_phi, hidden_width=64, depth=4)
+        self.hypernet_phi = jnp.zeros((self.d_theta*2,))  # --- Ablation: No Hypernet, just learn a single theta_0 ---
+        self.controlnet_psi = CNNEncoder(in_channels=C*1, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=32, depth=3)
         
-        # self.A = jnp.eye(self.d_theta*2)
+        self.A = jnp.eye(self.d_theta*2)
         # self.A = jax.random.normal(k_A, (self.d_theta*2, self.d_theta*2)) * 0.0001
-        self.A = jax.random.normal(k_A, (self.d_theta*2, self.d_theta*2)) * 0
+        # self.A = jax.random.normal(k_A, (self.d_theta*2, self.d_theta*2)) * 0
         self.B = jnp.zeros((self.d_theta*2, CONFIG["rec_feat_dim"]))
 
     def render_pixels(self, thetas, coords):
@@ -272,10 +274,21 @@ class WARP(eqx.Module):
             encoded_coord = fourier_encode(coord, self.num_freqs)
             out = root(encoded_coord)
             
-            gray_fg = jax.nn.sigmoid(out[0:1])
-            gray_bg = jax.nn.sigmoid(out[1:2])
-            alpha   = jax.nn.sigmoid(out[2:3])
-            return alpha * gray_fg + (1.0 - alpha) * gray_bg
+            # gray_fg = jax.nn.sigmoid(out[0:1])
+            # gray_bg = jax.nn.sigmoid(out[1:2])
+            # alpha   = jax.nn.sigmoid(out[2:3])
+
+            # gray_fg = out[0:1]
+            # gray_bg = out[1:2]
+
+            # ## Alpha should be hard thresholded to encourage more discrete rendering and reduce blurriness
+            # alpha = jax.nn.sigmoid(out[2:3])
+
+            # return alpha * gray_fg + (1.0 - alpha) * gray_bg
+
+            return out[0:1]
+
+
         return jax.vmap(render_pt)(thetas, coords)
 
     def _get_thetas_and_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
@@ -285,7 +298,8 @@ class WARP(eqx.Module):
         
         init_gt_frame = ref_video[0]
         init_gt_frame_chw = jnp.transpose(init_gt_frame, (2, 0, 1)) 
-        theta_0 = self.hypernet_phi(init_gt_frame_chw)
+        # theta_0 = self.hypernet_phi(init_gt_frame_chw)
+        theta_0 = self.hypernet_phi
 
         def scan_step(state, scan_inputs):
             gt_curr_frame, step_idx = scan_inputs
@@ -385,29 +399,32 @@ if TRAIN:
             
             loss_full = jnp.mean((pred_selected - ref_selected)**2)
 
-            # --- AUXILIARY HYPERNET LOSS ---
-            rand_indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(CONFIG["nb_loss_steps_init"],), replace=False)
-            rand_gt_frames = ref_videos[:, rand_indices] 
+            # # --- AUXILIARY HYPERNET LOSS ---
+            # rand_indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(CONFIG["nb_loss_steps_init"],), replace=False)
+            # rand_gt_frames = ref_videos[:, rand_indices] 
             
-            B, N_init, H, W, C = rand_gt_frames.shape
+            # B, N_init, H, W, C = rand_gt_frames.shape
             
-            flat_gt_frames = rand_gt_frames.reshape(B * N_init, H, W, C)
-            flat_gt_frames_chw = jnp.transpose(flat_gt_frames, (0, 3, 1, 2))
+            # flat_gt_frames = rand_gt_frames.reshape(B * N_init, H, W, C)
+            # flat_gt_frames_chw = jnp.transpose(flat_gt_frames, (0, 3, 1, 2))
             
-            theta_rand = eqx.filter_vmap(m.hypernet_phi)(flat_gt_frames_chw) 
+            # theta_rand = eqx.filter_vmap(m.hypernet_phi)(flat_gt_frames_chw) 
 
-            ## scale back the theta_rand using the learned scale and shift from the hypernet
-            theta_mu, theta_scale = jnp.split(theta_rand, 2, axis=-1)
-            theta_rand = m.theta_base*(1+theta_scale) + theta_mu
+            # ## scale back the theta_rand using the learned scale and shift from the hypernet
+            # theta_mu, theta_scale = jnp.split(theta_rand, 2, axis=-1)
+            # theta_rand = m.theta_base*(1+theta_scale) + theta_mu
 
-            thetas_frame_rand = jnp.tile(theta_rand[:, None, :], (1, H * W, 1))
-            pred_flat_rand = eqx.filter_vmap(m.render_pixels, in_axes=(0, None))(thetas_frame_rand, coords_grid.reshape(-1, 2))
+            # thetas_frame_rand = jnp.tile(theta_rand[:, None, :], (1, H * W, 1))
+            # pred_flat_rand = eqx.filter_vmap(m.render_pixels, in_axes=(0, None))(thetas_frame_rand, coords_grid.reshape(-1, 2))
 
-            pred_frame_rand = pred_flat_rand.reshape(B, N_init, H, W, C)
+            # pred_frame_rand = pred_flat_rand.reshape(B, N_init, H, W, C)
 
-            loss_ae = jnp.mean((pred_frame_rand - rand_gt_frames)**2)
+            # loss_ae = jnp.mean((pred_frame_rand - rand_gt_frames)**2)
 
-            return loss_full + 1*loss_ae
+            # return loss_full + 1*loss_ae
+            # return loss_full + 0.01*loss_ae
+            return loss_full
+            # return loss_ae
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
         
@@ -424,7 +441,7 @@ if TRAIN:
 
     for epoch in range(CONFIG["nb_epochs"]):
         if not SINGLE_BATCH:
-            print(f"\nEPOCH: {epoch+1}")
+            print(f"\nEPOCH: {epoch+1}", flush=True)
         epoch_losses = []
         
         # pbar = tqdm(train_loader)
@@ -444,13 +461,17 @@ if TRAIN:
             #     pbar.set_description(f"Loss: {loss:.4f} | LR Scale: {current_scale:.4f}")
 
         all_losses.extend(epoch_losses)
-        
+
+        if not SINGLE_BATCH:
+            avg_epoch_loss = np.mean(epoch_losses)
+            print(f"Epoch {epoch+1}/{CONFIG['nb_epochs']} - Avg Loss: {avg_epoch_loss:.4f} - LR Scale: {current_scale:.4f}", flush=True)
+
         # Periodically save model over the training process
         if epoch in [4, CONFIG["nb_epochs"]//2, 2*CONFIG["nb_epochs"]//3]:
             eqx.tree_serialise_leaves(artefacts_path / f"tf_model_ep{epoch+1}.eqx", model)
 
         ## Generate intermediate visualizations at the end of each epoch
-        if (epoch+1) % (CONFIG["nb_epochs"]//10)==0:
+        if (epoch+1) % (max(CONFIG["nb_epochs"]//10, 1)) == 0:
             val_keys = jax.random.split(key, CONFIG["batch_size"])
             val_videos = evaluate(model,sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"])
             plot_pred_ref_videos_rollout(val_videos[0], 

@@ -198,7 +198,7 @@ class CNNDecoder(eqx.Module):
             eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=k4),
             jax.nn.relu,
             eqx.nn.ConvTranspose2d(16, out_channels, kernel_size=4, stride=2, padding=1, key=k5),
-            jax.nn.sigmoid
+            # jax.nn.sigmoid
         ]
 
     def __call__(self, z):

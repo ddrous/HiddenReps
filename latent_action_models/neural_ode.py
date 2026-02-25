@@ -33,13 +33,13 @@ def count_trainable_params(model):
 # --- Configuration ---
 TRAIN = True
 RUN_DIR = "./" if not TRAIN else None
-SINGLE_BATCH = True
+SINGLE_BATCH = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 200,
+    "nb_epochs": 20,
     "batch_size": 16 if not SINGLE_BATCH else 1,
-    "learning_rate": 1e-4,   
+    "learning_rate": 1e-5,   
     "print_every": 100,
     "seq_len_in": 10,        # Context frames used for training/encoding
     "seq_len_out": 20,       # Total frames to generate at test time (10 recon + 10 pred)
@@ -200,7 +200,7 @@ class CNNDecoder(eqx.Module):
             eqx.nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, key=k4),
             jax.nn.relu,
             eqx.nn.ConvTranspose2d(16, out_channels, kernel_size=4, stride=2, padding=1, key=k5),
-            jax.nn.sigmoid
+            # jax.nn.sigmoid
         ]
 
     def __call__(self, z):
@@ -243,7 +243,7 @@ class NonRNN_ODE_Model(eqx.Module):
         
         self.encoder = CNNEncoder(C, latent_dim, k_enc)
         self.vector_field = VectorField(latent_dim, ode_hidden_dim, k_vf)
-        self.decoder = CNNDecoder(latent_dim, C, k_dec)
+        self.decoder = CNNDecoder(latent_dim*1, C, k_dec)
 
     def _forward_single(self, ref_video, eval_len):
         # Map to (T, C, H, W) for Equinox convolutions
@@ -261,19 +261,25 @@ class NonRNN_ODE_Model(eqx.Module):
         solver = diffrax.Tsit5()
         dt0 = 0.1
         # Save trajectory exactly at discrete frame indices
-        saveat = diffrax.SaveAt(ts=jnp.arange(float(eval_len)))
+        # saveat = diffrax.SaveAt(ts=jnp.arange(float(eval_len)))
+        saveat = diffrax.SaveAt(ts=jnp.linspace(0, 1, eval_len))
+        # saveat = diffrax.SaveAt(ts=jnp.linspace(0, 1, target_latents.shape[0]))
         
         sol = diffrax.diffeqsolve(
             diffrax.ODETerm(self.vector_field),
             solver,
             t0=0.0,
-            t1=float(eval_len - 1),
+            # t1=float(eval_len - 1),
+            t1=1.0,
             dt0=dt0,
             y0=z0,
             saveat=saveat,
             stepsize_controller=diffrax.PIDController(rtol=1e-3, atol=1e-3)
         )
         pred_latents = sol.ys # Shape: (eval_len, latent_dim)
+
+        ## Concatenate with target latents first first
+        # pred_latents = jnp.concatenate([pred_latents, target_latents], axis=-1) # (T, latent_dim*2)
         
         # 4. Decode Trajectory Back to Pixel Space
         decode_vmap = jax.vmap(self.decoder)
@@ -337,12 +343,16 @@ if TRAIN:
             
             # 1. Pixel Loss (L2 Reconstruction)
             pixel_loss = jnp.mean((pred_videos - ref_videos[:, :CONFIG["seq_len_in"]])**2)
+            # pixel_loss = jnp.mean((pred_videos[:, 0] - ref_videos[:, 0])**2)
             
             # 2. Latent ODE Constraint (L2 Distance in Latent Space)
             latent_loss = jnp.mean((pred_lats - target_lats[:, :CONFIG["seq_len_in"]])**2)
             
             total_loss = pixel_loss + latent_loss
             return total_loss, (pixel_loss, latent_loss)
+
+            # total_loss = pixel_loss
+            # return total_loss, (pixel_loss, pixel_loss)
 
         (loss_val, (pix_val, lat_val)), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model)
         
@@ -442,3 +452,5 @@ plot_pred_ref_videos_rollout(
     title=f"Pred", 
     save_name="inference_forecast_rollout.png"
 )
+
+print("Min and Max pixel values in final predictions:", final_videos.min(), final_videos.max())

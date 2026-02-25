@@ -32,20 +32,20 @@ def count_trainable_params(model):
 # --- Configuration ---
 TRAIN = True
 RUN_DIR = "./" if not TRAIN else None
-SINGLE_BATCH = True
+SINGLE_BATCH = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 1000,
+    "nb_epochs": 1,
     "batch_size": 4 if not SINGLE_BATCH else 1,
-    "learning_rate": 1e-6,   # Paper starting learning rate [cite: 343]
+    "learning_rate": 1e-5,   # Paper starting learning rate [cite: 343]
     "print_every": 100,
     "p_forcing": 1.0,        # Scheduled sampling probability 
     
     # PredRNN++ Architecture settings [cite: 220, 221]
     "hidden_channels": [64, 64, 64, 64], # Paper uses [128, 64, 64, 64], scaled down for safety
     "kernel_size": 5,        
-    "ghu_channels": 64,      # Paper uses 128
+    "ghu_channels": 32,      # Paper uses 128
     "seq_len_in": 10,        # 10 frames in [cite: 347]
     "seq_len_out": 10,       # 10 frames out [cite: 347]
 
@@ -309,7 +309,8 @@ class PredRNNPP(eqx.Module):
             # Decode to image space
             out_frame_chw = self.final_conv(h_st[-1])
             # PredRNN++ usually doesn't strictly sigmoid at the end if standardized, but for image [0,1] it's useful
-            out_frame = jax.nn.sigmoid(jnp.transpose(out_frame_chw, (1, 2, 0)))
+            # out_frame = jax.nn.sigmoid(jnp.transpose(out_frame_chw, (1, 2, 0)))
+            out_frame = jnp.transpose(out_frame_chw, (1, 2, 0))
             
             new_state = (h_st, c_st, m_st, z_st, out_frame, subk)
             return new_state, out_frame
