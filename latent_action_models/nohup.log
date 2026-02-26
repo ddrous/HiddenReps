@@ -1,161 +1,22 @@
-/home/gb21553/Projects/HiddenReps/latent_action_models/warp_9_CHEAP.py:367: UserWarning: A JAX array is being set as static! This can result in unexpected behavior and is usually a mistake to do.
-  model = WARP(CONFIG["root_width"], CONFIG["root_depth"], CONFIG["num_fourier_freqs"], (H, W, C), subkey)
+/home/gb21553/Projects/HiddenReps/latent_action_models/warp_12_mult.py:594: UserWarning: A JAX array is being set as static! This can result in unexpected behavior and is usually a mistake to do.
+  model = WARP(
 Loading Moving MNIST Dataset...
-Batched Video shape: (48, 20, 64, 64, 1)
-Total Trainable Parameters in WARP: 4860738
+Batched Video shape: (32, 20, 64, 64, 1)
+Total Trainable Parameters in WARP: 45019698
 
-🚀 Starting WARP Training -> Saving to experiments/260225-141931
+🚀 Starting WARP Training -> Saving to experiments/260226-215258
+Epoch 100/1000 - Avg Loss: 0.0399 - LR Scale: 1.0000
+Epoch 200/1000 - Avg Loss: 0.0354 - LR Scale: 1.0000
+Epoch 300/1000 - Avg Loss: 0.0378 - LR Scale: 1.0000
+Epoch 400/1000 - Avg Loss: 0.0346 - LR Scale: 1.0000
+Epoch 500/1000 - Avg Loss: 0.0350 - LR Scale: 1.0000
+Epoch 600/1000 - Avg Loss: 0.0335 - LR Scale: 1.0000
+Epoch 700/1000 - Avg Loss: 0.0363 - LR Scale: 1.0000
+Epoch 800/1000 - Avg Loss: 0.0305 - LR Scale: 1.0000
+Epoch 900/1000 - Avg Loss: 0.0321 - LR Scale: 1.0000
+Epoch 999/1000 - Avg Loss: 0.0309 - LR Scale: 1.0000
+Epoch 1000/1000 - Avg Loss: 0.0337 - LR Scale: 1.0000
 
-EPOCH: 1
-Epoch 1/50 - Avg Loss: 0.0422 - LR Scale: 1.0000
-
-EPOCH: 2
-Epoch 2/50 - Avg Loss: 0.0400 - LR Scale: 1.0000
-
-EPOCH: 3
-Epoch 3/50 - Avg Loss: 0.0396 - LR Scale: 1.0000
-
-EPOCH: 4
-Epoch 4/50 - Avg Loss: 0.0394 - LR Scale: 1.0000
-
-EPOCH: 5
-Epoch 5/50 - Avg Loss: 0.0391 - LR Scale: 1.0000
-
-EPOCH: 6
-Epoch 6/50 - Avg Loss: 0.0388 - LR Scale: 1.0000
-
-EPOCH: 7
-Epoch 7/50 - Avg Loss: 0.0385 - LR Scale: 1.0000
-
-EPOCH: 8
-Epoch 8/50 - Avg Loss: 0.0383 - LR Scale: 1.0000
-
-EPOCH: 9
-Epoch 9/50 - Avg Loss: 0.0381 - LR Scale: 1.0000
-
-EPOCH: 10
-Epoch 10/50 - Avg Loss: 0.0378 - LR Scale: 1.0000
-
-EPOCH: 11
-Epoch 11/50 - Avg Loss: 0.0376 - LR Scale: 1.0000
-
-EPOCH: 12
-Epoch 12/50 - Avg Loss: 0.0374 - LR Scale: 1.0000
-
-EPOCH: 13
-Epoch 13/50 - Avg Loss: 0.0371 - LR Scale: 1.0000
-
-EPOCH: 14
-Epoch 14/50 - Avg Loss: 0.0368 - LR Scale: 1.0000
-
-EPOCH: 15
-Epoch 15/50 - Avg Loss: 0.0366 - LR Scale: 1.0000
-
-EPOCH: 16
-Epoch 16/50 - Avg Loss: 0.0365 - LR Scale: 1.0000
-
-EPOCH: 17
-Epoch 17/50 - Avg Loss: 0.0363 - LR Scale: 1.0000
-
-EPOCH: 18
-Epoch 18/50 - Avg Loss: 0.0361 - LR Scale: 1.0000
-
-EPOCH: 19
-Epoch 19/50 - Avg Loss: 0.0359 - LR Scale: 1.0000
-
-EPOCH: 20
-Epoch 20/50 - Avg Loss: 0.0358 - LR Scale: 1.0000
-
-EPOCH: 21
-Epoch 21/50 - Avg Loss: 0.0356 - LR Scale: 1.0000
-
-EPOCH: 22
-Epoch 22/50 - Avg Loss: 0.0354 - LR Scale: 1.0000
-
-EPOCH: 23
-Epoch 23/50 - Avg Loss: 0.0353 - LR Scale: 1.0000
-
-EPOCH: 24
-Epoch 24/50 - Avg Loss: 0.0352 - LR Scale: 1.0000
-
-EPOCH: 25
-Epoch 25/50 - Avg Loss: 0.0350 - LR Scale: 1.0000
-
-EPOCH: 26
-Epoch 26/50 - Avg Loss: 0.0348 - LR Scale: 1.0000
-
-EPOCH: 27
-Epoch 27/50 - Avg Loss: 0.0347 - LR Scale: 1.0000
-
-EPOCH: 28
-Epoch 28/50 - Avg Loss: 0.0346 - LR Scale: 1.0000
-
-EPOCH: 29
-Epoch 29/50 - Avg Loss: 0.0344 - LR Scale: 1.0000
-
-EPOCH: 30
-Epoch 30/50 - Avg Loss: 0.0343 - LR Scale: 1.0000
-
-EPOCH: 31
-Epoch 31/50 - Avg Loss: 0.0342 - LR Scale: 1.0000
-
-EPOCH: 32
-Epoch 32/50 - Avg Loss: 0.0341 - LR Scale: 1.0000
-
-EPOCH: 33
-Epoch 33/50 - Avg Loss: 0.0340 - LR Scale: 1.0000
-
-EPOCH: 34
-Epoch 34/50 - Avg Loss: 0.0339 - LR Scale: 1.0000
-
-EPOCH: 35
-Epoch 35/50 - Avg Loss: 0.0338 - LR Scale: 1.0000
-
-EPOCH: 36
-Epoch 36/50 - Avg Loss: 0.0337 - LR Scale: 1.0000
-
-EPOCH: 37
-Epoch 37/50 - Avg Loss: 0.0335 - LR Scale: 1.0000
-
-EPOCH: 38
-Epoch 38/50 - Avg Loss: 0.0335 - LR Scale: 1.0000
-
-EPOCH: 39
-Epoch 39/50 - Avg Loss: 0.0334 - LR Scale: 1.0000
-
-EPOCH: 40
-Epoch 40/50 - Avg Loss: 0.0333 - LR Scale: 1.0000
-
-EPOCH: 41
-Epoch 41/50 - Avg Loss: 0.0333 - LR Scale: 1.0000
-
-EPOCH: 42
-Epoch 42/50 - Avg Loss: 0.0332 - LR Scale: 1.0000
-
-EPOCH: 43
-Epoch 43/50 - Avg Loss: 0.0331 - LR Scale: 1.0000
-
-EPOCH: 44
-Epoch 44/50 - Avg Loss: 0.0330 - LR Scale: 1.0000
-
-EPOCH: 45
-Epoch 45/50 - Avg Loss: 0.0330 - LR Scale: 1.0000
-
-EPOCH: 46
-Epoch 46/50 - Avg Loss: 0.0329 - LR Scale: 1.0000
-
-EPOCH: 47
-Epoch 47/50 - Avg Loss: 0.0328 - LR Scale: 1.0000
-
-EPOCH: 48
-Epoch 48/50 - Avg Loss: 0.0327 - LR Scale: 1.0000
-
-EPOCH: 49
-Epoch 49/50 - Avg Loss: 0.0327 - LR Scale: 1.0000
-
-EPOCH: 50
-Epoch 50/50 - Avg Loss: 0.0327 - LR Scale: 1.0000
-
-Wall time for WARP training in h:m:s: 00:24:29
+Wall time for WARP training in h:m:s: 00:04:55
 
 === Generating Dashboards ===

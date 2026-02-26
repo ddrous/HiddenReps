@@ -37,27 +37,28 @@ TRAIN = True
 RUN_DIR = "./" if not TRAIN else None
 
 SINGLE_BATCH = False
+USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 800,
-    "print_every": 10,
-    "batch_size": 32 if not SINGLE_BATCH else 1,
-    "learning_rate": 1e-7,
+    "nb_epochs": 60,
+    "print_every": 1,
+    "batch_size": 1 if SINGLE_BATCH else 32,
+    "learning_rate": 1e-7 if USE_NLL_LOSS else 1e-5,
     "p_forcing": 0.25,
     "inf_context_ratio": 0.5,
     "nb_loss_steps_full": 20,
     "nb_loss_steps_init": 20,
-    "rec_feat_dim": 32,
+    "rec_feat_dim": 256,
     "root_width": 12,
     "root_depth": 5,
     "num_fourier_freqs": 6,
-    "use_nll_loss": True,
+    "use_nll_loss": USE_NLL_LOSS,
 
     # --- Architecture Params ---
     "num_layers": 1,
-    "use_hypernet": False,
-    "use_controlnet": True,
+    "use_hypernet": True,
+    "use_controlnet": False,
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 500,      
@@ -107,7 +108,10 @@ def numpy_collate(batch):
         
     videos = videos.astype(np.float32)
     if videos.max() > 2.0:
-        videos = videos / 255.0  
+        videos = videos / 255.0
+
+    ## Rescale to [-1, 1]
+    # videos = videos * 2.0 - 1.0
 
     return videos
 
@@ -132,7 +136,7 @@ try:
         training_subset = Subset(dataset, range(CONFIG["batch_size"]))
         train_loader = DataLoader(
             training_subset, 
-            batch_size=CONFIG["batch_size"], 
+            batch_size=CONFIG["batch_size"]//1, 
             shuffle=False, 
             collate_fn=numpy_collate, 
             drop_last=True
@@ -192,18 +196,26 @@ def plot_pred_ref_videos(video, ref_video, title="Render", save_name=None):
 def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=None):
     nb_frames = video.shape[0]
 
+    ## Rescale to [0,1] if in [-1,1]
+    rescale = False
+    if ref_video[..., :C].min() < 0.0:
+        rescale = True
+        ref_video = (ref_video + 1.0) / 2.0
+
     if video.shape[-1] == 1:
         fig, axes = plt.subplots(2, 1+(nb_frames//2), figsize=(20, 6))
         indices_to_plot = list(np.arange(0, nb_frames, 2)) + [nb_frames-1]
         for i, idx in enumerate(indices_to_plot):
-            sbimshow(video[idx], title=f"{title} t={idx}", ax=axes[0, i])
+            video_to_plot = video[idx] if not rescale else (video[idx] + 1.0) / 2.0
+            sbimshow(video_to_plot, title=f"{title} t={idx}", ax=axes[0, i])
             sbimshow(ref_video[idx], title=f"Ref t={idx}", ax=axes[1, i])
     else:
         ## We want to plot uncertainties as well
-        fig, axes = plt.subplots(3, 1+(nb_frames//2), figsize=(20, 9))
+        fig, axes = plt.subplots(3, 1+(nb_frames//2), figsize=(20, 7))
         indices_to_plot = list(np.arange(0, nb_frames, 2)) + [nb_frames-1]
         for i, idx in enumerate(indices_to_plot):
-            sbimshow(video[idx, ..., :C], title=f"Mean t={idx}", ax=axes[0, i])
+            video_to_plot = video[idx, ..., :C] if not rescale else (video[idx, ..., :C] + 1.0) / 2.0
+            sbimshow(video_to_plot, title=f"Mean t={idx}", ax=axes[0, i])
             sbimshow(video[idx, ..., C:], title=f"Std t={idx}", ax=axes[1, i])
             sbimshow(ref_video[idx], title=f"Ref t={idx}", ax=axes[2, i])
 
@@ -237,7 +249,7 @@ class RootMLP(eqx.Module):
 
 class CNNEncoder(eqx.Module):
     layers: list
-    
+
     def __init__(self, in_channels, out_dim, spatial_shape, key, hidden_width=16, depth=3):
         H, W = spatial_shape
         keys = jax.random.split(key, depth + 1)
@@ -256,7 +268,7 @@ class CNNEncoder(eqx.Module):
         dummy_x = jnp.zeros((in_channels, H, W))
         for layer in conv_layers:
             dummy_x = layer(dummy_x)
-            
+
         flat_dim = dummy_x.reshape(-1).shape[0]
         self.layers = conv_layers + [eqx.nn.Linear(flat_dim, out_dim, key=keys[depth])]
         
@@ -271,10 +283,15 @@ class CNNEncoder(eqx.Module):
 class LinearRNNLayer(eqx.Module):
     A: jax.Array
     B: jax.Array
+    # C: jax.Array = eqx.field(static=True)  # For potential FiLM conditioning, not used in this version
 
     def __init__(self, in_dim, out_dim, key):
         k_A, k_B = jax.random.split(key)
-        self.A = jnp.eye(out_dim)
+
+        ## define a MLP
+        self.A = eqx.nn.MLP(out_dim, out_dim, width_size=out_dim*2, depth=2, key=k_A)
+
+        # self.A = jnp.eye(out_dim)
         # self.A = jax.random.normal(k_A, (out_dim, out_dim)) * 0.01
         # self.A = jax.random.normal(k_A, (out_dim, out_dim)) * 0
 
@@ -282,7 +299,11 @@ class LinearRNNLayer(eqx.Module):
         # self.A = jnp.eye(out_dim) + jax.random.normal(k_A, (out_dim, out_dim)) * 0.0001
         
         # self.B = jnp.zeros((out_dim, CONFIG["rec_feat_dim"]))
-        self.B = jnp.zeros((out_dim, in_dim))
+        # self.B = jnp.zeros((out_dim, in_dim))
+        # self.B = eqx.nn.MLP(in_dim, out_dim, width_size=(out_dim+in_dim)//2, depth=3, key=k_B)
+        self.B = eqx.nn.MLP(in_dim, out_dim, width_size=out_dim*2, depth=2, key=k_B)
+
+        # self.C = jnp.zeros((out_dim, in_dim))  # Not used in this version, but reserved for potential FiLM conditioning
 
 
 class WARP(eqx.Module):
@@ -308,7 +329,7 @@ class WARP(eqx.Module):
         self.use_hypernet = use_hypernet
         self.use_controlnet = use_controlnet
         H, W, C = frame_shape
-        
+
         coord_dim = 2 + 2 * 2 * num_freqs 
         root_out_dim = C * 2 if CONFIG["use_nll_loss"] else C
         template_root = RootMLP(coord_dim, root_out_dim, root_width, root_depth, k_root)
@@ -320,8 +341,16 @@ class WARP(eqx.Module):
 
         if use_hypernet:
             self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta*1, spatial_shape=(H, W), key=k_phi, hidden_width=64, depth=4)
+
+            ## Initialise the weight and biases at zero
+            # self.hypernet_phi = jax.tree_map(lambda x: jnp.zeros_like(x), self.hypernet_phi)
+            # self.hypernet_phi = jax.tree_map(lambda x: x*0.001, self.hypernet_phi)
+
         else:
             self.hypernet_phi = None
+
+        # ## TODO: the B space is the weight space:
+        # CONFIG["rec_feat_dim"] = self.d_theta*2
 
         if use_controlnet:
             self.controlnet_psi = CNNEncoder(in_channels=C*2, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=32, depth=3)
@@ -349,11 +378,11 @@ class WARP(eqx.Module):
     @property
     def A(self):
         """Property to keep evaluation/plotting code transparently compatible."""
-        return self.rnn_layers[-1].A
+        return self.rnn_layers[-1].A if type(self.rnn_layers[-1].A) == jnp.ndarray else self.rnn_layers[-1].A.layers[-1].weight
 
     @property
     def B(self):
-        return self.rnn_layers[-1].B
+        return self.rnn_layers[-1].B if type(self.rnn_layers[-1].B) == jnp.ndarray else self.rnn_layers[-1].B.layers[-1].weight
 
     def render_pixels(self, thetas, coords):
         def render_pt(theta, coord):
@@ -380,7 +409,11 @@ class WARP(eqx.Module):
             if CONFIG["use_nll_loss"]:
                 mean, std = out[:C], out[C:]
                 # std = jnp.clip(std, 1e-4, 10.0)
-                std = jnp.maximum(jax.nn.softplus(std), 1e-4)
+                # std = jnp.maximum(jax.nn.softplus(std), 1e-4)
+                # std = jnp.maximum(jax.nn.softplus(std), 0.5)
+                # std = jnp.maximum(std, 0.5)
+                # std = jax.nn.relu(std) + 1e-4
+                std = jax.nn.softplus(std) + 1e-4
                 return jnp.concatenate([mean, std], axis=-1)
             else:
                 return out
@@ -399,7 +432,8 @@ class WARP(eqx.Module):
             # theta_mu, theta_scale = jnp.split(theta, 2, axis=-1)
             # theta_scaled = self.theta_base*(1+theta_scale) + theta_mu
 
-            thetas_frame = jnp.tile(theta, (H*W, 1))
+            # thetas_frame = jnp.tile(theta, (H*W, 1))
+            thetas_frame = jnp.tile(theta+self.theta_base, (H*W, 1))
             pred_flat = self.render_pixels(thetas_frame, flat_coords)
 
             if CONFIG["use_nll_loss"]:
@@ -415,6 +449,7 @@ class WARP(eqx.Module):
             is_last = (i == self.num_layers - 1)
             if is_last and self.use_hypernet and self.hypernet_phi is not None:
                 h_inits.append(self.hypernet_phi(jnp.transpose(init_frame, (2, 0, 1))))
+                # h_inits.append(self.hypernet_phi(jnp.transpose(init_frame, (2, 0, 1))) + self.theta_base)
             elif is_last:
                 h_inits.append(self.theta_base)
             else:
@@ -480,18 +515,28 @@ class WARP(eqx.Module):
                 is_context = t_ratio <= inf_context_ratio
                 is_forced = jax.random.bernoulli(subk, p_forcing)
                 use_gt = jnp.logical_or(is_context, is_forced)
-                
+
                 frame_t = jnp.where(use_gt, gt_curr_frame, pred_frame_sample)
 
                 # 3. Input computation for Layer 1
                 dx0 = frame_t - prev_frame_selected
                 if self.use_controlnet and self.controlnet_psi is not None:
                     # dx_feat = self.controlnet_psi(jnp.transpose(dx0, (2, 0, 1)))
+
                     concat = jnp.concatenate([frame_t, prev_frame_selected], axis=-1)
                     dx_feat = self.controlnet_psi(jnp.transpose(concat, (2, 0, 1)))
+
+                    # ft_feats = self.controlnet_psi(jnp.transpose(frame_t, (2, 0, 1)))
+                    # ps_feats = self.controlnet_psi(jnp.transpose(prev_frame_selected, (2, 0, 1)))
+                    # dx_feat = ft_feats - ps_feats
                 else:
                     # dx_feat = dx0.flatten() / jnp.sqrt(dx0.size)
                     dx_feat = dx0.flatten()
+
+                    # ft_feats = self.hypernet_phi(jnp.transpose(frame_t, (2, 0, 1)))
+                    # ps_feats = self.hypernet_phi(jnp.transpose(prev_frame_selected, (2, 0, 1)))
+                    # dx_feat = jnp.concatenate([ft_feats, ps_feats], axis=-1)
+
 
                 # 4. Deep Linear Recurrence cascade (Precomputing differences inline)
                 new_h_states = []
@@ -499,7 +544,15 @@ class WARP(eqx.Module):
                 
                 for i, layer in enumerate(self.rnn_layers):
                     h_prev = h_states[i]
-                    h_next = layer.A @ h_prev + layer.B @ curr_dx
+
+                    # h_next = layer.A @ h_prev + layer.B @ curr_dx
+
+                    h_next = layer.A(h_prev) + layer.B(curr_dx)
+
+                    # h_next = layer.B @ curr_dx
+
+                    # h_next = layer.A @ h_prev + layer.B @ ft_feats - layer.C @ ps_feats
+
                     # h_next = jax.nn.tanh(layer.A @ h_prev + layer.B @ curr_dx)
                     new_h_states.append(h_next)
                     
@@ -616,7 +669,8 @@ if TRAIN:
         # for batch_idx, batch_videos in enumerate(pbar):
         for batch_idx, batch_videos in enumerate(train_loader):
             key, subkey = jax.random.split(key)
-            batch_keys = jax.random.split(subkey, CONFIG["batch_size"])
+            # batch_keys = jax.random.split(subkey, CONFIG["batch_size"])
+            batch_keys = jax.random.split(subkey, batch_videos.shape[0])
             
             model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, CONFIG["p_forcing"])
             epoch_losses.append(loss)
@@ -644,7 +698,8 @@ if TRAIN:
 
         ## Generate intermediate visualizations at the end of each epoch
         if (epoch+1) % (max(CONFIG["nb_epochs"]//10, 1)) == 0:
-            val_keys = jax.random.split(key, CONFIG["batch_size"])
+            # val_keys = jax.random.split(key, CONFIG["batch_size"])
+            val_keys = jax.random.split(key, sample_batch.shape[0])
             # Evaluate using standard autoregressive behavior
             val_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
             plot_pred_ref_videos_rollout(val_videos[0], 
@@ -723,12 +778,12 @@ plt.savefig(plots_path / "recurrence_matrix_A.png")
 plt.show()
 
 #%%
-sample_batch = next(iter(train_loader))
+# sample_batch = next(iter(train_loader))
 
-# ## sample a batch from the test_loader (create it first)
-# testing_subset = datasets.MovingMNIST(root=data_path, split="test", download=True)
-# test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=True)
-# sample_batch = next(iter(test_loader))
+## sample a batch from the test_loader (create it first)
+testing_subset = datasets.MovingMNIST(root=data_path, split="test", download=True)
+test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=True)
+sample_batch = next(iter(test_loader))
 
 # print(f"Sample batch shape for inference: {sample_batch.shape}")
 
@@ -737,18 +792,23 @@ pad_length = 20 - sample_batch.shape[1]
 sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)
 
 # Run inference utilizing the newly embedded `__call__` interface (handles batched transparently)
-val_keys = jax.random.split(key, CONFIG["batch_size"])
+val_keys = jax.random.split(key, sample_batch.shape[0])
 final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.5, precompute_ref_diffs=False)
 
 ## Print Min and Max pixel values
-print(f"Final Predicted Video Mean Pixel Value Range: min={final_videos[...,:C].min():.4f}, max={final_videos[...,:C].max():.4f}")
-print(f"Final Predicted Video Std Pixel Value Range: min={final_videos[...,C:].min():.4f}, max={final_videos[...,C:].max():.4f}")
+if CONFIG["use_nll_loss"]:
+    print(f"Final Predicted Video Mean Pixel Value Range: min={final_videos[...,:C].min():.4f}, max={final_videos[...,:C].max():.4f}")
+    print(f"Final Predicted Video Std Pixel Value Range: min={final_videos[...,C:].min():.4f}, max={final_videos[...,C:].max():.4f}")
 
+#%%
 test_seq_id = np.random.randint(0, sample_batch.shape[0])
 
 plot_pred_ref_videos_rollout(
-    final_videos[test_seq_id,...,:C], 
-    sample_batch[test_seq_id,...,:C],
+    final_videos[test_seq_id], 
+    sample_batch[test_seq_id],
     title=f"Pred", 
     save_name="inference_forecast_rollout.png"
 )
+
+# %%
+# Next idea: Turn the B space intot he weight-space. This means the controlnet is the hypernet and that's it!

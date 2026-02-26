@@ -22,3 +22,5 @@ torch/checkpoints/*
 
 latent_action_models/data/*
 latent_action_models/experiments/*
+
+*.log
