@@ -36,7 +36,7 @@ def count_trainable_params(model):
 TRAIN = True
 RUN_DIR = "./" if not TRAIN else None
 
-SINGLE_BATCH = False
+SINGLE_BATCH = True
 USE_NLL_LOSS = False
 
 CONFIG = {
@@ -59,6 +59,11 @@ CONFIG = {
     "num_layers": 1,
     "use_hypernet": True,
     "use_controlnet": True,
+
+    # --- Architecture Params ---
+    "dynamics_space": 128,
+    "lam_space": 32,
+    "split_forward": True,
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 500,      
@@ -105,7 +110,7 @@ def numpy_collate(batch):
         videos = np.expand_dims(videos, axis=-1)
     elif videos.ndim == 5 and videos.shape[2] == 1:
         videos = np.transpose(videos, (0, 1, 3, 4, 2))
-        
+
     videos = videos.astype(np.float32)
     if videos.max() > 2.0:
         videos = videos / 255.0
@@ -307,301 +312,218 @@ class LinearRNNLayer(eqx.Module):
 
         # self.C = jnp.zeros((out_dim, in_dim))  # Not used in this version, but reserved for potential FiLM conditioning
 
+#%% Cell 3: Model Definition
+class CNNEncoder(eqx.Module):
+    layers: list
+
+    def __init__(self, in_channels, out_dim, spatial_shape, key, hidden_width=16, depth=3):
+        H, W = spatial_shape
+        keys = jax.random.split(key, depth + 1)
+        
+        conv_layers = []
+        current_in = in_channels
+        current_out = hidden_width
+        
+        for i in range(depth):
+            conv_layers.append(
+                eqx.nn.Conv2d(current_in, current_out, kernel_size=3, stride=2, padding=1, key=keys[i])
+            )
+            current_in = current_out
+            current_out *= 2
+            
+        # Compute flattened dimension
+        h_small = H // (2**depth)
+        w_small = W // (2**depth)
+        flat_dim = current_in * h_small * w_small
+        
+        self.layers = conv_layers + [eqx.nn.Linear(flat_dim, out_dim, key=keys[depth])]
+        
+    def __call__(self, x):
+        for layer in self.layers[:-1]:
+            x = jax.nn.relu(layer(x))
+        x = x.reshape(-1)
+        x = self.layers[-1](x)
+        return x
+
+class CNNDecoder(eqx.Module):
+    fc: eqx.nn.Linear
+    deconv_layers: list
+    hidden_width: int
+    h_small: int
+    w_small: int
+
+    def __init__(self, in_dim, out_channels, spatial_shape, key, hidden_width=16, depth=3):
+        H, W = spatial_shape
+        self.hidden_width = hidden_width * (2 ** (depth - 1))
+        self.h_small = H // (2 ** depth)
+        self.w_small = W // (2 ** depth)
+
+        keys = jax.random.split(key, depth + 1)
+        self.fc = eqx.nn.Linear(in_dim, self.hidden_width * self.h_small * self.w_small, key=keys[0])
+
+        layers = []
+        current_in = self.hidden_width
+        for i in range(depth):
+            current_out = current_in // 2 if i < depth - 1 else out_channels
+            layers.append(
+                eqx.nn.ConvTranspose2d(current_in, current_out, kernel_size=4, stride=2, padding=1, key=keys[i+1])
+            )
+            current_in = current_out
+        self.deconv_layers = layers
+
+    def __call__(self, z):
+        x = jax.nn.relu(self.fc(z))
+        x = x.reshape(self.hidden_width, self.h_small, self.w_small)
+        for i, layer in enumerate(self.deconv_layers):
+            x = layer(x)
+            if i < len(self.deconv_layers) - 1:
+                x = jax.nn.relu(x)
+        return x
+
+class LAM(eqx.Module):
+    mlp: eqx.nn.MLP
+    def __init__(self, dyn_dim, lam_dim, key):
+        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim, depth=2, key=key)
+        
+    def __call__(self, z_prev, z_target):
+        return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
+
+class ForwardDynamics(eqx.Module):
+    mlp_A: Optional[eqx.nn.MLP]
+    mlp_B: Optional[eqx.nn.MLP]
+    giant_mlp: Optional[eqx.nn.MLP]
+    split_forward: bool = eqx.field(static=True)
+
+    def __init__(self, dyn_dim, lam_dim, split_forward, key):
+        self.split_forward = split_forward
+        k1, k2, k3 = jax.random.split(key, 3)
+        if split_forward:
+            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k1)
+            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k2)
+            self.giant_mlp = None
+        else:
+            self.mlp_A = None
+            self.mlp_B = None
+            self.giant_mlp = eqx.nn.MLP(dyn_dim + lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k3)
+
+    def __call__(self, z_prev, a):
+        if self.split_forward:
+            return self.mlp_A(z_prev) + self.mlp_B(a)
+        else:
+            return self.giant_mlp(jnp.concatenate([z_prev, a], axis=-1))
 
 class WARP(eqx.Module):
-    rnn_layers: list
-    theta_base: jax.Array
-    hypernet_phi: Optional[CNNEncoder]
-    controlnet_psi: Optional[CNNEncoder]
-
-    use_hypernet: bool = eqx.field(static=True)
-    use_controlnet: bool = eqx.field(static=True)
-    num_layers: int = eqx.field(static=True)
-    root_structure: RootMLP = eqx.field(static=True)
-    unravel_fn: callable = eqx.field(static=True)
-    d_theta: int = eqx.field(static=True)
-    num_freqs: int = eqx.field(static=True)
+    encoder: CNNEncoder
+    decoder: CNNDecoder
+    lam: LAM
+    forward_dyn: ForwardDynamics
+    dyn_dim: int = eqx.field(static=True)
+    lam_dim: int = eqx.field(static=True)
     frame_shape: tuple = eqx.field(static=True)
+    split_forward: bool = eqx.field(static=True)
 
-    def __init__(self, root_width, root_depth, num_freqs, frame_shape, num_layers, use_hypernet, use_controlnet, key):
-        k_root, k_rnn, k_phi, k_psi = jax.random.split(key, 4)
-        self.num_freqs = num_freqs
-        self.frame_shape = frame_shape
-        self.num_layers = num_layers
-        self.use_hypernet = use_hypernet
-        self.use_controlnet = use_controlnet
+    def __init__(self, frame_shape, dyn_dim, lam_dim, split_forward, key):
+        k1, k2, k3, k4 = jax.random.split(key, 4)
         H, W, C = frame_shape
+        self.frame_shape = frame_shape
+        self.dyn_dim = dyn_dim
+        self.lam_dim = lam_dim
+        self.split_forward = split_forward
 
-        coord_dim = 2 + 2 * 2 * num_freqs 
-        root_out_dim = C * 2 if CONFIG["use_nll_loss"] else C
-        template_root = RootMLP(coord_dim, root_out_dim, root_width, root_depth, k_root)
-
-        flat_params, self.unravel_fn = ravel_pytree(template_root)
-        self.d_theta = flat_params.shape[0]
-        self.root_structure = template_root
-        self.theta_base = flat_params
-
-        if use_hypernet:
-            self.hypernet_phi = CNNEncoder(in_channels=C, out_dim=self.d_theta*1, spatial_shape=(H, W), key=k_phi, hidden_width=64, depth=4)
-
-            ## Initialise the weight and biases at zero
-            # self.hypernet_phi = jax.tree_map(lambda x: jnp.zeros_like(x), self.hypernet_phi)
-            # self.hypernet_phi = jax.tree_map(lambda x: x*0.001, self.hypernet_phi)
-
-        else:
-            self.hypernet_phi = None
-
-        # ## TODO: the B space is the weight space:
-        # CONFIG["rec_feat_dim"] = self.d_theta*2
-
-        if use_controlnet:
-            self.controlnet_psi = CNNEncoder(in_channels=C*2, out_dim=CONFIG["rec_feat_dim"], spatial_shape=(H, W), key=k_psi, hidden_width=32, depth=3)
-            in_dim = CONFIG["rec_feat_dim"]
-        else:
-            self.controlnet_psi = None
-            in_dim = H * W * C * 1
-            
-        rnn_layers = []
-        keys = jax.random.split(k_rnn, num_layers)
-
-        if num_layers == 1:
-            rnn_layers.append(LinearRNNLayer(in_dim, self.d_theta, keys[0]))
-        else:
-            # First layer
-            rnn_layers.append(LinearRNNLayer(in_dim, CONFIG["rec_feat_dim"], keys[0]))
-            # Intermediate layers
-            for i in range(1, num_layers - 1):
-                rnn_layers.append(LinearRNNLayer(CONFIG["rec_feat_dim"], CONFIG["rec_feat_dim"], keys[i]))
-            # Last layer maps strictly back into weight space
-            rnn_layers.append(LinearRNNLayer(CONFIG["rec_feat_dim"], self.d_theta, keys[-1]))
-
-        self.rnn_layers = rnn_layers
+        self.encoder = CNNEncoder(in_channels=C, out_dim=dyn_dim, spatial_shape=(H, W), key=k1)
+        self.decoder = CNNDecoder(in_dim=dyn_dim, out_channels=C*2 if CONFIG["use_nll_loss"] else C, spatial_shape=(H, W), key=k2)
+        self.lam = LAM(dyn_dim, lam_dim, key=k3)
+        self.forward_dyn = ForwardDynamics(dyn_dim, lam_dim, split_forward, key=k4)
 
     @property
     def A(self):
-        """Property to keep evaluation/plotting code transparently compatible."""
-        return self.rnn_layers[-1].A if type(self.rnn_layers[-1].A) == jnp.ndarray else self.rnn_layers[-1].A.layers[-1].weight
+        """Maintains compatibility with your Cell 5 visualisation."""
+        if self.split_forward:
+            return self.forward_dyn.mlp_A.layers[-1].weight
+        else:
+            return self.forward_dyn.giant_mlp.layers[-1].weight
 
-    @property
-    def B(self):
-        return self.rnn_layers[-1].B if type(self.rnn_layers[-1].B) == jnp.ndarray else self.rnn_layers[-1].B.layers[-1].weight
-
-    def render_pixels(self, thetas, coords):
-        def render_pt(theta, coord):
-            root = self.unravel_fn(theta)
-            encoded_coord = fourier_encode(coord, self.num_freqs)
-            out = root(encoded_coord)
-            
-            # gray_fg = jax.nn.sigmoid(out[0:1])
-            # gray_bg = jax.nn.sigmoid(out[1:2])
-            # alpha   = jax.nn.sigmoid(out[2:3])
-
-            # gray_fg = out[0:1]
-            # gray_bg = out[1:2]
-
-            # ## Alpha should be hard thresholded to encourage more discrete rendering and reduce blurriness
-            # alpha = jax.nn.sigmoid(out[2:3])
-
-            # return alpha * gray_fg + (1.0 - alpha) * gray_bg
-
-            # return out[0:1]
-            
-            # return out
-
-            if CONFIG["use_nll_loss"]:
-                mean, std = out[:C], out[C:]
-                # std = jnp.clip(std, 1e-4, 10.0)
-                # std = jnp.maximum(jax.nn.softplus(std), 1e-4)
-                # std = jnp.maximum(jax.nn.softplus(std), 0.5)
-                # std = jnp.maximum(std, 0.5)
-                # std = jax.nn.relu(std) + 1e-4
-                std = jax.nn.softplus(std) + 1e-4
-                return jnp.concatenate([mean, std], axis=-1)
-            else:
-                return out
-
-        return jax.vmap(render_pt)(thetas, coords)
-
-    def _get_thetas_and_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio, precompute_ref_diffs=False):
-        H, W, C = self.frame_shape
-        flat_coords = coords_grid.reshape(-1, 2)
+    def _get_preds_single(self, ref_video, p_forcing, key, inf_context_ratio):
         T = ref_video.shape[0]
+        H, W, C = self.frame_shape
         init_frame = ref_video[0]
 
-        # Shared Rendering function
-        def render_frame(theta):
-            # ## split and compute theta with the FiLM projection
-            # theta_mu, theta_scale = jnp.split(theta, 2, axis=-1)
-            # theta_scaled = self.theta_base*(1+theta_scale) + theta_mu
+        # 1. Initialize abstract state from the very first frame
+        z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
 
-            # thetas_frame = jnp.tile(theta, (H*W, 1))
-            thetas_frame = jnp.tile(theta+self.theta_base, (H*W, 1))
-            pred_flat = self.render_pixels(thetas_frame, flat_coords)
+        def scan_step(z_prev, scan_inputs):
+            gt_curr_frame, step_idx = scan_inputs
+            k = jax.random.fold_in(key, step_idx)
+            k, subk = jax.random.split(k)
+
+            # 2. Encode ground truth next frame
+            z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
+
+            # 3. Model's own prediction of the next latent space (Assumes null action)
+            z_next_base = self.forward_dyn(z_prev, jnp.zeros(self.lam_dim))
+
+            # 4. Coin flip logic
+            t_ratio = step_idx / (T - 1)
+            is_context = t_ratio <= inf_context_ratio
+            is_forced = jax.random.bernoulli(subk, p_forcing)
+            use_gt = jnp.logical_or(is_context, is_forced)
+
+            # 5. Decide target representation for LAM
+            z_target = jnp.where(use_gt, z_next_gt, z_next_base)
+
+            # 6. Predict action
+            a_t = self.lam(z_prev, z_target)
+
+            # 7. Step forward in latent space
+            z_next = self.forward_dyn(z_prev, a_t)
+
+            # 8. Decode to pixels
+            pred_out = self.decoder(z_next)
+            pred_out = jnp.transpose(pred_out, (1, 2, 0))
 
             if CONFIG["use_nll_loss"]:
-                # pred_means, pred_stds = pred_flat[:, :C], jax.nn.softplus(pred_flat[:, C:])
-                # pred_flat = pred_means.reshape(H, W, C)
-                return pred_flat.reshape(H, W, C*2)
-            else:
-                return pred_flat.reshape(H, W, C)
+                mean, std = pred_out[..., :C], pred_out[..., C:]
+                std = jax.nn.softplus(std) + 1e-4
+                pred_out = jnp.concatenate([mean, std], axis=-1)
 
-        # Shared Initialization of multi-layer hidden states
-        h_inits = []
-        for i in range(self.num_layers):
-            is_last = (i == self.num_layers - 1)
-            if is_last and self.use_hypernet and self.hypernet_phi is not None:
-                h_inits.append(self.hypernet_phi(jnp.transpose(init_frame, (2, 0, 1))))
-                # h_inits.append(self.hypernet_phi(jnp.transpose(init_frame, (2, 0, 1))) + self.theta_base)
-            elif is_last:
-                h_inits.append(self.theta_base)
-            else:
-                h_inits.append(jnp.zeros(self.rnn_layers[i].B.shape[0]))
+            return z_next, pred_out
 
-        if precompute_ref_diffs:
-            # ==========================================================
-            # FAST PATH: Decoupled Sequence Scans (No Autoregressive Rendering)
-            # ==========================================================
-            shifted_ref_video = jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0)
-            dx_frames = shifted_ref_video - ref_video
-            
-            if self.use_controlnet and self.controlnet_psi is not None:
-                dx_feats = jax.vmap(self.controlnet_psi)(jnp.transpose(dx_frames, (0, 3, 1, 2)))
-            else:
-                dx_feats = dx_frames.reshape(T, -1) / jnp.sqrt(H * W * C)
+        # Match old sequence length behavior
+        scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
+        _, pred_video = jax.lax.scan(scan_step, z_init, scan_inputs)
 
-            curr_input_seq = dx_feats
-            
-            for i, layer in enumerate(self.rnn_layers):
-                is_last = (i == self.num_layers - 1)
-                h_init = h_inits[i]
-                
-                def fast_scan(h, dx):
-                    h_next = layer.A @ h + layer.B @ dx
-                    return h_next, h_next
-
-                _, h_seq = jax.lax.scan(fast_scan, h_init, curr_input_seq)
-
-                if not is_last:
-                    # Precompute the sequential differences for the next layer
-                    h_seq_prev = jnp.concatenate([h_init[None, ...], h_seq[:-1]], axis=0)
-                    curr_input_seq = h_seq - h_seq_prev
-                else:
-                    final_thetas = jnp.concatenate([h_init[None, ...], h_seq[:-1]], axis=0)
-
-            pred_video = jax.vmap(render_frame)(final_thetas)
-            return pred_video
-
-        else:
-            # ==========================================================
-            # DEFAULT PATH: True Autoregressive Step-by-Step Scan
-            # ==========================================================
-            def scan_step(state, scan_inputs):
-                gt_curr_frame, step_idx = scan_inputs
-                h_states, prev_frame_selected, k = state
-                k, subk = jax.random.split(k)
-
-                # 1. Render the prediction for the CURRENT step from the LAST layer (theta)
-                theta = h_states[-1]
-                pred_frame = render_frame(theta)
-
-                if CONFIG["use_nll_loss"]:
-                    # pred_frame_mean, pred_frame_std = pred_frame[..., :C], jax.nn.softplus(pred_frame[..., C:])
-                    pred_frame_mean, pred_frame_std = pred_frame[..., :C], pred_frame[..., C:]
-                    pred_frame_sample = pred_frame_mean + pred_frame_std * jax.random.normal(subk, pred_frame_mean.shape)
-                    prev_frame_selected = prev_frame_selected[:, :, :C]
-                else:
-                    pred_frame_sample = pred_frame
-
-                # 2. First Layer Coin Flip
-                t_ratio = step_idx / (T - 1)
-                is_context = t_ratio <= inf_context_ratio
-                is_forced = jax.random.bernoulli(subk, p_forcing)
-                use_gt = jnp.logical_or(is_context, is_forced)
-
-                frame_t = jnp.where(use_gt, gt_curr_frame, pred_frame_sample)
-
-                # 3. Input computation for Layer 1
-                dx0 = frame_t - prev_frame_selected
-                if self.use_controlnet and self.controlnet_psi is not None:
-                    # dx_feat = self.controlnet_psi(jnp.transpose(dx0, (2, 0, 1)))
-
-                    concat = jnp.concatenate([frame_t, prev_frame_selected], axis=-1)
-                    dx_feat = self.controlnet_psi(jnp.transpose(concat, (2, 0, 1)))
-
-                    # ft_feats = self.controlnet_psi(jnp.transpose(frame_t, (2, 0, 1)))
-                    # ps_feats = self.controlnet_psi(jnp.transpose(prev_frame_selected, (2, 0, 1)))
-                    # dx_feat = ft_feats - ps_feats
-                else:
-                    # dx_feat = dx0.flatten() / jnp.sqrt(dx0.size)
-                    dx_feat = dx0.flatten()
-
-                    # ft_feats = self.hypernet_phi(jnp.transpose(frame_t, (2, 0, 1)))
-                    # ps_feats = self.hypernet_phi(jnp.transpose(prev_frame_selected, (2, 0, 1)))
-                    # dx_feat = jnp.concatenate([ft_feats, ps_feats], axis=-1)
-
-
-                # 4. Deep Linear Recurrence cascade (Precomputing differences inline)
-                new_h_states = []
-                curr_dx = dx_feat
-                
-                for i, layer in enumerate(self.rnn_layers):
-                    h_prev = h_states[i]
-
-                    # h_next = layer.A @ h_prev + layer.B @ curr_dx
-
-                    h_next = layer.A(h_prev) + layer.B(curr_dx)
-
-                    # h_next = layer.B @ curr_dx
-
-                    # h_next = layer.A @ h_prev + layer.B @ ft_feats - layer.C @ ps_feats
-
-                    # h_next = jax.nn.tanh(layer.A @ h_prev + layer.B @ curr_dx)
-                    new_h_states.append(h_next)
-                    
-                    # Precompute difference from this layer to act as the pure linear input for the next layer
-                    curr_dx = h_next - h_prev
-                
-                new_state = (new_h_states, frame_t, subk)
-                # new_state = (new_h_states, gt_curr_frame, subk)
-                return new_state, pred_frame
-
-            init_state = (h_inits, init_frame, key)
-            scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
-            _, pred_video = jax.lax.scan(scan_step, init_state, scan_inputs)
-
-            return pred_video
+        return pred_video
 
     def __call__(self, ref_videos, p_forcing, keys, coords_grid, inf_context_ratio, precompute_ref_diffs=False):
+        # coords_grid and precompute_ref_diffs are ignored as they apply to the old weight-space model
         is_single = (ref_videos.ndim == 4)
         if is_single:
             ref_videos = ref_videos[None, ...]
             keys = keys[None, ...] if keys.ndim == 1 else keys
             
-        batched_fn = jax.vmap(self._get_thetas_and_preds_single, in_axes=(0, None, 0, None, None, None))
-        preds = batched_fn(ref_videos, p_forcing, keys, coords_grid, inf_context_ratio, precompute_ref_diffs)
+        batched_fn = jax.vmap(self._get_preds_single, in_axes=(0, None, 0, None))
+        preds = batched_fn(ref_videos, p_forcing, keys, inf_context_ratio)
         
         if is_single:
             return preds[0]
         return preds
 
-
 @eqx.filter_jit
 def evaluate(m, batch, p_forcing, keys, coords, context_ratio, precompute_ref_diffs=False):
     return m(batch, p_forcing, keys, coords, context_ratio, precompute_ref_diffs)
+
+
 
 #%% Cell 4: Initialization & Training/Loading Logic
 key, subkey = jax.random.split(key)
 
 # Pass the new hyperparameters into WARP initialization
 model = WARP(
-    CONFIG["root_width"], 
-    CONFIG["root_depth"], 
-    CONFIG["num_fourier_freqs"], 
-    (H, W, C), 
-    CONFIG["num_layers"],
-    CONFIG["use_hypernet"],
-    CONFIG["use_controlnet"],
-    subkey
+    frame_shape=(H, W, C), 
+    dyn_dim=CONFIG["dynamics_space"], 
+    lam_dim=CONFIG["lam_space"],
+    split_forward=CONFIG["split_forward"],
+    key=subkey
 )
 A_init = model.A.copy()
 
