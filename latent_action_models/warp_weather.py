@@ -166,7 +166,7 @@ def numpy_collate(batch):
 
 print("Loading WeatherBench Dataset...")
 try:
-    data_path = './data/WeatherBench/2m_temperature'
+    data_path = './data/WeatherBench/2m_temperature' if TRAIN else '../../data/WeatherBench/2m_temperature'
     train_dataset = WeatherBenchTemperature(data_path=data_path, split="train", download=False, seq_len=CONFIG["seq_len"])
     
     if SINGLE_BATCH:
@@ -202,7 +202,8 @@ def sbimshow(img, title="", ax=None, vmin=None, vmax=None):
 
 def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=None):
     nb_frames = video.shape[0]
-    vmin, vmax = get_vmin_vmax(video[..., :C], ref_video[..., :C])
+    # vmin, vmax = get_vmin_vmax(video[..., :C], ref_video[..., :C])
+    vmin, vmax = get_vmin_vmax(ref_video[..., :C], ref_video[..., :C])
 
     if video.shape[-1] == 1:
         fig, axes = plt.subplots(2, 1+(nb_frames//2), figsize=(20, 5))
@@ -226,7 +227,8 @@ def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=Non
 def animate_side_by_side(pred_video, ref_video, title="Prediction vs Ground Truth", interval=200):
     """HTML5 video for Predicted vs Reference Weather Sequences."""
     seq_len = pred_video.shape[0]
-    vmin, vmax = get_vmin_vmax(pred_video[..., :C], ref_video[..., :C])
+    # vmin, vmax = get_vmin_vmax(pred_video[..., :C], ref_video[..., :C])
+    vmin, vmax = get_vmin_vmax(ref_video[..., :C], ref_video[..., :C])
     
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), dpi=120)
     
@@ -627,7 +629,7 @@ plt.show()
 #%% Cell 6: Testing & Animations
 
 test_dataset = WeatherBenchTemperature(
-    data_path="./data/WeatherBench/2m_temperature", 
+    data_path=data_path, 
     split="test", 
     download=False, 
     seq_len=CONFIG["seq_len"],

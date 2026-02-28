@@ -52,7 +52,7 @@ CONFIG = {
     "seed": 2026,
     "nb_epochs": 1,
     "print_every": 1,
-    "batch_size": 2 if SINGLE_BATCH else 16, # Lowered for WeatherBench memory footprint
+    "batch_size": 2 if SINGLE_BATCH else 64,
     "learning_rate": 1e-7 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
@@ -173,7 +173,7 @@ def numpy_collate(batch):
 
 print("Loading WeatherBench Dataset...")
 try:
-    data_path = './data/WeatherBench/2m_temperature'
+    data_path = './data/WeatherBench/2m_temperature' if TRAIN else "../../data/WeatherBench/2m_temperature"
     train_dataset = WeatherBenchTemperature(data_path=data_path, split="train", download=False, seq_len=CONFIG["seq_len"])
     
     if SINGLE_BATCH:
@@ -228,7 +228,8 @@ def plot_pred_ref_videos(video, ref_video, title="Render", save_name=None):
 
 def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=None):
     nb_frames = video.shape[0]
-    vmin, vmax = get_vmin_vmax(video[..., :C], ref_video[..., :C])
+    # vmin, vmax = get_vmin_vmax(video[..., :C], ref_video[..., :C])
+    vmin, vmax = get_vmin_vmax(ref_video[..., :C], ref_video[..., :C])
 
     if video.shape[-1] == 1:
         fig, axes = plt.subplots(2, 1+(nb_frames//2), figsize=(20, 6))
@@ -253,7 +254,8 @@ def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=Non
 def animate_side_by_side(pred_video, ref_video, title="Prediction vs Ground Truth", interval=200):
     """HTML5 video for Predicted vs Reference Weather Sequences."""
     seq_len = pred_video.shape[0]
-    vmin, vmax = get_vmin_vmax(pred_video[..., :C], ref_video[..., :C])
+    # vmin, vmax = get_vmin_vmax(pred_video[..., :C], ref_video[..., :C])
+    vmin, vmax = get_vmin_vmax(ref_video[..., :C], ref_video[..., :C])
     
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), dpi=120)
     
@@ -574,8 +576,8 @@ if TRAIN:
         epoch_losses = []
         
         # for batch_idx, batch_videos in enumerate(train_loader):
-        pbar = tqdm(enumerate(train_loader))
-        for batch_idx, batch_videos in pbar:
+        pbar = tqdm(train_loader)
+        for batch_idx, batch_videos in enumerate(pbar):
             key, subkey = jax.random.split(key)
             batch_keys = jax.random.split(subkey, batch_videos.shape[0])
             
@@ -669,7 +671,7 @@ plt.show()
 
 #%% Cell 6: Testing & Animations
 test_dataset = WeatherBenchTemperature(
-    data_path="./data/WeatherBench/2m_temperature", 
+    data_path=data_path, 
     split="test", 
     download=False, 
     seq_len=CONFIG["seq_len"],
