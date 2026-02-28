@@ -40,7 +40,7 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 400,
+    "nb_epochs": 250,
     "print_every": 1,
     "batch_size": 2 if SINGLE_BATCH else 32,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
@@ -48,6 +48,8 @@ CONFIG = {
     "inf_context_ratio": 0.5,
     "nb_loss_steps_full": 20,
     "use_nll_loss": USE_NLL_LOSS,
+    "aux_encoder_loss": False,
+    "aux_loss_weight": 0.1,
 
     # --- Architecture Params ---
     "lam_space": 64,
@@ -367,6 +369,9 @@ class WARP(eqx.Module):
     #         k = jax.random.fold_in(key, step_idx)
     #         k, subk = jax.random.split(k)
 
+    #         # Render pixels explicitly using our helper
+    #         pred_out = self.render_frame(z_prev, coords_grid)
+
     #         z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
     #         z_next_base = self.forward_dyn(z_prev, jnp.zeros(self.lam_dim))     ## TODO: zero action means continue dynamics without forcing towards GT
 
@@ -378,9 +383,6 @@ class WARP(eqx.Module):
     #         z_target = jnp.where(use_gt, z_next_gt, z_next_base)
     #         a_t = self.lam(z_prev, z_target)
     #         z_next = self.forward_dyn(z_prev, a_t)
-
-    #         # Render pixels explicitly using our helper
-    #         pred_out = self.render_frame(z_next, coords_grid)
 
     #         return z_next, (z_next, pred_out)
 
@@ -469,7 +471,9 @@ count_A = count_trainable_params(model.forward_dyn.mlp_A)
 count_B = count_trainable_params(model.forward_dyn.mlp_B)
 count_lam = count_trainable_params(model.lam)
 count_encoder = count_trainable_params(model.encoder)
+theta_base = count_trainable_params(model.theta_base)
 print(" - in the Encoder:", count_encoder)
+print(" - in the base theta:", theta_base)
 print(" - in the Forward Dynamics A:", count_A)
 print(" - in the Forward Dynamics B:", count_B)
 print(" - in the Inv. Dynamics (LAM):", count_lam)
@@ -498,47 +502,32 @@ if TRAIN:
             # Forward pass: Extract both predicted thetas and rendered pixels
             pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
 
-            # # Encode ground truth to target thetas
-            # ref_videos_enc = jnp.transpose(ref_videos, (0, 1, 4, 2, 3))
-            # target_thetas = jax.vmap(jax.vmap(m.encoder))(ref_videos_enc)
-            # target_thetas_shifted = jnp.concatenate([target_thetas[:, 1:], target_thetas[:, -1:]], axis=1)
-
             # --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
             # latent_loss = jnp.mean((pred_thetas - target_thetas_shifted)**2)
             latent_loss = jnp.mean((pred_videos - ref_videos)**2)
 
-            # # --- 2. AUTOENCODING LOSS (Auxiliary) ---
-            # ae_loss = 0.0
-            # if CONFIG["ae_loss_type"] == "encdec":
-            #     # Render Target Thetas -> Match GT Pixels
-            #     # We vmap our fast render_frame function across Batches and Time steps
-            #     batched_render = jax.vmap(jax.vmap(lambda theta: m.render_frame(theta, coords_grid)))
-            #     decoded_pixels = batched_render(target_thetas_shifted)
-                
-            #     # Shift reference pixels to align with predicted future steps
-            #     shifted_gt = jnp.concatenate([ref_videos[:, 1:], ref_videos[:, -1:]], axis=1)
+            # --- 2. AUTOENCODING LOSS (Auxiliary) ---
+            if CONFIG["aux_encoder_loss"]:
 
-            #     if CONFIG["use_nll_loss"]:
-            #         decoded_mean = decoded_pixels[..., :C]
-            #         ae_loss = jnp.mean((decoded_mean - shifted_gt)**2)
-            #     else:
-            #         ae_loss = jnp.mean((decoded_pixels - shifted_gt)**2)
+                # Encode ground truth to target thetas
+                ref_videos_enc = jnp.transpose(ref_videos, (0, 1, 4, 2, 3))
+                target_thetas = jax.vmap(jax.vmap(m.encoder))(ref_videos_enc)
 
-            # elif CONFIG["ae_loss_type"] == "decenc":
-            #     # Pred Videos (already rendered via pred_thetas) -> Encode -> Match Pred Thetas
-            #     if CONFIG["use_nll_loss"]:
-            #         decoded_mean = pred_videos[..., :C]
-            #     else:
-            #         decoded_mean = pred_videos
-                
-            #     # Format to (B, T, C, H, W) for encoder
-            #     decoded_mean_enc = jnp.transpose(decoded_mean, (0, 1, 4, 2, 3))
-            #     re_encoded_thetas = jax.vmap(jax.vmap(m.encoder))(decoded_mean_enc)
-            #     ae_loss = jnp.mean((re_encoded_thetas - jax.lax.stop_gradient(pred_thetas))**2)
+                # Render Target Thetas -> Match GT Pixels
+                # We vmap our fast render_frame function across Batches and Time steps
+                batched_render = jax.vmap(jax.vmap(lambda theta: m.render_frame(theta, coords_grid)))
+                decoded_pixels = batched_render(target_thetas)
 
-            # total_loss = latent_loss + CONFIG["ae_loss_weight"] * ae_loss
+                if CONFIG["use_nll_loss"]:
+                    decoded_mean = decoded_pixels[..., :C]
+                    ae_loss = jnp.mean((decoded_mean - target_thetas)**2)
+                else:
+                    ae_loss = jnp.mean((decoded_pixels - target_thetas)**2)
+            else:
+                ae_loss = 0.0
 
-            total_loss = latent_loss
+            total_loss = latent_loss + CONFIG["aux_loss_weight"] * ae_loss
+
             return total_loss
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
@@ -675,7 +664,7 @@ plt.show()
 # testing_subset = datasets.MovingMNIST(root=data_path, split="test", download=True)
 
 testing_subset = MovingMNISTDataset(test_arrays)
-test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=numpy_collate, drop_last=False)
+test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=False)
 sample_batch = next(iter(test_loader))
 
 # sample_batch = next(iter(train_loader))

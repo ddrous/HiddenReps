@@ -36,24 +36,20 @@ def count_trainable_params(model):
 TRAIN = True
 RUN_DIR = "./" if not TRAIN else None
 
-SINGLE_BATCH = True
+SINGLE_BATCH = False
 USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 250,
+    "nb_epochs": 100,
     "print_every": 1,
     "batch_size": 1 if SINGLE_BATCH else 32,
-    "learning_rate": 1e-7 if USE_NLL_LOSS else 1e-5,
-    "p_forcing": 0.5,
+    "learning_rate": 1e-7 if USE_NLL_LOSS else 1e-4,
+    "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
-    "nb_loss_steps_full": 20,
-    "nb_loss_steps_init": 20,
-    "rec_feat_dim": 128,
-    "root_width": 12,
-    "root_depth": 5,
-    "num_fourier_freqs": 6,
     "use_nll_loss": USE_NLL_LOSS,
+    "aux_encoder_loss": False,
+    "aux_loss_weight": 0.1,
 
     # --- Architecture Params ---
     "num_layers": 1,
@@ -61,8 +57,8 @@ CONFIG = {
     "use_controlnet": True,
 
     # --- Architecture Params ---
-    "dynamics_space": 128,
-    "lam_space": 32,
+    "dynamics_space": 961,
+    "lam_space": 64,
     "split_forward": True,
 
     # --- Plateau Scheduler Config ---
@@ -71,7 +67,7 @@ CONFIG = {
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
     "lr_accum_size": 5,     
-    "lr_min_scale": 1e-2     
+    "lr_min_scale": 1e-1     
 }
 
 key = jax.random.PRNGKey(CONFIG["seed"])
@@ -123,20 +119,29 @@ def numpy_collate(batch):
 print("Loading Moving MNIST Dataset...")
 try:
     data_path = './data' if TRAIN else '../../data'
-    dataset = datasets.MovingMNIST(root=data_path, split=None, download=True)
-    # sampler = SlidingWindowBatchSampler(
-    #     dataset_size=len(dataset),
-    #     batch_size=CONFIG["batch_size"],
-    #     shuffle=True,       # shuffles the global ordering once per epoch
-    #     drop_last=True,
-    # )
-    # sampler = RepeatingBatchSampler(
-    #     dataset_size=len(dataset),
-    #     batch_size=CONFIG["batch_size"],
-    #     new_batch_every=5,   # each batch is repeated for 5 consecutive steps before
-    #     shuffle=True,       # shuffles the global ordering once per epoch
-    #     drop_last=True,
-    # )
+    # dataset = datasets.MovingMNIST(root=data_path, split=None, download=True)
+
+    ## Manulally load train and test splits to have more control over batching and shuffling
+    mov_mnist_arrays = np.load(data_path + "/MovingMNIST/mnist_test_seq.npy")
+    print(f"Original loaded MovingMNIST shape: {mov_mnist_arrays.shape} (T, N, H, W)")
+    ## SPlit, 8000 train, 2000 test
+    train_arrays = mov_mnist_arrays[:, :8000]
+    test_arrays = mov_mnist_arrays[:, 8000:]
+
+    ## Create PyTorch dataset
+    class MovingMNISTDataset(torch.utils.data.Dataset):
+        def __init__(self, data_array):
+            self.data_array = data_array
+
+        def __len__(self):
+            return self.data_array.shape[1]
+
+        def __getitem__(self, idx):
+            video = self.data_array[:, idx]  # Shape (T, H, W)
+            video = np.expand_dims(video, axis=-1)  # Add channel dimension -> (T, H, W, 1)
+            return torch.from_numpy(video.astype(np.float32))
+
+    dataset = MovingMNISTDataset(train_arrays)
     if SINGLE_BATCH:
         training_subset = Subset(dataset, range(CONFIG["batch_size"]))
         train_loader = DataLoader(
@@ -151,7 +156,7 @@ try:
                                   batch_size=CONFIG["batch_size"], 
                                   shuffle=True, 
                                   collate_fn=numpy_collate, 
-                                  drop_last=True)
+                                  drop_last=False)
         # train_loader = DataLoader(dataset, 
         #                           batch_sampler=sampler, 
         #                           collate_fn=numpy_collate)
@@ -236,21 +241,6 @@ def fourier_encode(x, num_freqs):
     angles = angles.reshape(*x.shape[:-1], -1)
     return jnp.concatenate([x, jnp.sin(angles), jnp.cos(angles)], axis=-1)
 
-class RootMLP(eqx.Module):
-    layers: list
-
-    def __init__(self, in_size, out_size, width, depth, key):
-        keys = jax.random.split(key, depth + 1)
-        self.layers = [eqx.nn.Linear(in_size, width, key=keys[0])]
-        for i in range(depth - 1):
-            self.layers.append(eqx.nn.Linear(width, width, key=keys[i+1]))
-        self.layers.append(eqx.nn.Linear(width, out_size, key=keys[-1]))
-
-    def __call__(self, x):
-        for layer in self.layers[:-1]:
-            x = jax.nn.relu(layer(x))
-            # x = jnp.sin(layer(x))
-        return self.layers[-1](x)
 
 class CNNEncoder(eqx.Module):
     layers: list
@@ -285,32 +275,6 @@ class CNNEncoder(eqx.Module):
         x = self.layers[-1](x)
         return x
 
-class LinearRNNLayer(eqx.Module):
-    A: jax.Array
-    B: jax.Array
-    # C: jax.Array = eqx.field(static=True)  # For potential FiLM conditioning, not used in this version
-
-    def __init__(self, in_dim, out_dim, key):
-        k_A, k_B = jax.random.split(key)
-
-        ## define a MLP
-        # self.A = eqx.nn.MLP(out_dim, out_dim, width_size=out_dim*2, depth=2, activation=jax.nn.softplus, key=k_A)
-        # self.A = eqx.nn.MLP(out_dim, out_dim, width_size=out_dim*2, depth=2, key=k_A)
-        self.A = eqx.nn.MLP(out_dim, out_dim, width_size=int(out_dim*1.5), depth=2, key=k_A)
-
-        # self.A = jnp.eye(out_dim)
-        # self.A = jax.random.normal(k_A, (out_dim, out_dim)) * 0.01
-        # self.A = jax.random.normal(k_A, (out_dim, out_dim)) * 0
-
-        ## A should be a transport operator close to identiy. Initilialise as a transport matrix
-        # self.A = jnp.eye(out_dim) + jax.random.normal(k_A, (out_dim, out_dim)) * 0.0001
-        
-        # self.B = jnp.zeros((out_dim, CONFIG["rec_feat_dim"]))
-        # self.B = jnp.zeros((out_dim, in_dim))
-        self.B = eqx.nn.MLP(in_dim, out_dim, width_size=(out_dim+in_dim)//2, depth=2, key=k_B)
-        # self.B = eqx.nn.MLP(in_dim, out_dim, width_size=out_dim*2, depth=2, activation=jax.nn.softplus, key=k_B)
-
-        # self.C = jnp.zeros((out_dim, in_dim))  # Not used in this version, but reserved for potential FiLM conditioning
 
 #%% Cell 3: Model Definition
 class CNNEncoder(eqx.Module):
@@ -383,7 +347,7 @@ class CNNDecoder(eqx.Module):
 class LAM(eqx.Module):
     mlp: eqx.nn.MLP
     def __init__(self, dyn_dim, lam_dim, key):
-        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim, depth=2, key=key)
+        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim, depth=3, key=key)
         
     def __call__(self, z_prev, z_target):
         return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
@@ -398,8 +362,8 @@ class ForwardDynamics(eqx.Module):
         self.split_forward = split_forward
         k1, k2, k3 = jax.random.split(key, 3)
         if split_forward:
-            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k1)
-            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k2)
+            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=3, key=k1)
+            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=3, key=k2)
             self.giant_mlp = None
         else:
             self.mlp_A = None
@@ -412,7 +376,7 @@ class ForwardDynamics(eqx.Module):
         else:
             return self.giant_mlp(jnp.concatenate([z_prev, a], axis=-1))
 
-class WARP(eqx.Module):
+class WorldModel(eqx.Module):
     encoder: CNNEncoder
     decoder: CNNDecoder
     lam: LAM
@@ -430,8 +394,8 @@ class WARP(eqx.Module):
         self.lam_dim = lam_dim
         self.split_forward = split_forward
 
-        self.encoder = CNNEncoder(in_channels=C, out_dim=dyn_dim, spatial_shape=(H, W), key=k1)
-        self.decoder = CNNDecoder(in_dim=dyn_dim, out_channels=C*2 if CONFIG["use_nll_loss"] else C, spatial_shape=(H, W), key=k2)
+        self.encoder = CNNEncoder(in_channels=C, out_dim=dyn_dim, spatial_shape=(H, W), key=k1, hidden_width=64, depth=4)
+        self.decoder = CNNDecoder(in_dim=dyn_dim, out_channels=C*2 if CONFIG["use_nll_loss"] else C, spatial_shape=(H, W), key=k2, hidden_width=64, depth=4)
         self.lam = LAM(dyn_dim, lam_dim, key=k3)
         self.forward_dyn = ForwardDynamics(dyn_dim, lam_dim, split_forward, key=k4)
 
@@ -456,30 +420,27 @@ class WARP(eqx.Module):
             k = jax.random.fold_in(key, step_idx)
             k, subk = jax.random.split(k)
 
-            # 2. Encode ground truth next frame
-            z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
-
-            # 3. Model's own prediction of the next latent space (Assumes null action)
-            z_next_base = self.forward_dyn(z_prev, jnp.zeros(self.lam_dim))
+            # 8. Decode to pixels
+            pred_out = self.decoder(z_prev)
+            pred_out = jnp.transpose(pred_out, (1, 2, 0))
 
             # 4. Coin flip logic
-            t_ratio = step_idx / (T - 1)
-            is_context = t_ratio <= inf_context_ratio
+            t_ratio = step_idx / T
+            is_context = t_ratio < inf_context_ratio
             is_forced = jax.random.bernoulli(subk, p_forcing)
             use_gt = jnp.logical_or(is_context, is_forced)
 
-            # 5. Decide target representation for LAM
-            z_target = jnp.where(use_gt, z_next_gt, z_next_base)
+            # 2. Encode ground truth next frame
+            z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
 
             # 6. Predict action
-            a_t = self.lam(z_prev, z_target)
+            a_gt = self.lam(z_prev, z_next_gt)
+
+            # 5. Decide whether to use GT action or zero action
+            a_t = jnp.where(use_gt, a_gt, jnp.zeros_like(a_gt))
 
             # 7. Step forward in latent space
             z_next = self.forward_dyn(z_prev, a_t)
-
-            # 8. Decode to pixels
-            pred_out = self.decoder(z_next)
-            pred_out = jnp.transpose(pred_out, (1, 2, 0))
 
             if CONFIG["use_nll_loss"]:
                 mean, std = pred_out[..., :C], pred_out[..., C:]
@@ -489,7 +450,7 @@ class WARP(eqx.Module):
             return z_next, pred_out
 
         # Match old sequence length behavior
-        scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
+        scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
         _, pred_video = jax.lax.scan(scan_step, z_init, scan_inputs)
 
         return pred_video
@@ -517,8 +478,8 @@ def evaluate(m, batch, p_forcing, keys, coords, context_ratio, precompute_ref_di
 #%% Cell 4: Initialization & Training/Loading Logic
 key, subkey = jax.random.split(key)
 
-# Pass the new hyperparameters into WARP initialization
-model = WARP(
+# Pass the new hyperparameters into WorldModel initialization
+model = WorldModel(
     frame_shape=(H, W, C), 
     dyn_dim=CONFIG["dynamics_space"], 
     lam_dim=CONFIG["lam_space"],
@@ -527,10 +488,21 @@ model = WARP(
 )
 A_init = model.A.copy()
 
-print(f"Total Trainable Parameters in WARP: {count_trainable_params(model)}")
+print(f"Total Trainable Parameters in WorldModel: {count_trainable_params(model)}")
+
+count_A = count_trainable_params(model.forward_dyn.mlp_A)
+count_B = count_trainable_params(model.forward_dyn.mlp_B)
+count_lam = count_trainable_params(model.lam)
+count_encoder = count_trainable_params(model.encoder)
+count_decoder = count_trainable_params(model.decoder)
+print(" - in the Encoder:", count_encoder)
+print(" - in the Decoder:", count_decoder)
+print(" - in the Forward Dynamics A:", count_A)
+print(" - in the Forward Dynamics B:", count_B)
+print(" - in the Inv. Dynamics (LAM):", count_lam)
 
 if TRAIN:
-    print(f"\n🚀 Starting WARP Training -> Saving to {run_path}")
+    print(f"\n🚀 Starting WorldModel Training -> Saving to {run_path}")
     
     # --- Chain Adam with the Plateau Scheduler ---
     optimizer = optax.chain(
@@ -556,9 +528,8 @@ if TRAIN:
             pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
 
             # --- SEQUENCE LOSS---
-            full_indices = jax.random.choice(k_full, ref_videos.shape[1], shape=(CONFIG["nb_loss_steps_full"],), replace=False)
-            pred_selected = pred_videos[:, full_indices]
-            ref_selected = ref_videos[:, full_indices]
+            pred_selected = pred_videos
+            ref_selected = ref_videos
             
             if CONFIG["use_nll_loss"]:
                 # pred_means, pred_stds = pred_selected[..., :C], jax.nn.softplus(pred_selected[..., C:])
@@ -568,6 +539,17 @@ if TRAIN:
                 loss_full = jnp.mean(nll)
             else:
                 loss_full = jnp.mean((pred_selected - ref_selected)**2)
+
+
+            if CONFIG["aux_encoder_loss"]:
+                # --- AUXILIARY ENCODER LOSS ---
+                # dec(enc(ref)) should reconstruct the original frames (all of them)
+                latent_z = eqx.filter_vmap(m.encoder)(jnp.transpose(ref_videos, (0, 1, 4, 2, 3)))  # Shape (B, T, dyn_dim)
+                recon_frames = eqx.filter_vmap(m.decoder)(latent_z)  # Shape (B, T, C, H, W)
+                recon_frames = jnp.transpose(recon_frames, (0, 1, 3, 4, 2))  # Back to (B, T, H, W, C)
+                ae_loss = jnp.mean((recon_frames - ref_videos)**2)
+            else:
+                ae_loss = 0.0
 
             return loss_full
 
@@ -632,7 +614,7 @@ if TRAIN:
                                         save_name=f"pred_ref_epoch{epoch+1}.png")
 
     wall_time = time.time() - start_time
-    print("\nWall time for WARP training in h:m:s:", time.strftime("%H:%M:%S", time.gmtime(wall_time)))
+    print("\nWall time for WorldModel training in h:m:s:", time.strftime("%H:%M:%S", time.gmtime(wall_time)))
     
     # Save final artifacts
     eqx.tree_serialise_leaves(artefacts_path / "tf_model_final.eqx", model)
@@ -640,7 +622,7 @@ if TRAIN:
     np.save(artefacts_path / "lr_history.npy", np.array(lr_scales))
 
 else:
-    print(f"\n📥 Loading WARP model from {artefacts_path}")
+    print(f"\n📥 Loading WorldModel model from {artefacts_path}")
     model = eqx.tree_deserialise_leaves(artefacts_path / "tf_model_final.eqx", model)
     try:
         all_losses = np.load(artefacts_path / "loss_history.npy").tolist()
@@ -702,24 +684,22 @@ plt.savefig(plots_path / "recurrence_matrix_A.png")
 plt.show()
 
 #%%
-# sample_batch = next(iter(train_loader))
+# testing_subset = datasets.MovingMNIST(root=data_path, split="test", download=True)
 
-## sample a batch from the test_loader (create it first)
-testing_subset = datasets.MovingMNIST(root=data_path, split="test", download=True)
-test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=True)
+testing_subset = MovingMNISTDataset(test_arrays)
+test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=False)
 sample_batch = next(iter(test_loader))
 
-# print(f"Sample batch shape for inference: {sample_batch.shape}")
+# sample_batch = next(iter(train_loader))
 
-## Test sequences have length 10, so we all zeros to make it 20
+print("Batch shape for evaluation:", sample_batch.shape)
+
 pad_length = 20 - sample_batch.shape[1]
 sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)
 
-# Run inference utilizing the newly embedded `__call__` interface (handles batched transparently)
 val_keys = jax.random.split(key, sample_batch.shape[0])
 final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.5, precompute_ref_diffs=False)
 
-## Print Min and Max pixel values
 if CONFIG["use_nll_loss"]:
     print(f"Final Predicted Video Mean Pixel Value Range: min={final_videos[...,:C].min():.4f}, max={final_videos[...,:C].max():.4f}")
     print(f"Final Predicted Video Std Pixel Value Range: min={final_videos[...,C:].min():.4f}, max={final_videos[...,C:].max():.4f}")
@@ -731,7 +711,7 @@ plot_pred_ref_videos_rollout(
     final_videos[test_seq_id], 
     sample_batch[test_seq_id],
     title=f"Pred", 
-    save_name="inference_forecast_rollout.png"
+    save_name=f"inference_forecast_rollout_seq{test_seq_id}.png"
 )
 
 # %%
