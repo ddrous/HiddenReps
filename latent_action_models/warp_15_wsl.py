@@ -40,28 +40,24 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 50,
+    "nb_epochs": 400,
     "print_every": 1,
-    "batch_size": 1 if SINGLE_BATCH else 32,
+    "batch_size": 2 if SINGLE_BATCH else 32,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
     "nb_loss_steps_full": 20,
     "use_nll_loss": USE_NLL_LOSS,
 
-    # --- JEPA & AE Loss Configuration ---
-    "ae_loss_type": None,  # "encdec" (Render Targets -> Pixels), "decenc" (Render Preds -> Encode -> Latents), or None
-    "ae_loss_weight": 0.0,     # Weight of the autoencoding loss relative to latent dynamics loss
-
     # --- Architecture Params ---
-    "lam_space": 32,
+    "lam_space": 64,
     "split_forward": True,
     "root_width": 12,
     "root_depth": 5,
     "num_fourier_freqs": 6,
 
     # --- Plateau Scheduler Config ---
-    "lr_patience": 100,      
+    "lr_patience": 300,      
     "lr_cooldown": 0,       
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
@@ -113,7 +109,30 @@ def numpy_collate(batch):
 print("Loading Moving MNIST Dataset...")
 try:
     data_path = './data' if TRAIN else '../../data'
-    dataset = datasets.MovingMNIST(root=data_path, split=None, download=True)
+    # dataset = datasets.MovingMNIST(root=data_path, split=None, download=True)
+
+    ## Manulally load train and test splits to have more control over batching and shuffling
+    mov_mnist_arrays = np.load(data_path + "/MovingMNIST/mnist_test_seq.npy")
+    print(f"Original loaded MovingMNIST shape: {mov_mnist_arrays.shape} (T, N, H, W)")
+    ## SPlit, 8000 train, 2000 test
+    train_arrays = mov_mnist_arrays[:, :8000]
+    test_arrays = mov_mnist_arrays[:, 8000:]
+
+    ## Create PyTorch dataset
+    class MovingMNISTDataset(torch.utils.data.Dataset):
+        def __init__(self, data_array):
+            self.data_array = data_array
+
+        def __len__(self):
+            return self.data_array.shape[1]
+
+        def __getitem__(self, idx):
+            video = self.data_array[:, idx]  # Shape (T, H, W)
+            video = np.expand_dims(video, axis=-1)  # Add channel dimension -> (T, H, W, 1)
+            return torch.from_numpy(video.astype(np.float32))
+
+    dataset = MovingMNISTDataset(train_arrays)
+
     if SINGLE_BATCH:
         training_subset = Subset(dataset, range(CONFIG["batch_size"]))
         train_loader = DataLoader(
@@ -128,7 +147,7 @@ try:
                                   batch_size=CONFIG["batch_size"], 
                                   shuffle=True, 
                                   collate_fn=numpy_collate, 
-                                  drop_last=True)
+                                  drop_last=False)
 
     sample_batch = next(iter(train_loader))
     B, nb_frames, H, W, C = sample_batch.shape
@@ -257,8 +276,8 @@ class ForwardDynamics(eqx.Module):
         self.split_forward = split_forward
         k1, k2, k3 = jax.random.split(key, 3)
         if split_forward:
-            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k1)
-            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k2)
+            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=3, key=k1)
+            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=3, key=k2)
             self.giant_mlp = None
         else:
             self.mlp_A = None
@@ -382,9 +401,12 @@ class WARP(eqx.Module):
             k = jax.random.fold_in(key, step_idx)
             k, subk = jax.random.split(k)
 
+            # Render pixels explicitly using our helper
+            pred_out = self.render_frame(z_prev, coords_grid)
+
             # Determine if we are forcing towards ground truth this step
-            t_ratio = step_idx / (T - 1)
-            is_context = t_ratio <= inf_context_ratio
+            t_ratio = step_idx / T - 1
+            is_context = t_ratio < inf_context_ratio
             is_forced = jax.random.bernoulli(subk, p_forcing)
             use_gt = jnp.logical_or(is_context, is_forced)
 
@@ -400,12 +422,9 @@ class WARP(eqx.Module):
             # SINGLE forward dynamics call handles both the forced and autoregressive paths!
             z_next = self.forward_dyn(z_prev, a_t)
 
-            # Render pixels explicitly using our helper
-            pred_out = self.render_frame(z_next, coords_grid)
-
             return z_next, (z_next, pred_out)
 
-        scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
+        scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
         _, (pred_latents, pred_video) = jax.lax.scan(scan_step, z_init, scan_inputs)
 
         return pred_latents, pred_video
@@ -652,11 +671,16 @@ plt.savefig(plots_path / "recurrence_matrix_A.png")
 plt.show()
 
 #%%
-# testing_subset = datasets.MovingMNIST(root=data_path, split="test", download=True)
-# test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=True)
-# sample_batch = next(iter(test_loader))
 
-sample_batch = next(iter(train_loader))
+# testing_subset = datasets.MovingMNIST(root=data_path, split="test", download=True)
+
+testing_subset = MovingMNISTDataset(test_arrays)
+test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=numpy_collate, drop_last=False)
+sample_batch = next(iter(test_loader))
+
+# sample_batch = next(iter(train_loader))
+
+print("Batch shape for evaluation:", sample_batch.shape)
 
 pad_length = 20 - sample_batch.shape[1]
 sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)

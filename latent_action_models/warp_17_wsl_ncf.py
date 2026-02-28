@@ -40,10 +40,10 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 200,
+    "nb_epochs": 10,
     "print_every": 1,
     "batch_size": 1 if SINGLE_BATCH else 32,
-    "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
+    "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-5,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
     "nb_loss_steps_full": 20,

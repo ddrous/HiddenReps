@@ -1,55 +1,17 @@
 Loading Moving MNIST Dataset...
 Batched Video shape: (32, 20, 64, 64, 1)
 Dynamics Weight Space Dimension (d_theta): 961
-Total Trainable Parameters in WARP: 20606486
+Total Trainable Parameters in WARP: 19948366
  - in the Encoder: 9423297
- - in the Forward Dynamics A: 0
- - in the Forward Dynamics B: 0
+ - in the Discrete Actions: 320000
+ - in the Forward Dynamics A: 2833540
+ - in the Forward Dynamics B: 558592
+ - in the Forward Dynamics AB: 3084225
  - in the Inv. Dynamics (LAM): 3727751
 
-🚀 Starting WARP Training -> Saving to experiments/260228-004800
-Epoch 1/50 - Avg Loss: 0.0374 - LR Scale: 1.0000
-Epoch 2/50 - Avg Loss: 0.0359 - LR Scale: 1.0000
-Epoch 3/50 - Avg Loss: 0.0351 - LR Scale: 1.0000
-Epoch 4/50 - Avg Loss: 0.0346 - LR Scale: 1.0000
-Epoch 5/50 - Avg Loss: 0.0342 - LR Scale: 1.0000
-Epoch 6/50 - Avg Loss: 0.0340 - LR Scale: 1.0000
-Epoch 7/50 - Avg Loss: 0.0339 - LR Scale: 1.0000
-Epoch 8/50 - Avg Loss: 0.0337 - LR Scale: 1.0000
-Epoch 9/50 - Avg Loss: 0.0333 - LR Scale: 0.5000
-Epoch 10/50 - Avg Loss: 0.0330 - LR Scale: 0.5000
-Epoch 11/50 - Avg Loss: 0.0327 - LR Scale: 0.2500
-Epoch 12/50 - Avg Loss: 0.0324 - LR Scale: 0.1250
-Epoch 13/50 - Avg Loss: 0.0320 - LR Scale: 0.1250
-Epoch 14/50 - Avg Loss: 0.0319 - LR Scale: 0.1250
-Epoch 15/50 - Avg Loss: 0.0318 - LR Scale: 0.1250
-Epoch 16/50 - Avg Loss: 0.0317 - LR Scale: 0.1250
-Epoch 17/50 - Avg Loss: 0.0316 - LR Scale: 0.1000
-Epoch 18/50 - Avg Loss: 0.0314 - LR Scale: 0.1000
-Epoch 19/50 - Avg Loss: 0.0314 - LR Scale: 0.1000
-Epoch 20/50 - Avg Loss: 0.0313 - LR Scale: 0.1000
-Epoch 21/50 - Avg Loss: 0.0312 - LR Scale: 0.1000
-Epoch 22/50 - Avg Loss: 0.0312 - LR Scale: 0.1000
-Epoch 23/50 - Avg Loss: 0.0311 - LR Scale: 0.1000
-Epoch 24/50 - Avg Loss: 0.0310 - LR Scale: 0.1000
-Epoch 25/50 - Avg Loss: 0.0309 - LR Scale: 0.1000
-Epoch 26/50 - Avg Loss: 0.0309 - LR Scale: 0.1000
-Epoch 27/50 - Avg Loss: 0.0308 - LR Scale: 0.1000
-Epoch 28/50 - Avg Loss: 0.0308 - LR Scale: 0.1000
-Epoch 29/50 - Avg Loss: 0.0307 - LR Scale: 0.1000
-Epoch 30/50 - Avg Loss: 0.0306 - LR Scale: 0.1000
-Epoch 31/50 - Avg Loss: 0.0306 - LR Scale: 0.1000
-Epoch 32/50 - Avg Loss: 0.0305 - LR Scale: 0.1000
-Epoch 33/50 - Avg Loss: 0.0305 - LR Scale: 0.1000
-Epoch 34/50 - Avg Loss: 0.0304 - LR Scale: 0.1000
-Epoch 35/50 - Avg Loss: 0.0303 - LR Scale: 0.1000
-Epoch 36/50 - Avg Loss: 0.0303 - LR Scale: 0.1000
-Epoch 37/50 - Avg Loss: 0.0302 - LR Scale: 0.1000
-Epoch 38/50 - Avg Loss: 0.0302 - LR Scale: 0.1000
-Epoch 39/50 - Avg Loss: 0.0302 - LR Scale: 0.1000
-Epoch 40/50 - Avg Loss: 0.0301 - LR Scale: 0.1000
-Epoch 41/50 - Avg Loss: 0.0301 - LR Scale: 0.1000
-Epoch 42/50 - Avg Loss: 0.0300 - LR Scale: 0.1000
-Epoch 43/50 - Avg Loss: 0.0300 - LR Scale: 0.1000
-Epoch 44/50 - Avg Loss: 0.0299 - LR Scale: 0.1000
-Epoch 45/50 - Avg Loss: 0.0299 - LR Scale: 0.1000
+🚀 Starting WARP Training -> Saving to experiments/260228-020012
+Epoch 1/200 - Avg Loss: 0.0377 - LR Scale: 1.0000
+Epoch 2/200 - Avg Loss: 0.0361 - LR Scale: 1.0000
+Epoch 3/200 - Avg Loss: 0.0357 - LR Scale: 1.0000
+Epoch 4/200 - Avg Loss: 0.0353 - LR Scale: 1.0000
+Epoch 5/200 - Avg Loss: 0.0350 - LR Scale: 1.0000
