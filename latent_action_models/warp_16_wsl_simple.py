@@ -35,16 +35,16 @@ def count_trainable_params(model):
 TRAIN = True
 RUN_DIR = "./" if not TRAIN else None
 
-SINGLE_BATCH = False
+SINGLE_BATCH = True
 USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 50,
-    "print_every": 1,
+    "nb_epochs": 100,
+    "print_every": 10,
     "batch_size": 1 if SINGLE_BATCH else 32,
-    "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
-    "p_forcing": 0.0,
+    "learning_rate": 1e-5,
+    "p_forcing": 0.5,
     "inf_context_ratio": 0.5,
     "nb_loss_steps_full": 20,
     "use_nll_loss": USE_NLL_LOSS,
@@ -56,12 +56,15 @@ CONFIG = {
     # --- Architecture Params ---
     "lam_space": 32,
     "split_forward": True,
+    "attention_dim": 128,   # when MLP A is replaced with attention
+    "attention_num_heads": 4,
+    "attention_num_layers": 4,
     "root_width": 12,
     "root_depth": 5,
     "num_fourier_freqs": 6,
 
     # --- Plateau Scheduler Config ---
-    "lr_patience": 100,      
+    "lr_patience": 300,      
     "lr_cooldown": 0,       
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
@@ -242,10 +245,67 @@ class CNNEncoder(eqx.Module):
 class LAM(eqx.Module):
     mlp: eqx.nn.MLP
     def __init__(self, dyn_dim, lam_dim, key):
-        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim, depth=3, key=key)
+        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim, depth=2, key=key)
         
     def __call__(self, z_prev, z_target):
         return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
+
+
+class TransformerBlock(eqx.Module):
+    mlp: eqx.nn.MLP
+    mha: eqx.nn.MultiheadAttention
+    ln1: eqx.nn.LayerNorm
+    ln2: eqx.nn.LayerNorm
+
+    def __init__(self, d_model, num_heads, key):
+        k1, k2 = jax.random.split(key)
+        # Pre-LN architecture: LayerNorm interleaved before operations
+        self.ln1 = eqx.nn.LayerNorm(d_model)
+        self.mlp = eqx.nn.MLP(d_model, d_model, width_size=d_model * 4, depth=2, key=k1)
+        
+        self.ln2 = eqx.nn.LayerNorm(d_model)
+        self.mha = eqx.nn.MultiheadAttention(num_heads, query_size=d_model, key=k2)
+
+    def __call__(self, x):
+        # 1. Step-wise MLP first (vmap applies it independently to each step in seq_len)
+        x = x + jax.vmap(self.mlp)(jax.vmap(self.ln1)(x))
+        
+        # 1.5 Apply layer norm 2
+        x = jax.vmap(self.ln2)(x)
+
+        # 2. Then self-attention (processes the whole sequence at once)
+        # x = x + self.mha(self.ln2(x), self.ln2(x), self.ln2(x))
+        x = x + self.mha(x, x, x)
+
+        return x
+
+class InflatedDynamicsA(eqx.Module):
+    proj_in: eqx.nn.Linear
+    blocks: list
+    proj_out: eqx.nn.Linear
+
+    def __init__(self, d_model=64, num_heads=4, num_layers=3, key=jax.random.PRNGKey(0)):
+        keys = jax.random.split(key, num_layers + 2)
+        
+        self.proj_in = eqx.nn.Linear(1, d_model, key=keys[0])
+        self.blocks = [TransformerBlock(d_model, num_heads, keys[i+1]) for i in range(num_layers)]
+        self.proj_out = eqx.nn.Linear(d_model, 1, key=keys[-1])
+
+    def __call__(self, x):
+        """ x shape expected: (seq_len, 1) """
+        
+        # Inflate to d_model
+        h = jax.vmap(self.proj_in)(x)
+        
+        # Process through sequence of blocks
+        for block in self.blocks:
+            h = block(h)
+            
+        # Map back to 1D
+        out = jax.vmap(self.proj_out)(h)
+        
+        # Add to original input
+        return x + out
 
 class ForwardDynamics(eqx.Module):
     mlp_A: Optional[eqx.nn.MLP]
@@ -257,8 +317,28 @@ class ForwardDynamics(eqx.Module):
         self.split_forward = split_forward
         k1, k2, k3 = jax.random.split(key, 3)
         if split_forward:
-            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k1)
+            # self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k1)
+
+            ## Make A a attention layer instead
+            att_dim = CONFIG["attention_dim"]
+            # self.mlp_A = eqx.nn.MultiheadAttention(
+            #     num_heads=4,
+            #     key_size=1,
+            #     value_size=1,
+            #     query_size=1,
+            #     qk_size=att_dim,
+            #     vo_size=att_dim,
+            #     output_size=1,
+            #     key=k1,
+            # )
+
+            att_num_heads = CONFIG["attention_num_heads"]
+            att_num_layers = CONFIG["attention_num_layers"]
+            self.mlp_A = InflatedDynamicsA(d_model=att_dim, num_heads=att_num_heads, num_layers=att_num_layers, key=k1)
+
             self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k2)
+            # self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=(dyn_dim+lam_dim)//2, depth=2, key=k2)
+
             self.giant_mlp = None
         else:
             self.mlp_A = None
@@ -267,7 +347,12 @@ class ForwardDynamics(eqx.Module):
 
     def __call__(self, z_prev, a):
         if self.split_forward:
-            return self.mlp_A(z_prev) + self.mlp_B(a)
+            # return self.mlp_A(z_prev) + self.mlp_B(a)
+
+            z_prev_exp = z_prev[:, None]
+            # return self.mlp_A(z_prev_exp, z_prev_exp, z_prev_exp)[:, 0] + self.mlp_B(a)
+
+            return self.mlp_A(z_prev_exp)[:, 0] + self.mlp_B(a)
         else:
             return self.giant_mlp(jnp.concatenate([z_prev, a], axis=-1))
 
@@ -301,15 +386,22 @@ class WARP(eqx.Module):
         self.d_theta = flat_params.shape[0]
         self.theta_base = flat_params
 
-        # Set up JEPA dynamics components
-        self.encoder = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_enc, hidden_width=64)
+        # Set up dynamics components
+        self.encoder = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_enc, hidden_width=64, depth=4)
         self.lam = LAM(self.d_theta, lam_dim, key=k_lam)
         self.forward_dyn = ForwardDynamics(self.d_theta, lam_dim, split_forward, key=k_fwd)
 
     @property
     def A(self):
         if self.split_forward:
-            return self.forward_dyn.mlp_A.layers[-1].weight
+            if isinstance(self.forward_dyn.mlp_A, eqx.nn.MLP):
+                return self.forward_dyn.mlp_A.layers[-1].weight
+            elif isinstance(self.forward_dyn.mlp_A, eqx.nn.MultiheadAttention):
+                return self.forward_dyn.mlp_A.output_proj.weight
+            else:
+                # print("All the attirbutes of the attention layer are:", vars(self.forward_dyn.mlp_A))
+                # return self.forward_dyn.mlp_A.TransformerBlocks[0].mha.output_proj.weight
+                return self.forward_dyn.mlp_A.blocks[0].mlp.layers[-1].weight
         else:
             return self.forward_dyn.giant_mlp.layers[-1].weight
 
@@ -335,40 +427,6 @@ class WARP(eqx.Module):
         
         pred_flat = self.render_pixels(thetas_frame, flat_coords)
         return pred_flat.reshape(H, W, -1)
-
-    # def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
-    #     T = ref_video.shape[0]
-    #     init_frame = ref_video[0]
-
-    #     # 1. Initialize offset from first frame
-    #     z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
-
-    #     def scan_step(z_prev, scan_inputs):
-    #         gt_curr_frame, step_idx = scan_inputs
-    #         k = jax.random.fold_in(key, step_idx)
-    #         k, subk = jax.random.split(k)
-
-    #         z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
-    #         z_next_base = self.forward_dyn(z_prev, jnp.zeros(self.lam_dim))     ## TODO: zero action means continue dynamics without forcing towards GT
-
-    #         t_ratio = step_idx / (T - 1)
-    #         is_context = t_ratio <= inf_context_ratio
-    #         is_forced = jax.random.bernoulli(subk, p_forcing)
-    #         use_gt = jnp.logical_or(is_context, is_forced)
-
-    #         z_target = jnp.where(use_gt, z_next_gt, z_next_base)
-    #         a_t = self.lam(z_prev, z_target)
-    #         z_next = self.forward_dyn(z_prev, a_t)
-
-    #         # Render pixels explicitly using our helper
-    #         pred_out = self.render_frame(z_next, coords_grid)
-
-    #         return z_next, (z_next, pred_out)
-
-    #     scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
-    #     _, (pred_latents, pred_video) = jax.lax.scan(scan_step, z_init, scan_inputs)
-
-    #     return pred_latents, pred_video
 
     def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
         T = ref_video.shape[0]
@@ -441,11 +499,9 @@ model = WARP(
 )
 A_init = model.A.copy()
 
-
-print(f"Dynamics Weight Space Dimension (d_theta): {model.d_theta}")
-
 print(f"Total Trainable Parameters in WARP: {count_trainable_params(model)}")
 
+## Count the params in the MLP_A in the forward dyn model
 count_A = count_trainable_params(model.forward_dyn.mlp_A)
 count_B = count_trainable_params(model.forward_dyn.mlp_B)
 count_lam = count_trainable_params(model.lam)
@@ -453,7 +509,10 @@ count_encoder = count_trainable_params(model.encoder)
 print(" - in the Encoder:", count_encoder)
 print(" - in the Forward Dynamics A:", count_A)
 print(" - in the Forward Dynamics B:", count_B)
-print(" - in the Inv. Dynamics (LAM):", count_lam)
+print(" - in the Inverse Dynamics (LAM):", count_lam)
+
+
+print(f"Dynamics Weight Space Dimension (d_theta): {model.d_theta}")
 
 if TRAIN:
     print(f"\n🚀 Starting WARP Training -> Saving to {run_path}")
@@ -479,9 +538,10 @@ if TRAIN:
             # Forward pass: Extract both predicted thetas and rendered pixels
             pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
 
-            # # Encode ground truth to target thetas
+            # # # Encode ground truth to target thetas
             # ref_videos_enc = jnp.transpose(ref_videos, (0, 1, 4, 2, 3))
-            # target_thetas = jax.vmap(jax.vmap(m.encoder))(ref_videos_enc)
+            # # target_thetas = jax.vmap(jax.vmap(m.encoder))(ref_videos_enc)
+            # target_thetas = jax.lax.stop_gradient(jax.vmap(jax.vmap(m.encoder))(ref_videos_enc))
             # target_thetas_shifted = jnp.concatenate([target_thetas[:, 1:], target_thetas[:, -1:]], axis=1)
 
             # --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
@@ -561,11 +621,10 @@ if TRAIN:
             key, subkey = jax.random.split(key)
             batch_keys = jax.random.split(subkey, batch_videos.shape[0])
             
-            model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, CONFIG["p_forcing"])
+            # model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, CONFIG["p_forcing"])
 
-            # p_forcing = compute_p_forcing(epoch, schedule="step", start=CONFIG["p_forcing"], end=0.0)
-            # model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, p_forcing)
-
+            p_forcing = compute_p_forcing(epoch, schedule="step", start=CONFIG["p_forcing"], end=0.0)
+            model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, p_forcing)
             epoch_losses.append(loss)
 
             current_scale = optax.tree_utils.tree_get(opt_state, "scale")
@@ -580,7 +639,7 @@ if TRAIN:
         if epoch in [4, CONFIG["nb_epochs"]//2, 2*CONFIG["nb_epochs"]//3]:
             eqx.tree_serialise_leaves(artefacts_path / f"tf_model_ep{epoch+1}.eqx", model)
 
-        if (epoch+1) % (max(CONFIG["nb_epochs"]//10, 1)) == 0:
+        if (epoch+1) % (max(CONFIG["nb_epochs"]//20, 1)) == 0:
             val_keys = jax.random.split(key, sample_batch.shape[0])
             _, val_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
             plot_pred_ref_videos_rollout(val_videos[0], 
@@ -608,8 +667,6 @@ else:
 
 #%% Cell 5: Final Visualizations
 print("\n=== Generating Dashboards ===")
-
-# print(len(all_losses), "loss points collected during training.")
 
 if len(all_losses) > 0:
     fig, ax1 = plt.subplots(figsize=(10, 5))

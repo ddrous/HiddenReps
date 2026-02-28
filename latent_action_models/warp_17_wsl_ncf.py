@@ -40,7 +40,7 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 50,
+    "nb_epochs": 200,
     "print_every": 1,
     "batch_size": 1 if SINGLE_BATCH else 32,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
@@ -61,7 +61,7 @@ CONFIG = {
     "num_fourier_freqs": 6,
 
     # --- Plateau Scheduler Config ---
-    "lr_patience": 100,      
+    "lr_patience": 300,      
     "lr_cooldown": 0,       
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
@@ -250,24 +250,40 @@ class LAM(eqx.Module):
 class ForwardDynamics(eqx.Module):
     mlp_A: Optional[eqx.nn.MLP]
     mlp_B: Optional[eqx.nn.MLP]
+    mlp_AB: Optional[eqx.nn.MLP]
     giant_mlp: Optional[eqx.nn.MLP]
     split_forward: bool = eqx.field(static=True)
 
-    def __init__(self, dyn_dim, lam_dim, split_forward, key):
+    def __init__(self, dyn_dim, lam_dim, int_dim, split_forward, key):
         self.split_forward = split_forward
         k1, k2, k3 = jax.random.split(key, 3)
         if split_forward:
-            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k1)
-            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k2)
+            self.mlp_A = eqx.nn.MLP(dyn_dim, int_dim, width_size=max(dyn_dim, int_dim)*2, depth=1, key=k1)
+            self.mlp_B = eqx.nn.MLP(lam_dim, int_dim, width_size=max(lam_dim, int_dim)*2, depth=1, key=k2)
+            self.mlp_AB = eqx.nn.MLP(int_dim*2, dyn_dim, width_size=min(int_dim, dyn_dim)*2, depth=2, key=k3)
             self.giant_mlp = None
         else:
             self.mlp_A = None
             self.mlp_B = None
             self.giant_mlp = eqx.nn.MLP(dyn_dim + lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k3)
 
-    def __call__(self, z_prev, a):
+    def __call__(self, z_prev, a, a0=None):
         if self.split_forward:
-            return self.mlp_A(z_prev) + self.mlp_B(a)
+            # return self.mlp_A(z_prev) + self.mlp_B(a)
+
+            if a0 is None:
+                int_A = self.mlp_A(z_prev)
+                int_B = self.mlp_B(a)
+                return self.mlp_AB(jnp.concatenate([int_A, int_B], axis=-1))
+            else:
+                ## We do a Taylor expansion around a_0, so we need the Jacobian of the dynamics w.r.t. the action at a_0
+                int_A = self.mlp_A(z_prev)
+                def fn(a_in):
+                    int_B_in = self.mlp_B(a_in)
+                    return self.mlp_AB(jnp.concatenate([int_A, int_B_in], axis=-1))
+                grad_fn = lambda a_in: jax.jvp(fn, (a0,), (a_in - a0,))[1]
+                return fn(a0) + grad_fn(a)
+
         else:
             return self.giant_mlp(jnp.concatenate([z_prev, a], axis=-1))
 
@@ -276,6 +292,7 @@ class WARP(eqx.Module):
     lam: LAM
     forward_dyn: ForwardDynamics
     theta_base: jax.Array
+    discrete_actions: eqx.nn.Embedding
     
     unravel_fn: callable = eqx.field(static=True)
     d_theta: int = eqx.field(static=True)
@@ -304,7 +321,12 @@ class WARP(eqx.Module):
         # Set up JEPA dynamics components
         self.encoder = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_enc, hidden_width=64)
         self.lam = LAM(self.d_theta, lam_dim, key=k_lam)
-        self.forward_dyn = ForwardDynamics(self.d_theta, lam_dim, split_forward, key=k_fwd)
+
+        int_dim = 512
+        self.forward_dyn = ForwardDynamics(self.d_theta, lam_dim, int_dim, split_forward, key=k_fwd)
+        num_discrete_actions = 10000
+        self.discrete_actions = eqx.nn.Embedding(num_discrete_actions, lam_dim, key=k_fwd)
+
 
     @property
     def A(self):
@@ -336,40 +358,6 @@ class WARP(eqx.Module):
         pred_flat = self.render_pixels(thetas_frame, flat_coords)
         return pred_flat.reshape(H, W, -1)
 
-    # def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
-    #     T = ref_video.shape[0]
-    #     init_frame = ref_video[0]
-
-    #     # 1. Initialize offset from first frame
-    #     z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
-
-    #     def scan_step(z_prev, scan_inputs):
-    #         gt_curr_frame, step_idx = scan_inputs
-    #         k = jax.random.fold_in(key, step_idx)
-    #         k, subk = jax.random.split(k)
-
-    #         z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
-    #         z_next_base = self.forward_dyn(z_prev, jnp.zeros(self.lam_dim))     ## TODO: zero action means continue dynamics without forcing towards GT
-
-    #         t_ratio = step_idx / (T - 1)
-    #         is_context = t_ratio <= inf_context_ratio
-    #         is_forced = jax.random.bernoulli(subk, p_forcing)
-    #         use_gt = jnp.logical_or(is_context, is_forced)
-
-    #         z_target = jnp.where(use_gt, z_next_gt, z_next_base)
-    #         a_t = self.lam(z_prev, z_target)
-    #         z_next = self.forward_dyn(z_prev, a_t)
-
-    #         # Render pixels explicitly using our helper
-    #         pred_out = self.render_frame(z_next, coords_grid)
-
-    #         return z_next, (z_next, pred_out)
-
-    #     scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
-    #     _, (pred_latents, pred_video) = jax.lax.scan(scan_step, z_init, scan_inputs)
-
-    #     return pred_latents, pred_video
-
     def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
         T = ref_video.shape[0]
         init_frame = ref_video[0]
@@ -397,8 +385,15 @@ class WARP(eqx.Module):
             # THE FIX: If using GT, use the LAM's action. Otherwise, default to 0.
             a_t = jnp.where(use_gt, a_gt, jnp.zeros(self.lam_dim))
 
+            # # Let's sample the closest discrete action from our embedding table to the LAM output (for interpretability/debugging)
+            # a0_t = None
+            discrete_idx = jnp.argmin(jnp.mean(jnp.abs(self.discrete_actions.weight - a_gt)))
+            # print("Shape of discrete_idx:", discrete_idx.shape, self.discrete_actions.weight.shape)  # Should be (lam_dim,)
+            # discrete_idx = jnp.array([discrete_idx], dtype=jnp.int32)  # Ensure it's an integer index
+            a0_t = self.discrete_actions(discrete_idx)
+
             # SINGLE forward dynamics call handles both the forced and autoregressive paths!
-            z_next = self.forward_dyn(z_prev, a_t)
+            z_next = self.forward_dyn(z_prev, a_t, a0=a0_t)
 
             # Render pixels explicitly using our helper
             pred_out = self.render_frame(z_next, coords_grid)
@@ -446,13 +441,17 @@ print(f"Dynamics Weight Space Dimension (d_theta): {model.d_theta}")
 
 print(f"Total Trainable Parameters in WARP: {count_trainable_params(model)}")
 
+count_discrete_emb = count_trainable_params(model.discrete_actions)
 count_A = count_trainable_params(model.forward_dyn.mlp_A)
 count_B = count_trainable_params(model.forward_dyn.mlp_B)
+count_AB = count_trainable_params(model.forward_dyn.mlp_AB)
 count_lam = count_trainable_params(model.lam)
 count_encoder = count_trainable_params(model.encoder)
 print(" - in the Encoder:", count_encoder)
+print(" - in the Discrete Actions:", count_discrete_emb)
 print(" - in the Forward Dynamics A:", count_A)
 print(" - in the Forward Dynamics B:", count_B)
+print(" - in the Forward Dynamics AB:", count_AB)
 print(" - in the Inv. Dynamics (LAM):", count_lam)
 
 if TRAIN:
