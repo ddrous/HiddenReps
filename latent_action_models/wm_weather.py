@@ -50,7 +50,7 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 1,
+    "nb_epochs": 10,
     "print_every": 1,
     "batch_size": 2 if SINGLE_BATCH else 64,
     "learning_rate": 1e-7 if USE_NLL_LOSS else 1e-4,
@@ -551,14 +551,15 @@ if TRAIN:
 
             if CONFIG["aux_encoder_loss"]:
                 # --- AUXILIARY ENCODER LOSS ---
-                latent_z = eqx.filter_vmap(m.encoder)(jnp.transpose(ref_videos, (0, 1, 4, 2, 3)))
+                indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(4,), replace=False)
+                latent_z = eqx.filter_vmap(m.encoder)(jnp.transpose(ref_videos[:, indices], (0, 1, 4, 2, 3)))
                 recon_frames = eqx.filter_vmap(m.decoder)(latent_z)
                 recon_frames = jnp.transpose(recon_frames, (0, 1, 3, 4, 2))
-                ae_loss = jnp.mean((recon_frames - ref_videos)**2)
+                ae_loss = jnp.mean((recon_frames - ref_videos[:, indices])**2)
             else:
                 ae_loss = 0.0
 
-            return loss_full
+            return loss_full + CONFIG["aux_loss_weight"] * ae_loss
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
         
@@ -575,9 +576,9 @@ if TRAIN:
     for epoch in range(CONFIG["nb_epochs"]):
         epoch_losses = []
         
-        # for batch_idx, batch_videos in enumerate(train_loader):
-        pbar = tqdm(train_loader)
-        for batch_idx, batch_videos in enumerate(pbar):
+        for batch_idx, batch_videos in enumerate(train_loader):
+        # pbar = tqdm(train_loader)
+        # for batch_idx, batch_videos in enumerate(pbar):
             key, subkey = jax.random.split(key)
             batch_keys = jax.random.split(subkey, batch_videos.shape[0])
             
@@ -587,8 +588,8 @@ if TRAIN:
             current_scale = optax.tree_utils.tree_get(opt_state, "scale")
             lr_scales.append(current_scale)
 
-            if batch_idx % 10 == 0:
-                pbar.set_description(f"Epoch {epoch+1}/{CONFIG['nb_epochs']} - Loss: {loss:.4f} - LR Scale: {current_scale:.4f}")
+            # if batch_idx % 10 == 0:
+            #     pbar.set_description(f"Epoch {epoch+1}/{CONFIG['nb_epochs']} - Loss: {loss:.4f} - LR Scale: {current_scale:.4f}")
 
         all_losses.extend(epoch_losses)
 

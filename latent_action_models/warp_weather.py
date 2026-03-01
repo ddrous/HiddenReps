@@ -48,7 +48,7 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 1,
+    "nb_epochs": 10,
     "print_every": 1,
     "batch_size": 2 if SINGLE_BATCH else 64,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
@@ -57,7 +57,7 @@ CONFIG = {
     "use_nll_loss": USE_NLL_LOSS,
     "aux_encoder_loss": False,
     "aux_loss_weight": 0.1,
-    "seq_len": 24, # OpenSTL default
+    "seq_len": 24,
 
     # --- Architecture Params ---
     "lam_space": 64,
@@ -504,10 +504,13 @@ if TRAIN:
             k_full, k_init = jax.random.split(keys[0], 2)
             pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
 
-            latent_loss = jnp.mean((pred_videos - ref_videos)**2)
+            rec_loss = jnp.mean((pred_videos - ref_videos)**2)
 
             if CONFIG["aux_encoder_loss"]:
-                ref_videos_enc = jnp.transpose(ref_videos, (0, 1, 4, 2, 3))
+                indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(4,), replace=False)
+
+                # Encode ground truth to target thetas
+                ref_videos_enc = jnp.transpose(ref_videos[:, indices], (0, 1, 4, 2, 3))
                 target_thetas = jax.vmap(jax.vmap(m.encoder))(ref_videos_enc)
 
                 batched_render = jax.vmap(jax.vmap(lambda theta: m.render_frame(theta, coords_grid)))
@@ -515,13 +518,13 @@ if TRAIN:
 
                 if CONFIG["use_nll_loss"]:
                     decoded_mean = decoded_pixels[..., :C]
-                    ae_loss = jnp.mean((decoded_mean - target_thetas)**2)
+                    ae_loss = jnp.mean((decoded_mean - ref_videos[:, indices])**2)
                 else:
-                    ae_loss = jnp.mean((decoded_pixels - target_thetas)**2)
+                    ae_loss = jnp.mean((decoded_pixels - ref_videos[:, indices])**2)
             else:
                 ae_loss = 0.0
 
-            total_loss = latent_loss + CONFIG["aux_loss_weight"] * ae_loss
+            total_loss = rec_loss + CONFIG["aux_loss_weight"] * ae_loss
             return total_loss
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)

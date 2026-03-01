@@ -46,10 +46,10 @@ CONFIG = {
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
-    "nb_loss_steps_full": 20,
     "use_nll_loss": USE_NLL_LOSS,
     "aux_encoder_loss": False,
-    "aux_loss_weight": 0.1,
+    "aux_loss_weight": 1,
+    "aux_loss_num_steps": 4,
 
     # --- Architecture Params ---
     "lam_space": 64,
@@ -504,13 +504,15 @@ if TRAIN:
 
             # --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
             # latent_loss = jnp.mean((pred_thetas - target_thetas_shifted)**2)
-            latent_loss = jnp.mean((pred_videos - ref_videos)**2)
+            rec_loss = jnp.mean((pred_videos - ref_videos)**2)
 
             # --- 2. AUTOENCODING LOSS (Auxiliary) ---
             if CONFIG["aux_encoder_loss"]:
 
+                indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(CONFIG["aux_loss_num_steps"],), replace=False)
+
                 # Encode ground truth to target thetas
-                ref_videos_enc = jnp.transpose(ref_videos, (0, 1, 4, 2, 3))
+                ref_videos_enc = jnp.transpose(ref_videos[:, indices], (0, 1, 4, 2, 3))
                 target_thetas = jax.vmap(jax.vmap(m.encoder))(ref_videos_enc)
 
                 # Render Target Thetas -> Match GT Pixels
@@ -520,13 +522,13 @@ if TRAIN:
 
                 if CONFIG["use_nll_loss"]:
                     decoded_mean = decoded_pixels[..., :C]
-                    ae_loss = jnp.mean((decoded_mean - target_thetas)**2)
+                    ae_loss = jnp.mean((decoded_mean - ref_videos[:, indices])**2)
                 else:
-                    ae_loss = jnp.mean((decoded_pixels - target_thetas)**2)
+                    ae_loss = jnp.mean((decoded_pixels - ref_videos[:, indices])**2)
             else:
                 ae_loss = 0.0
 
-            total_loss = latent_loss + CONFIG["aux_loss_weight"] * ae_loss
+            total_loss = rec_loss + CONFIG["aux_loss_weight"] * ae_loss
 
             return total_loss
 

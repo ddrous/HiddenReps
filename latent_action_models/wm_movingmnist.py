@@ -540,18 +540,17 @@ if TRAIN:
             else:
                 loss_full = jnp.mean((pred_selected - ref_selected)**2)
 
-
             if CONFIG["aux_encoder_loss"]:
                 # --- AUXILIARY ENCODER LOSS ---
-                # dec(enc(ref)) should reconstruct the original frames (all of them)
-                latent_z = eqx.filter_vmap(m.encoder)(jnp.transpose(ref_videos, (0, 1, 4, 2, 3)))  # Shape (B, T, dyn_dim)
-                recon_frames = eqx.filter_vmap(m.decoder)(latent_z)  # Shape (B, T, C, H, W)
-                recon_frames = jnp.transpose(recon_frames, (0, 1, 3, 4, 2))  # Back to (B, T, H, W, C)
-                ae_loss = jnp.mean((recon_frames - ref_videos)**2)
+                indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(4,), replace=False)
+                latent_z = eqx.filter_vmap(m.encoder)(jnp.transpose(ref_videos[:, indices], (0, 1, 4, 2, 3)))
+                recon_frames = eqx.filter_vmap(m.decoder)(latent_z)
+                recon_frames = jnp.transpose(recon_frames, (0, 1, 3, 4, 2))
+                ae_loss = jnp.mean((recon_frames - ref_videos[:, indices])**2)
             else:
                 ae_loss = 0.0
 
-            return loss_full
+            return loss_full + CONFIG["aux_loss_weight"] * ae_loss
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
         
