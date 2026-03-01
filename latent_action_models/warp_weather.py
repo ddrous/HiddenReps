@@ -48,9 +48,9 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 10,
+    "nb_epochs": 5,
     "print_every": 1,
-    "batch_size": 2 if SINGLE_BATCH else 64,
+    "batch_size": 2 if SINGLE_BATCH else 64*8,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
@@ -424,7 +424,8 @@ class WARP(eqx.Module):
             is_forced = jax.random.bernoulli(subk, p_forcing)
             use_gt = jnp.logical_or(is_context, is_forced)
 
-            z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
+            # z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
+            z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
             a_gt = self.lam(z_prev, z_next_gt)
             a_t = jnp.where(use_gt, a_gt, jnp.zeros(self.lam_dim))
 
@@ -502,7 +503,11 @@ if TRAIN:
     def train_step(model, opt_state, keys, ref_videos, coords_grid, p_forcing):
         def loss_fn(m):
             k_full, k_init = jax.random.split(keys[0], 2)
-            pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
+            # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
+            # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
+
+            context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
+            pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
 
             rec_loss = jnp.mean((pred_videos - ref_videos)**2)
 
@@ -558,7 +563,7 @@ if TRAIN:
             print(f"Epoch {epoch+1}/{CONFIG['nb_epochs']} - Avg Loss: {avg_epoch_loss:.4f} - LR Scale: {current_scale:.4f}", flush=True)
 
         if epoch in [4, CONFIG["nb_epochs"]//2, 2*CONFIG["nb_epochs"]//3]:
-            eqx.tree_serialise_leaves(artefacts_path / f"tf_model_ep{epoch+1}.eqx", model)
+            eqx.tree_serialise_leaves(artefacts_path / f"model_ep{epoch+1}.eqx", model)
 
         if (epoch+1) % (max(CONFIG["nb_epochs"]//10, 1)) == 0:
             val_keys = jax.random.split(key, sample_batch.shape[0])
@@ -571,13 +576,13 @@ if TRAIN:
     wall_time = time.time() - start_time
     print("\nWall time for WARP training in h:m:s:", time.strftime("%H:%M:%S", time.gmtime(wall_time)))
     
-    eqx.tree_serialise_leaves(artefacts_path / "tf_model_final.eqx", model)
+    eqx.tree_serialise_leaves(artefacts_path / "model_final.eqx", model)
     np.save(artefacts_path / "loss_history.npy", np.array(all_losses))
     np.save(artefacts_path / "lr_history.npy", np.array(lr_scales))
 
 else:
     print(f"\n📥 Loading WARP model from {artefacts_path}")
-    model = eqx.tree_deserialise_leaves(artefacts_path / "tf_model_final.eqx", model)
+    model = eqx.tree_deserialise_leaves(artefacts_path / "model_final.eqx", model)
     try:
         all_losses = np.load(artefacts_path / "loss_history.npy").tolist()
         lr_scales = np.load(artefacts_path / "lr_history.npy").tolist()
@@ -657,7 +662,7 @@ if CONFIG["use_nll_loss"]:
 
 #%% Generate Outputs
 test_seq_id = np.random.randint(0, sample_batch.shape[0])
-print(f"Visualizing Test Sequence ID: {test_seq_id}")
+print(f"Visualizing Test Sequence ID: {test_seq_id}", flush=True)
 
 # 1. Plot the static rollout side-by-side
 plot_pred_ref_videos_rollout(

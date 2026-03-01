@@ -50,9 +50,9 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 5,
+    "nb_epochs": 10,
     "print_every": 1,
-    "batch_size": 2 if SINGLE_BATCH else 64*8,
+    "batch_size": 2 if SINGLE_BATCH else 64,
     "learning_rate": 1e-7 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
@@ -69,7 +69,7 @@ CONFIG = {
     # --- Architecture Params ---
     "dynamics_space": 961,
     "lam_space": 64,
-    "split_forward": False,
+    "split_forward": True,
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 500,      
@@ -448,7 +448,7 @@ class WorldModel(eqx.Module):
             use_gt = jnp.logical_or(is_context, is_forced)
 
             # 2. Encode ground truth next frame
-            z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
+            z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
 
             # 6. Predict action
             a_gt = self.lam(z_prev, z_next_gt)
@@ -540,7 +540,7 @@ if TRAIN:
             k_full, k_init = jax.random.split(keys[0], 2)
             
             # 1. Standard Forward Pass
-            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 1.0, precompute_ref_diffs=False)
+            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
 
             # --- SEQUENCE LOSS---
             pred_selected = pred_videos
@@ -587,9 +587,8 @@ if TRAIN:
             batch_keys = jax.random.split(subkey, batch_videos.shape[0])
             
             model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, CONFIG["p_forcing"])
-
             epoch_losses.append(loss)
-
+            
             current_scale = optax.tree_utils.tree_get(opt_state, "scale")
             lr_scales.append(current_scale)
 
@@ -603,7 +602,7 @@ if TRAIN:
             print(f"Epoch {epoch+1}/{CONFIG['nb_epochs']} - Avg Loss: {avg_epoch_loss:.4f} - LR Scale: {current_scale:.4f}", flush=True)
 
         if epoch in [4, CONFIG["nb_epochs"]//2, 2*CONFIG["nb_epochs"]//3]:
-            eqx.tree_serialise_leaves(artefacts_path / f"model_ep{epoch+1}.eqx", model)
+            eqx.tree_serialise_leaves(artefacts_path / f"tf_model_ep{epoch+1}.eqx", model)
 
         if (epoch+1) % (max(CONFIG["nb_epochs"]//10, 1)) == 0:
             val_keys = jax.random.split(key, sample_batch.shape[0])
@@ -616,13 +615,13 @@ if TRAIN:
     wall_time = time.time() - start_time
     print("\nWall time for WorldModel training in h:m:s:", time.strftime("%H:%M:%S", time.gmtime(wall_time)))
     
-    eqx.tree_serialise_leaves(artefacts_path / "model_final.eqx", model)
+    eqx.tree_serialise_leaves(artefacts_path / "tf_model_final.eqx", model)
     np.save(artefacts_path / "loss_history.npy", np.array(all_losses))
     np.save(artefacts_path / "lr_history.npy", np.array(lr_scales))
 
 else:
     print(f"\n📥 Loading WorldModel model from {artefacts_path}")
-    model = eqx.tree_deserialise_leaves(artefacts_path / "model_final.eqx", model)
+    model = eqx.tree_deserialise_leaves(artefacts_path / "tf_model_final.eqx", model)
     try:
         all_losses = np.load(artefacts_path / "loss_history.npy").tolist()
         lr_scales = np.load(artefacts_path / "lr_history.npy").tolist()
@@ -687,7 +686,7 @@ test_dataset = WeatherBenchTemperature(
 test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=False)
 sample_batch = next(iter(test_loader))
 
-print("Batch shape for evaluation:", sample_batch.shape, flush=True)
+print("Batch shape for evaluation:", sample_batch.shape)
 
 pad_length = CONFIG["seq_len"] - sample_batch.shape[1]
 if pad_length > 0:

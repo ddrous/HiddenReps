@@ -41,9 +41,9 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 100,
+    "nb_epochs": 150,
     "print_every": 1,
-    "batch_size": 1 if SINGLE_BATCH else 32,
+    "batch_size": 1 if SINGLE_BATCH else 32*8,
     "learning_rate": 1e-7 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
@@ -59,7 +59,7 @@ CONFIG = {
     # --- Architecture Params ---
     "dynamics_space": 961,
     "lam_space": 64,
-    "split_forward": True,
+    "split_forward": False,
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 500,      
@@ -431,7 +431,8 @@ class WorldModel(eqx.Module):
             use_gt = jnp.logical_or(is_context, is_forced)
 
             # 2. Encode ground truth next frame
-            z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
+            # z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
+            z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
 
             # 6. Predict action
             a_gt = self.lam(z_prev, z_next_gt)
@@ -525,7 +526,8 @@ if TRAIN:
             k_full, k_init = jax.random.split(keys[0], 2)
             
             # 1. Standard Forward Pass (Default behavior, precompute_ref_diffs is False)
-            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
+            # pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
+            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 1.0, precompute_ref_diffs=False)
 
             # --- SEQUENCE LOSS---
             pred_selected = pred_videos
@@ -599,7 +601,7 @@ if TRAIN:
 
         # Periodically save model over the training process
         if epoch in [4, CONFIG["nb_epochs"]//2, 2*CONFIG["nb_epochs"]//3]:
-            eqx.tree_serialise_leaves(artefacts_path / f"tf_model_ep{epoch+1}.eqx", model)
+            eqx.tree_serialise_leaves(artefacts_path / f"model_ep{epoch+1}.eqx", model)
 
         ## Generate intermediate visualizations at the end of each epoch
         if (epoch+1) % (max(CONFIG["nb_epochs"]//10, 1)) == 0:
@@ -616,13 +618,13 @@ if TRAIN:
     print("\nWall time for WorldModel training in h:m:s:", time.strftime("%H:%M:%S", time.gmtime(wall_time)))
     
     # Save final artifacts
-    eqx.tree_serialise_leaves(artefacts_path / "tf_model_final.eqx", model)
+    eqx.tree_serialise_leaves(artefacts_path / "model_final.eqx", model)
     np.save(artefacts_path / "loss_history.npy", np.array(all_losses))
     np.save(artefacts_path / "lr_history.npy", np.array(lr_scales))
 
 else:
     print(f"\n📥 Loading WorldModel model from {artefacts_path}")
-    model = eqx.tree_deserialise_leaves(artefacts_path / "tf_model_final.eqx", model)
+    model = eqx.tree_deserialise_leaves(artefacts_path / "model_final.eqx", model)
     try:
         all_losses = np.load(artefacts_path / "loss_history.npy").tolist()
         lr_scales = np.load(artefacts_path / "lr_history.npy").tolist()
@@ -691,7 +693,7 @@ sample_batch = next(iter(test_loader))
 
 # sample_batch = next(iter(train_loader))
 
-print("Batch shape for evaluation:", sample_batch.shape)
+print("Batch shape for evaluation:", sample_batch.shape, flush=True)
 
 pad_length = 20 - sample_batch.shape[1]
 sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)

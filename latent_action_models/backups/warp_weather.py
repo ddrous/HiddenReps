@@ -5,23 +5,31 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from IPython.display import HTML, display
 import numpy as np
 import time
 import datetime
 from pathlib import Path
 import shutil
-import sys
+import glob
+import subprocess
 from tqdm import tqdm
 from jax.flatten_util import ravel_pytree
 from typing import Optional
 
 import torch
-from torchvision import datasets
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset
 
 import seaborn as sns
 sns.set(style="white", context="talk")
 plt.rcParams['savefig.facecolor'] = 'white'
+plt.rcParams['figure.dpi'] = 150  # Crisp visualizations
+
+try:
+    import xarray as xr
+except ImportError:
+    raise ImportError("Please install xarray and netcdf4: pip install xarray netcdf4")
 
 def count_trainable_params(model):
     def count_params(x):
@@ -39,17 +47,17 @@ SINGLE_BATCH = False
 USE_NLL_LOSS = False
 
 CONFIG = {
-    "seed": 42,
-    "nb_epochs": 150,
+    "seed": 2026,
+    "nb_epochs": 10,
     "print_every": 1,
-    "batch_size": 2 if SINGLE_BATCH else 32*8,
+    "batch_size": 2 if SINGLE_BATCH else 64,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
     "use_nll_loss": USE_NLL_LOSS,
     "aux_encoder_loss": False,
-    "aux_loss_weight": 1,
-    "aux_loss_num_steps": 4,
+    "aux_loss_weight": 0.1,
+    "seq_len": 24,
 
     # --- Architecture Params ---
     "lam_space": 64,
@@ -92,70 +100,86 @@ artefacts_path = run_path / "artefacts"
 plots_path = run_path / "plots"
 
 #%% Cell 2: PyTorch Data Loading & Plotting Helpers
-def numpy_collate(batch):
-    if isinstance(batch[0], tuple):
-        videos = torch.stack([b[0] for b in batch]).numpy()
-    else:
-        videos = torch.stack(batch).numpy()
-    
-    if videos.ndim == 4:
-        videos = np.expand_dims(videos, axis=-1)
-    elif videos.ndim == 5 and videos.shape[2] == 1:
-        videos = np.transpose(videos, (0, 1, 3, 4, 2))
 
-    videos = videos.astype(np.float32)
-    if videos.max() > 2.0:
-        videos = videos / 255.0
+class WeatherBenchTemperature(Dataset):
+    def __init__(self, data_path="./data/WeatherBench", split="train", download=False, seq_len=24, mean=None, std=None):
+        self.data_path = data_path
+        self.split = split
+        self.seq_len = seq_len
+        
+        if download:
+            self._download_and_extract()
+            
+        if split == "train":
+            years = [str(y) for y in range(1979, 2016)]
+        elif split == "val":
+            years = ['2016']
+        elif split == "test":
+            years = ['2017', '2018']
+        else:
+            raise ValueError("Split must be 'train', 'val', or 'test'.")
+            
+        file_patterns = [os.path.join(data_path, f"*{y}*.nc") for y in years]
+        files_to_load = []
+        for pat in file_patterns:
+            files_to_load.extend(glob.glob(pat))
+            
+        if len(files_to_load) == 0:
+            raise FileNotFoundError(f"No .nc files found. Try setting download=True.")
+            
+        print(f"[{split.upper()}] Loading data...")
+        dataset = xr.open_mfdataset(sorted(files_to_load), combine='by_coords')
+        raw_data = dataset.get('t2m').values 
+        
+        if split == "train":
+            self.mean = raw_data.mean() if mean is None else mean
+            self.std = raw_data.std() if std is None else std
+        else:
+            self.mean = raw_data.mean() if mean is None else mean
+            self.std = raw_data.std() if std is None else std
+            
+        norm_data = (raw_data - self.mean) / self.std
+        self.data = np.expand_dims(norm_data, axis=1).astype(np.float32)
+
+    def _download_and_extract(self):
+        if len(glob.glob(os.path.join(self.data_path, "*.nc"))) > 0: return
+        os.makedirs(self.data_path, exist_ok=True)
+        zip_path = os.path.join(self.data_path, "2m_temperature.zip")
+        url = "https://dataserv.ub.tum.de/public.php/dav/files/m1524895/5.625deg/2m_temperature/?accept=zip"
+        subprocess.run(["wget", url, "-O", zip_path], check=True)
+        subprocess.run(["unzip", "-q", zip_path, "-d", self.data_path], check=True)
+        os.remove(zip_path)
+
+    def __len__(self):
+        return len(self.data) - self.seq_len + 1
+
+    def __getitem__(self, idx):
+        seq = self.data[idx : idx + self.seq_len]
+        return torch.from_numpy(seq)
+
+def numpy_collate(batch):
+    # Batch is list of Tensors (T, C, H, W). Stack -> (B, T, C, H, W)
+    videos = torch.stack(batch).numpy()
+    # JAX model expects (B, T, H, W, C)
+    videos = np.transpose(videos, (0, 1, 3, 4, 2))
     return videos
 
-print("Loading Moving MNIST Dataset...")
+print("Loading WeatherBench Dataset...")
 try:
-    data_path = './data' if TRAIN else '../../data'
-    # dataset = datasets.MovingMNIST(root=data_path, split=None, download=True)
-
-    ## Manulally load train and test splits to have more control over batching and shuffling
-    mov_mnist_arrays = np.load(data_path + "/MovingMNIST/mnist_test_seq.npy")
-    print(f"Original loaded MovingMNIST shape: {mov_mnist_arrays.shape} (T, N, H, W)")
-    ## SPlit, 8000 train, 2000 test
-    train_arrays = mov_mnist_arrays[:, :8000]
-    test_arrays = mov_mnist_arrays[:, 8000:]
-
-    ## Create PyTorch dataset
-    class MovingMNISTDataset(torch.utils.data.Dataset):
-        def __init__(self, data_array):
-            self.data_array = data_array
-
-        def __len__(self):
-            return self.data_array.shape[1]
-
-        def __getitem__(self, idx):
-            video = self.data_array[:, idx]  # Shape (T, H, W)
-            video = np.expand_dims(video, axis=-1)  # Add channel dimension -> (T, H, W, 1)
-            return torch.from_numpy(video.astype(np.float32))
-
-    dataset = MovingMNISTDataset(train_arrays)
-
+    data_path = './data/WeatherBench/2m_temperature' if TRAIN else '../../data/WeatherBench/2m_temperature'
+    train_dataset = WeatherBenchTemperature(data_path=data_path, split="train", download=False, seq_len=CONFIG["seq_len"])
+    
     if SINGLE_BATCH:
-        training_subset = Subset(dataset, range(CONFIG["batch_size"]))
-        train_loader = DataLoader(
-            training_subset, 
-            batch_size=CONFIG["batch_size"]//1, 
-            shuffle=False, 
-            collate_fn=numpy_collate, 
-            drop_last=True
-        )
+        training_subset = Subset(train_dataset, range(CONFIG["batch_size"]))
+        train_loader = DataLoader(training_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=True)
     else:
-        train_loader = DataLoader(dataset, 
-                                  batch_size=CONFIG["batch_size"], 
-                                  shuffle=True, 
-                                  collate_fn=numpy_collate, 
-                                  drop_last=False)
+        train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=numpy_collate, drop_last=False)
 
     sample_batch = next(iter(train_loader))
     B, nb_frames, H, W, C = sample_batch.shape
     print(f"Batched Video shape: {sample_batch.shape}")
 except Exception as e:
-    print(f"Could not load MovingMNIST: {e}")
+    print(f"Could not load WeatherBench: {e}")
     raise e
 
 y_coords = jnp.linspace(-1, 1, H)
@@ -163,47 +187,78 @@ x_coords = jnp.linspace(-1, 1, W)
 X_grid, Y_grid = jnp.meshgrid(x_coords, y_coords)
 coords_grid = jnp.stack([X_grid, Y_grid], axis=-1) 
 
-def sbimshow(img, title="", ax=None):
-    img = np.clip(img, 0.0, 1.0)
-    if img.shape[-1] == 1:
-        img = np.repeat(img, 3, axis=-1)
+def get_vmin_vmax(v1, v2):
+    return min(v1.min(), v2.min()), max(v1.max(), v2.max())
+
+def sbimshow(img, title="", ax=None, vmin=None, vmax=None):
     if ax is None:
-        plt.imshow(img)
-        plt.title(title)
+        plt.imshow(img, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation='nearest')
+        plt.title(title, fontsize=10)
         plt.axis('off')
     else:
-        ax.imshow(img)
-        ax.set_title(title)
+        ax.imshow(img, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation='nearest')
+        ax.set_title(title, fontsize=10)
         ax.axis('off')
 
 def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=None):
     nb_frames = video.shape[0]
-
-    rescale = False
-    if ref_video[..., :C].min() < 0.0:
-        rescale = True
-        ref_video = (ref_video + 1.0) / 2.0
+    # vmin, vmax = get_vmin_vmax(video[..., :C], ref_video[..., :C])
+    vmin, vmax = get_vmin_vmax(ref_video[..., :C], ref_video[..., :C])
 
     if video.shape[-1] == 1:
-        fig, axes = plt.subplots(2, 1+(nb_frames//2), figsize=(20, 6))
+        fig, axes = plt.subplots(2, 1+(nb_frames//2), figsize=(20, 5))
         indices_to_plot = list(np.arange(0, nb_frames, 2)) + [nb_frames-1]
         for i, idx in enumerate(indices_to_plot):
-            video_to_plot = video[idx] if not rescale else (video[idx] + 1.0) / 2.0
-            sbimshow(video_to_plot, title=f"{title} t={idx}", ax=axes[0, i])
-            sbimshow(ref_video[idx], title=f"Ref t={idx}", ax=axes[1, i])
+            sbimshow(video[idx, ..., 0], title=f"{title} t={idx}h", ax=axes[0, i], vmin=vmin, vmax=vmax)
+            sbimshow(ref_video[idx, ..., 0], title=f"Ref t={idx}h", ax=axes[1, i], vmin=vmin, vmax=vmax)
     else:
         fig, axes = plt.subplots(3, 1+(nb_frames//2), figsize=(20, 7))
         indices_to_plot = list(np.arange(0, nb_frames, 2)) + [nb_frames-1]
         for i, idx in enumerate(indices_to_plot):
-            video_to_plot = video[idx, ..., :C] if not rescale else (video[idx, ..., :C] + 1.0) / 2.0
-            sbimshow(video_to_plot, title=f"Mean t={idx}", ax=axes[0, i])
-            sbimshow(video[idx, ..., C:], title=f"Std t={idx}", ax=axes[1, i])
-            sbimshow(ref_video[idx], title=f"Ref t={idx}", ax=axes[2, i])
+            sbimshow(video[idx, ..., 0], title=f"Mean t={idx}h", ax=axes[0, i], vmin=vmin, vmax=vmax)
+            sbimshow(video[idx, ..., 1], title=f"Std t={idx}h", ax=axes[1, i]) # std map gets its own scale
+            sbimshow(ref_video[idx, ..., 0], title=f"Ref t={idx}h", ax=axes[2, i], vmin=vmin, vmax=vmax)
 
     plt.tight_layout()
     if save_name:
         plt.savefig(plots_path / save_name)
     plt.show()
+
+def animate_side_by_side(pred_video, ref_video, title="Prediction vs Ground Truth", interval=200):
+    """HTML5 video for Predicted vs Reference Weather Sequences."""
+    seq_len = pred_video.shape[0]
+    # vmin, vmax = get_vmin_vmax(pred_video[..., :C], ref_video[..., :C])
+    vmin, vmax = get_vmin_vmax(ref_video[..., :C], ref_video[..., :C])
+    
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), dpi=120)
+    
+    im_pred = axes[0].imshow(pred_video[0, ..., 0], cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation='nearest')
+    axes[0].axis('off')
+    title_pred = axes[0].set_title(f"Predicted | t=0h")
+    
+    im_ref = axes[1].imshow(ref_video[0, ..., 0], cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation='nearest')
+    axes[1].axis('off')
+    title_ref = axes[1].set_title(f"Ground Truth | t=0h")
+    
+    # Shared Colorbar
+    cbar = fig.colorbar(im_ref, ax=axes, fraction=0.02, pad=0.04)
+    cbar.set_label("Norm. Temperature")
+    plt.suptitle(title, y=1.05)
+    
+    def update(frame):
+        im_pred.set_array(pred_video[frame, ..., 0])
+        title_pred.set_text(f"Predicted | t={frame}h")
+        im_ref.set_array(ref_video[frame, ..., 0])
+        title_ref.set_text(f"Ground Truth | t={frame}h")
+        return [im_pred, title_pred, im_ref, title_ref]
+        
+    ani = animation.FuncAnimation(fig, update, frames=seq_len, interval=interval, blit=False)
+
+    ## Save as GIF (optional)
+    ani.save(plots_path / f"{title.replace(' ', '_')}.gif", writer='pillow', fps=5)
+
+    plt.close(fig)
+    return HTML(ani.to_jshtml())
 
 #%% Cell 3: Model Definition
 
@@ -313,7 +368,6 @@ class WARP(eqx.Module):
         self.split_forward = split_forward
         H, W, C = frame_shape
 
-        # Set up implicit renderer (decoder)
         coord_dim = 2 + 2 * 2 * num_freqs 
         root_out_dim = C * 2 if CONFIG["use_nll_loss"] else C
         template_root = RootMLP(coord_dim, root_out_dim, root_width, root_depth, k_root)
@@ -322,7 +376,6 @@ class WARP(eqx.Module):
         self.d_theta = flat_params.shape[0]
         self.theta_base = flat_params
 
-        # Set up JEPA dynamics components
         self.encoder = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_enc, hidden_width=64)
         self.lam = LAM(self.d_theta, lam_dim, key=k_lam)
         self.forward_dyn = ForwardDynamics(self.d_theta, lam_dim, split_forward, key=k_fwd)
@@ -349,53 +402,14 @@ class WARP(eqx.Module):
     def render_frame(self, theta_offset, coords_grid):
         H, W, C = self.frame_shape
         flat_coords = coords_grid.reshape(-1, 2)
-        
-        # Add the base weights before rendering!
         theta = theta_offset + self.theta_base
         thetas_frame = jnp.tile(theta, (H*W, 1))
-        
         pred_flat = self.render_pixels(thetas_frame, flat_coords)
         return pred_flat.reshape(H, W, -1)
-
-    # def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
-    #     T = ref_video.shape[0]
-    #     init_frame = ref_video[0]
-
-    #     # 1. Initialize offset from first frame
-    #     z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
-
-    #     def scan_step(z_prev, scan_inputs):
-    #         gt_curr_frame, step_idx = scan_inputs
-    #         k = jax.random.fold_in(key, step_idx)
-    #         k, subk = jax.random.split(k)
-
-    #         # Render pixels explicitly using our helper
-    #         pred_out = self.render_frame(z_prev, coords_grid)
-
-    #         z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
-    #         z_next_base = self.forward_dyn(z_prev, jnp.zeros(self.lam_dim))     ## TODO: zero action means continue dynamics without forcing towards GT
-
-    #         t_ratio = step_idx / (T - 1)
-    #         is_context = t_ratio <= inf_context_ratio
-    #         is_forced = jax.random.bernoulli(subk, p_forcing)
-    #         use_gt = jnp.logical_or(is_context, is_forced)
-
-    #         z_target = jnp.where(use_gt, z_next_gt, z_next_base)
-    #         a_t = self.lam(z_prev, z_target)
-    #         z_next = self.forward_dyn(z_prev, a_t)
-
-    #         return z_next, (z_next, pred_out)
-
-    #     scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
-    #     _, (pred_latents, pred_video) = jax.lax.scan(scan_step, z_init, scan_inputs)
-
-    #     return pred_latents, pred_video
 
     def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
         T = ref_video.shape[0]
         init_frame = ref_video[0]
-
-        # 1. Initialize offset from first frame
         z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
 
         def scan_step(z_prev, scan_inputs):
@@ -403,28 +417,18 @@ class WARP(eqx.Module):
             k = jax.random.fold_in(key, step_idx)
             k, subk = jax.random.split(k)
 
-            # Render pixels explicitly using our helper
             pred_out = self.render_frame(z_prev, coords_grid)
 
-            # Determine if we are forcing towards ground truth this step
             t_ratio = step_idx / T - 1
             is_context = t_ratio < inf_context_ratio
             is_forced = jax.random.bernoulli(subk, p_forcing)
             use_gt = jnp.logical_or(is_context, is_forced)
 
-            # Encode the ground truth future
-            # z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
-            z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
-
-            # Compute the required action to hit GT
+            z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
             a_gt = self.lam(z_prev, z_next_gt)
-
-            # THE FIX: If using GT, use the LAM's action. Otherwise, default to 0.
             a_t = jnp.where(use_gt, a_gt, jnp.zeros(self.lam_dim))
 
-            # SINGLE forward dynamics call handles both the forced and autoregressive paths!
             z_next = self.forward_dyn(z_prev, a_t)
-
             return z_next, (z_next, pred_out)
 
         scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
@@ -465,7 +469,6 @@ A_init = model.A.copy()
 
 
 print(f"Dynamics Weight Space Dimension (d_theta): {model.d_theta}")
-
 print(f"Total Trainable Parameters in WARP: {count_trainable_params(model)}")
 
 count_A = count_trainable_params(model.forward_dyn.mlp_A)
@@ -499,29 +502,17 @@ if TRAIN:
     def train_step(model, opt_state, keys, ref_videos, coords_grid, p_forcing):
         def loss_fn(m):
             k_full, k_init = jax.random.split(keys[0], 2)
-            
-            # Forward pass: Extract both predicted thetas and rendered pixels
-            # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
-            # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
+            pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
 
-            context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
-            pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
-
-            # --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
-            # latent_loss = jnp.mean((pred_thetas - target_thetas_shifted)**2)
             rec_loss = jnp.mean((pred_videos - ref_videos)**2)
 
-            # --- 2. AUTOENCODING LOSS (Auxiliary) ---
             if CONFIG["aux_encoder_loss"]:
-
-                indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(CONFIG["aux_loss_num_steps"],), replace=False)
+                indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(4,), replace=False)
 
                 # Encode ground truth to target thetas
                 ref_videos_enc = jnp.transpose(ref_videos[:, indices], (0, 1, 4, 2, 3))
                 target_thetas = jax.vmap(jax.vmap(m.encoder))(ref_videos_enc)
 
-                # Render Target Thetas -> Match GT Pixels
-                # We vmap our fast render_frame function across Batches and Time steps
                 batched_render = jax.vmap(jax.vmap(lambda theta: m.render_frame(theta, coords_grid)))
                 decoded_pixels = batched_render(target_thetas)
 
@@ -534,7 +525,6 @@ if TRAIN:
                 ae_loss = 0.0
 
             total_loss = rec_loss + CONFIG["aux_loss_weight"] * ae_loss
-
             return total_loss
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
@@ -544,27 +534,6 @@ if TRAIN:
         )
         model = eqx.apply_updates(model, updates)
         return model, opt_state, loss_val
-
-    @eqx.filter_jit
-    def compute_p_forcing(epoch, schedule="linear", start=1.0, end=0.0):
-        ### if linear decay, make if JAX numpy compatible and compute outside of train_step
-        if schedule == "linear":
-            p = start + (end - start) * (epoch / CONFIG["nb_epochs"])
-            # return jnp.array(p, dtype=jnp.float32).item()
-            return p
-        elif schedule == "constant":
-            return start
-        elif schedule == "exponential":
-            decay_rate = (end / start) ** (1 / CONFIG["nb_epochs"])
-            p = start * (decay_rate ** epoch)
-            # return jnp.array(p, dtype=jnp.float32).item()
-            return p
-        elif schedule == "step":
-            ## 5 steps for now, can be made more flexible
-            possible_ps = jnp.linspace(start, end, num=5)
-            step_size = CONFIG["nb_epochs"] // 5
-            step_idx = epoch // step_size
-            return possible_ps[min(step_idx, len(possible_ps)-1)]
 
     all_losses = []
     lr_scales = []
@@ -577,10 +546,6 @@ if TRAIN:
             batch_keys = jax.random.split(subkey, batch_videos.shape[0])
             
             model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, CONFIG["p_forcing"])
-
-            # p_forcing = compute_p_forcing(epoch, schedule="step", start=CONFIG["p_forcing"], end=0.0)
-            # model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, p_forcing)
-
             epoch_losses.append(loss)
 
             current_scale = optax.tree_utils.tree_get(opt_state, "scale")
@@ -593,7 +558,7 @@ if TRAIN:
             print(f"Epoch {epoch+1}/{CONFIG['nb_epochs']} - Avg Loss: {avg_epoch_loss:.4f} - LR Scale: {current_scale:.4f}", flush=True)
 
         if epoch in [4, CONFIG["nb_epochs"]//2, 2*CONFIG["nb_epochs"]//3]:
-            eqx.tree_serialise_leaves(artefacts_path / f"model_ep{epoch+1}.eqx", model)
+            eqx.tree_serialise_leaves(artefacts_path / f"tf_model_ep{epoch+1}.eqx", model)
 
         if (epoch+1) % (max(CONFIG["nb_epochs"]//10, 1)) == 0:
             val_keys = jax.random.split(key, sample_batch.shape[0])
@@ -606,13 +571,13 @@ if TRAIN:
     wall_time = time.time() - start_time
     print("\nWall time for WARP training in h:m:s:", time.strftime("%H:%M:%S", time.gmtime(wall_time)))
     
-    eqx.tree_serialise_leaves(artefacts_path / "model_final.eqx", model)
+    eqx.tree_serialise_leaves(artefacts_path / "tf_model_final.eqx", model)
     np.save(artefacts_path / "loss_history.npy", np.array(all_losses))
     np.save(artefacts_path / "lr_history.npy", np.array(lr_scales))
 
 else:
     print(f"\n📥 Loading WARP model from {artefacts_path}")
-    model = eqx.tree_deserialise_leaves(artefacts_path / "model_final.eqx", model)
+    model = eqx.tree_deserialise_leaves(artefacts_path / "tf_model_final.eqx", model)
     try:
         all_losses = np.load(artefacts_path / "loss_history.npy").tolist()
         lr_scales = np.load(artefacts_path / "lr_history.npy").tolist()
@@ -623,8 +588,6 @@ else:
 
 #%% Cell 5: Final Visualizations
 print("\n=== Generating Dashboards ===")
-
-# print(len(all_losses), "loss points collected during training.")
 
 if len(all_losses) > 0:
     fig, ax1 = plt.subplots(figsize=(10, 5))
@@ -666,40 +629,52 @@ plt.tight_layout()
 plt.savefig(plots_path / "recurrence_matrix_A.png")
 plt.show()
 
-#%%
+#%% Cell 6: Testing & Animations
 
-# testing_subset = datasets.MovingMNIST(root=data_path, split="test", download=True)
+test_dataset = WeatherBenchTemperature(
+    data_path=data_path, 
+    split="test", 
+    download=False, 
+    seq_len=CONFIG["seq_len"],
+    mean=train_dataset.mean,
+    std=train_dataset.std
+)
 
-testing_subset = MovingMNISTDataset(test_arrays)
-test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=False)
+test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=False)
 sample_batch = next(iter(test_loader))
 
-# sample_batch = next(iter(train_loader))
+print("Batch shape for evaluation:", sample_batch.shape)
 
-print("Batch shape for evaluation:", sample_batch.shape, flush=True)
-
-pad_length = 20 - sample_batch.shape[1]
-sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)
+pad_length = CONFIG["seq_len"] - sample_batch.shape[1]
+if pad_length > 0:
+    sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)
 
 val_keys = jax.random.split(key, sample_batch.shape[0])
-_, final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.5, precompute_ref_diffs=False)
+_, final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
 
 if CONFIG["use_nll_loss"]:
     print(f"Final Predicted Video Mean Pixel Value Range: min={final_videos[...,:C].min():.4f}, max={final_videos[...,:C].max():.4f}")
-    print(f"Final Predicted Video Std Pixel Value Range: min={final_videos[...,C:].min():.4f}, max={final_videos[...,C:].max():.4f}")
 
-#%%
+#%% Generate Outputs
 test_seq_id = np.random.randint(0, sample_batch.shape[0])
+print(f"Visualizing Test Sequence ID: {test_seq_id}")
 
+# 1. Plot the static rollout side-by-side
 plot_pred_ref_videos_rollout(
     final_videos[test_seq_id], 
     sample_batch[test_seq_id],
     title=f"Pred", 
-    save_name="inference_forecast_rollout.png"
+    save_name=f"inference_forecast_rollout_{test_seq_id}.png"
 )
+
+# 2. Render the interactive HTML5 Video 
+video_html = animate_side_by_side(
+    final_videos[test_seq_id], 
+    sample_batch[test_seq_id]
+)
+display(video_html)
 
 # %%
 os.system(f"cp -r nohup.log {run_path}/nohup.log")
 
 #%%
-
