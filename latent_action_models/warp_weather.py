@@ -50,7 +50,7 @@ CONFIG = {
     "seed": 2026,
     "nb_epochs": 5,
     "print_every": 1,
-    "batch_size": 2 if SINGLE_BATCH else 64*8,
+    "batch_size": 2 if SINGLE_BATCH else 64*1,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,

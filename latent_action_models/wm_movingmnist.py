@@ -493,6 +493,7 @@ print(f"Total Trainable Parameters in WorldModel: {count_trainable_params(model)
 
 count_A = count_trainable_params(model.forward_dyn.mlp_A)
 count_B = count_trainable_params(model.forward_dyn.mlp_B)
+count_giant = count_trainable_params(model.forward_dyn.giant_mlp)
 count_lam = count_trainable_params(model.lam)
 count_encoder = count_trainable_params(model.encoder)
 count_decoder = count_trainable_params(model.decoder)
@@ -500,6 +501,7 @@ print(" - in the Encoder:", count_encoder)
 print(" - in the Decoder:", count_decoder)
 print(" - in the Forward Dynamics A:", count_A)
 print(" - in the Forward Dynamics B:", count_B)
+print(" - in the Forward Dynamics Giant MLP:", count_giant)
 print(" - in the Inv. Dynamics (LAM):", count_lam)
 
 if TRAIN:
@@ -527,7 +529,10 @@ if TRAIN:
             
             # 1. Standard Forward Pass (Default behavior, precompute_ref_diffs is False)
             # pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
-            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 1.0, precompute_ref_diffs=False)
+            # pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 1.0, precompute_ref_diffs=False)
+
+            context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
+            pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
 
             # --- SEQUENCE LOSS---
             pred_selected = pred_videos
