@@ -40,7 +40,7 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 200*1,
+    "nb_epochs": 200*6,
     "print_every": 1,
     "batch_size": 2 if SINGLE_BATCH else 32*8,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
@@ -53,7 +53,7 @@ CONFIG = {
 
     # --- Architecture Params ---
     "lam_space": 32,
-    "mem_space": 128*4,
+    "mem_space": 128*2,
     "split_forward": True,
     "root_width": 12,
     "root_depth": 5,
@@ -61,7 +61,7 @@ CONFIG = {
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 400,      
-    "lr_cooldown": 0,       
+    "lr_cooldown": 100,       
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
     "lr_accum_size": 5,     
@@ -264,7 +264,7 @@ class CNNEncoder(eqx.Module):
 class LAM(eqx.Module):
     mlp: eqx.nn.MLP
     def __init__(self, dyn_dim, lam_dim, key):
-        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim*2, depth=2, key=key)
+        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim*1, depth=2, key=key)
         
     def __call__(self, z_prev, z_target):
         return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
@@ -501,7 +501,7 @@ class WARP(eqx.Module):
         def scan_step(carry, scan_inputs):
             z_t, m_t = carry
             o_tp1, step_idx = scan_inputs
-            subk = jax.random.fold_in(key, step_idx)
+            # subk = jax.random.fold_in(key, step_idx)
 
             # --- FIX: Move rendering INSIDE the checkpointed step ---
             # This prevents JAX from accumulating INR activations for all timesteps at once.
@@ -615,8 +615,9 @@ if TRAIN:
             # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
 
             # context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
-            context_ratio = jax.random.uniform(k_full, minval=0.25, maxval=1.0)
-            pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
+            # context_ratio = jax.random.uniform(k_full, minval=0.25, maxval=1.0)
+            context_ratio = CONFIG["inf_context_ratio"]
+            _, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
 
             # --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
             # latent_loss = jnp.mean((pred_thetas - target_thetas_shifted)**2)
