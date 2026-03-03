@@ -40,11 +40,11 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 50,
+    "nb_epochs": 200*6,
     "print_every": 1,
-    "batch_size": 2 if SINGLE_BATCH else 8*1,
+    "batch_size": 2 if SINGLE_BATCH else 32*8,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
-    "p_forcing": 0.0,
+    "p_forcing": 0.5,
     "inf_context_ratio": 0.5,
     "use_nll_loss": USE_NLL_LOSS,
     "aux_encoder_loss": False,
@@ -52,16 +52,16 @@ CONFIG = {
     "aux_loss_num_steps": 4,
 
     # --- Architecture Params ---
-    "lam_space": 64,
-    "mem_space": 64*4,
+    "lam_space": 32,
+    "mem_space": 128*4,
     "split_forward": True,
     "root_width": 12,
     "root_depth": 5,
     "num_fourier_freqs": 6,
 
     # --- Plateau Scheduler Config ---
-    "lr_patience": 500,      
-    "lr_cooldown": 0,       
+    "lr_patience": 400,      
+    "lr_cooldown": 100,       
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
     "lr_accum_size": 5,     
@@ -264,7 +264,7 @@ class CNNEncoder(eqx.Module):
 class LAM(eqx.Module):
     mlp: eqx.nn.MLP
     def __init__(self, dyn_dim, lam_dim, key):
-        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim, depth=2, key=key)
+        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim*2, depth=2, key=key)
         
     def __call__(self, z_prev, z_target):
         return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
@@ -316,17 +316,20 @@ class MemoryModule(eqx.Module):
         # enc_in_dim = lam_dim + mem_dim + 1
         enc_in_dim = lam_dim + 0
         
+        # int_dim = (mem_dim + lam_dim) // 2
+        int_dim = mem_dim * 2
+
         # 1. The Gate Network: Outputs values squashed between 0 and 1 (via sigmoid)
         # It decides WHAT to forget and WHAT to let in.
-        self.self_mlp = eqx.nn.MLP(mem_dim, mem_dim, width_size=mem_dim * 2, depth=2, key=k1)
+        self.self_mlp = eqx.nn.MLP(mem_dim, mem_dim, width_size=mem_dim*2, depth=2, key=k1)
         
         # 2. The Candidate Network: Outputs values squashed between -1 and 1 (via tanh)
         # It represents the NEW information extracted from the current action.
-        self.candidate_mlp = eqx.nn.MLP(enc_in_dim, mem_dim, width_size=mem_dim * 2, depth=2, key=k2)
+        self.candidate_mlp = eqx.nn.MLP(enc_in_dim, mem_dim, width_size=int_dim, depth=2, key=k2)
 
         # Decoding just needs the memory state and time.
         dec_in_dim = mem_dim + 0
-        self.decoder_mlp = eqx.nn.MLP(dec_in_dim, lam_dim, width_size=mem_dim * 2, depth=2, key=k3)
+        self.decoder_mlp = eqx.nn.MLP(dec_in_dim, lam_dim, width_size=int_dim, depth=2, key=k3)
 
     def reset(self, mem_dim):
         """Returns an empty initial memory state."""
@@ -358,6 +361,7 @@ class MemoryModule(eqx.Module):
         m_new = self.self_mlp(m) + self.candidate_mlp(x)
 
         return m_new
+        # return jax.nn.tanh(m_new)
 
     def decode(self, m, t):
         """
@@ -491,37 +495,47 @@ class WARP(eqx.Module):
 
         m_init = jnp.zeros(self.mem_dim)
 
-        # @eqx.filter_checkpoint
+        # 2. Add the Equinox checkpointing decorator here!
+        # Recompute internal activations during the backward pass.
+        @eqx.filter_checkpoint
         def scan_step(carry, scan_inputs):
             z_t, m_t = carry
             o_tp1, step_idx = scan_inputs
+            subk = jax.random.fold_in(key, step_idx)
+
+            # --- FIX: Move rendering INSIDE the checkpointed step ---
+            # This prevents JAX from accumulating INR activations for all timesteps at once.
+            pred_out = self.render_frame(z_t, coords_grid)
 
             # Determine if we are forcing towards ground truth this step
             t_ratio = step_idx / T
             is_context = t_ratio < context_ratio
+            # is_forced = jax.random.bernoulli(subk, p_forcing)       #TODO: use mode="high" for small p
+            # use_gt = jnp.logical_or(is_context, is_forced)
+            use_gt = is_context
 
             # ONLY compute encoder and LAM when use_gt is True
             a_t = jax.lax.cond(
-                is_context,
+                use_gt,
                 lambda: self.lam(
                     z_t, 
                     jax.lax.stop_gradient(self.encoder(jnp.transpose(o_tp1, (2, 0, 1))))
                 ),
-                lambda: self.memory.decode(m_t, t_ratio)
+                lambda: self.memory.decode(m_t, None)
             )
 
             ## Encode into the memory with C
-            m_tp1 = self.memory.encode(m_t, a_t, t_ratio)
+            m_tp1 = self.memory.encode(m_t, a_t, None)
 
             # SINGLE forward dynamics call handles both the forced and autoregressive paths!
             z_tp1 = self.forward_dyn(z_t, a_t)
 
-            return (z_tp1, m_tp1), z_t
+            return (z_tp1, m_tp1), (z_t, pred_out)
 
         scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
-        _, pred_latents = jax.lax.scan(scan_step, (z_init, m_init), scan_inputs)
-
-        pred_video = eqx.filter_vmap(self.render_frame, in_axes=(0, None))(pred_latents, coords_grid)
+        
+        # 3. Execute the scan as normal, collecting both latents and rendered frames
+        _, (pred_latents, pred_video) = jax.lax.scan(scan_step, (z_init, m_init), scan_inputs)
 
         return pred_latents, pred_video
 
@@ -565,10 +579,12 @@ print(f"Total Trainable Parameters in WARP: {count_trainable_params(model)}")
 count_A = count_trainable_params(model.forward_dyn.mlp_A)
 count_B = count_trainable_params(model.forward_dyn.mlp_B)
 count_lam = count_trainable_params(model.lam)
+count_memory = count_trainable_params(model.memory)
 count_encoder = count_trainable_params(model.encoder)
 theta_base = count_trainable_params(model.theta_base)
 print(" - in the Encoder:", count_encoder)
 print(" - in the base theta:", theta_base)
+print(" - in the Memory Module:", count_memory)
 print(" - in the Forward Dynamics A:", count_A)
 print(" - in the Forward Dynamics B:", count_B)
 print(" - in the Inv. Dynamics (LAM):", count_lam)
@@ -598,8 +614,8 @@ if TRAIN:
             # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
             # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
 
-            context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
-            # context_ratio = 1.0
+            # context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
+            context_ratio = jax.random.uniform(k_full, minval=0.25, maxval=1.0)
             pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
 
             # --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
