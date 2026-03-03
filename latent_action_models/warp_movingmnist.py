@@ -39,10 +39,10 @@ SINGLE_BATCH = False
 USE_NLL_LOSS = False
 
 CONFIG = {
-    "seed": 2026,
-    "nb_epochs": 200*6,
+    "seed": 42,
+    "nb_epochs": 5000,
     "print_every": 1,
-    "batch_size": 2 if SINGLE_BATCH else 32*8,
+    "batch_size": 2 if SINGLE_BATCH else 256*6,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.5,
     "inf_context_ratio": 0.5,
@@ -399,7 +399,7 @@ class WARP(eqx.Module):
         # Set up implicit renderer (decoder)
         coord_dim = 2 + 2 * 2 * num_freqs 
         root_out_dim = C * 2 if CONFIG["use_nll_loss"] else C
-        template_root = RootMLP(coord_dim, root_out_dim, root_width, root_depth, k_root)
+        template_root = RootMLP(coord_dim+0, root_out_dim, root_width, root_depth, k_root)
         
         flat_params, self.unravel_fn = ravel_pytree(template_root)
         self.d_theta = flat_params.shape[0]
@@ -420,27 +420,29 @@ class WARP(eqx.Module):
         else:
             return self.forward_dyn.giant_mlp.layers[-1].weight
 
-    def render_pixels(self, thetas, coords):
+    def render_pixels(self, theta, coords):
         def render_pt(theta, coord):
             root = self.unravel_fn(theta)
-            encoded_coord = fourier_encode(coord, self.num_freqs)
+            encoded_coord = fourier_encode(coord[1:], self.num_freqs)
+            # encoded_coord = jnp.concatenate([coord[:1], fourier_encode(coord[1:], self.num_freqs)], axis=-1)      @TODO: maybe add time coord here in the future?
             out = root(encoded_coord)
             if CONFIG["use_nll_loss"]:
                 mean, std = out[:C], out[C:]
                 std = jax.nn.softplus(std) + 1e-4
                 return jnp.concatenate([mean, std], axis=-1)
             return out
-        return jax.vmap(render_pt)(thetas, coords)
+        # return jax.vmap(render_pt)(thetas, coords)
+        return jax.vmap(render_pt, in_axes=(None, 0))(theta, coords)
 
     def render_frame(self, theta_offset, coords_grid):
         H, W, C = self.frame_shape
-        flat_coords = coords_grid.reshape(-1, 2)
+        flat_coords = coords_grid.reshape(-1, 3)
         
         # Add the base weights before rendering!
         theta = theta_offset + self.theta_base
-        thetas_frame = jnp.tile(theta, (H*W, 1))
+        # thetas_frame = jnp.tile(theta, (H*W, 1))
         
-        pred_flat = self.render_pixels(thetas_frame, flat_coords)
+        pred_flat = self.render_pixels(theta, flat_coords)
         return pred_flat.reshape(H, W, -1)
 
     # def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
@@ -503,9 +505,13 @@ class WARP(eqx.Module):
             o_tp1, step_idx = scan_inputs
             # subk = jax.random.fold_in(key, step_idx)
 
-            # --- FIX: Move rendering INSIDE the checkpointed step ---
-            # This prevents JAX from accumulating INR activations for all timesteps at once.
-            pred_out = self.render_frame(z_t, coords_grid)
+            # --- Rendering INSIDE the checkpointed step ---
+            # Concatenate the time t to the coordinates before rendering
+            time_coord = jnp.array([(step_idx-1)/ (T-1)], dtype=z_t.dtype)
+            # print("SHapes in scan_step:", z_t.shape, m_t.shape, o_tp1.shape, coords_grid.shape)
+            coords_grid_t = jnp.concatenate([jnp.full_like(coords_grid[..., :1], time_coord), coords_grid], axis=-1)
+
+            pred_out = self.render_frame(z_t, coords_grid_t)
 
             # Determine if we are forcing towards ground truth this step
             t_ratio = step_idx / T
@@ -634,7 +640,9 @@ if TRAIN:
 
                 # Render Target Thetas -> Match GT Pixels
                 # We vmap our fast render_frame function across Batches and Time steps
-                batched_render = jax.vmap(jax.vmap(lambda theta: m.render_frame(theta, coords_grid)))
+                ## Concat t=0 to the coords
+                coords_grid_t0 = jnp.concatenate([jnp.zeros_like(coords_grid[..., :1]), coords_grid], axis=-1)
+                batched_render = jax.vmap(jax.vmap(lambda theta: m.render_frame(theta, coords_grid_t0)))
                 decoded_pixels = batched_render(target_thetas)
 
                 if CONFIG["use_nll_loss"]:
