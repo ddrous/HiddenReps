@@ -445,16 +445,25 @@ class WorldModel(eqx.Module):
             t_ratio = step_idx / T
             is_context = t_ratio < inf_context_ratio
             is_forced = jax.random.bernoulli(subk, p_forcing)
-            use_gt = jnp.logical_or(is_context, is_forced)
+            use_gt = jnp.logical_or(is_context, False)
 
-            # 2. Encode ground truth next frame
-            z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
+            # # 2. Encode ground truth next frame
+            # z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
 
-            # 6. Predict action
-            a_gt = self.lam(z_prev, z_next_gt)
+            # # 6. Predict action
+            # a_gt = self.lam(z_prev, z_next_gt)
 
-            # 5. Decide whether to use GT action or zero action
-            a_t = jnp.where(use_gt, a_gt, jnp.zeros_like(a_gt))
+            # # 5. Decide whether to use GT action or zero action
+            # a_t = jnp.where(use_gt, a_gt, jnp.zeros_like(a_gt))
+
+            a_t = jax.lax.cond(
+                use_gt,
+                 lambda: self.lam(
+                     z_prev, 
+                     jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
+                 ),
+                 lambda: jnp.zeros(self.lam_dim)
+             )
 
             # 7. Step forward in latent space
             z_next = self.forward_dyn(z_prev, a_t)
@@ -725,4 +734,5 @@ display(video_html)
 
 # %%
 os.system(f"cp -r nohup.log {run_path}/nohup.log")
+
 #%%

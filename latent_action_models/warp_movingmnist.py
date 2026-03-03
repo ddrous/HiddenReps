@@ -39,10 +39,10 @@ SINGLE_BATCH = False
 USE_NLL_LOSS = False
 
 CONFIG = {
-    "seed": 42,
-    "nb_epochs": 150,
+    "seed": 2026,
+    "nb_epochs": 50,
     "print_every": 1,
-    "batch_size": 2 if SINGLE_BATCH else 32*1,
+    "batch_size": 2 if SINGLE_BATCH else 8*1,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.0,
     "inf_context_ratio": 0.5,
@@ -53,13 +53,14 @@ CONFIG = {
 
     # --- Architecture Params ---
     "lam_space": 64,
+    "mem_space": 64*4,
     "split_forward": True,
     "root_width": 12,
     "root_depth": 5,
     "num_fourier_freqs": 6,
 
     # --- Plateau Scheduler Config ---
-    "lr_patience": 300,      
+    "lr_patience": 500,      
     "lr_cooldown": 0,       
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
@@ -263,7 +264,7 @@ class CNNEncoder(eqx.Module):
 class LAM(eqx.Module):
     mlp: eqx.nn.MLP
     def __init__(self, dyn_dim, lam_dim, key):
-        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim, depth=3, key=key)
+        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim, depth=2, key=key)
         
     def __call__(self, z_prev, z_target):
         return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
@@ -278,8 +279,8 @@ class ForwardDynamics(eqx.Module):
         self.split_forward = split_forward
         k1, k2, k3 = jax.random.split(key, 3)
         if split_forward:
-            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=3, key=k1)
-            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=3, key=k2)
+            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k1)
+            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k2)
             self.giant_mlp = None
         else:
             self.mlp_A = None
@@ -292,11 +293,88 @@ class ForwardDynamics(eqx.Module):
         else:
             return self.giant_mlp(jnp.concatenate([z_prev, a], axis=-1))
 
+    def get_latents(self, z_prev, a):
+        if self.split_forward:
+            return self.mlp_A(z_prev), self.mlp_B(a)
+        else:
+            return NotImplementedError("get_latents is only implemented for split_forward=True")
+
+
+class MemoryModule(eqx.Module):
+    """
+    A Gated Memory Module.
+    Allows for dynamic remembering of latent actions over time.
+    """
+    self_mlp: eqx.nn.MLP
+    candidate_mlp: eqx.nn.MLP
+    decoder_mlp: eqx.nn.MLP
+
+    def __init__(self, lam_dim, mem_dim, key):
+        k1, k2, k3 = jax.random.split(key, 3)
+        
+        # Encoding requires the action, the current memory state, and time.
+        # enc_in_dim = lam_dim + mem_dim + 1
+        enc_in_dim = lam_dim + 0
+        
+        # 1. The Gate Network: Outputs values squashed between 0 and 1 (via sigmoid)
+        # It decides WHAT to forget and WHAT to let in.
+        self.self_mlp = eqx.nn.MLP(mem_dim, mem_dim, width_size=mem_dim * 2, depth=2, key=k1)
+        
+        # 2. The Candidate Network: Outputs values squashed between -1 and 1 (via tanh)
+        # It represents the NEW information extracted from the current action.
+        self.candidate_mlp = eqx.nn.MLP(enc_in_dim, mem_dim, width_size=mem_dim * 2, depth=2, key=k2)
+
+        # Decoding just needs the memory state and time.
+        dec_in_dim = mem_dim + 0
+        self.decoder_mlp = eqx.nn.MLP(dec_in_dim, lam_dim, width_size=mem_dim * 2, depth=2, key=k3)
+
+    def reset(self, mem_dim):
+        """Returns an empty initial memory state."""
+        return jnp.zeros((mem_dim,))
+
+    def encode(self, m, a, t):
+        """
+        Ingests a new action 'a' at time 't', updating memory 'm'.
+        """
+        # Combine the new action, current memory, and time
+        # x = jnp.concatenate([a, m, jnp.array([t], dtype=a.dtype)], axis=0)
+        # x = jnp.concatenate([a, jnp.array([t], dtype=a.dtype)], axis=0)
+        x = a
+        
+        # gate ~ 1.0 means "overwrite with new candidate"
+        # gate ~ 0.0 means "ignore new action, keep old memory"
+        # gate = jax.nn.sigmoid(self.gate_mlp(x))
+
+        # The proposed new memory content based on this event
+        # candidate = jax.nn.tanh(self.candidate_mlp(x))
+        # candidate = self.candidate_mlp(x)
+        
+        # Smooth interpolation: Forget part of the old, write part of the new.
+        # This guarantees the memory 'm' remains bounded between -1 and 1 over time.
+        # m_new = (1.0 - gate) * m + gate * candidate
+
+        # m_new = m + candidate
+
+        m_new = self.self_mlp(m) + self.candidate_mlp(x)
+
+        return m_new
+
+    def decode(self, m, t):
+        """
+        Queries the memory 'm' to extract an action for time 't'.
+        """
+        # x = jnp.concatenate([m, jnp.array([t], dtype=m.dtype)], axis=0)
+        x = m
+        return self.decoder_mlp(x)
+
+
 class WARP(eqx.Module):
     encoder: CNNEncoder
     lam: LAM
     forward_dyn: ForwardDynamics
     theta_base: jax.Array
+
+    memory: Optional[MemoryModule]
     
     unravel_fn: callable = eqx.field(static=True)
     d_theta: int = eqx.field(static=True)
@@ -304,9 +382,10 @@ class WARP(eqx.Module):
     frame_shape: tuple = eqx.field(static=True)
     split_forward: bool = eqx.field(static=True)
     num_freqs: int = eqx.field(static=True)
+    mem_dim: int = eqx.field(static=True)
 
-    def __init__(self, root_width, root_depth, num_freqs, frame_shape, lam_dim, split_forward, key):
-        k_root, k_enc, k_lam, k_fwd = jax.random.split(key, 4)
+    def __init__(self, root_width, root_depth, num_freqs, frame_shape, lam_dim, mem_dim, split_forward, key):
+        k_root, k_enc, k_lam, k_fwd, k_mem = jax.random.split(key, 5)
         self.frame_shape = frame_shape
         self.num_freqs = num_freqs
         self.lam_dim = lam_dim
@@ -326,6 +405,9 @@ class WARP(eqx.Module):
         self.encoder = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_enc, hidden_width=64)
         self.lam = LAM(self.d_theta, lam_dim, key=k_lam)
         self.forward_dyn = ForwardDynamics(self.d_theta, lam_dim, split_forward, key=k_fwd)
+
+        self.mem_dim = mem_dim
+        self.memory = MemoryModule(self.lam_dim, self.mem_dim, key=k_mem)
 
     @property
     def A(self):
@@ -372,63 +454,74 @@ class WARP(eqx.Module):
     #         # Render pixels explicitly using our helper
     #         pred_out = self.render_frame(z_prev, coords_grid)
 
-    #         z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
-    #         z_next_base = self.forward_dyn(z_prev, jnp.zeros(self.lam_dim))     ## TODO: zero action means continue dynamics without forcing towards GT
+    #         # Determine if we are forcing towards ground truth this step
+    #         t_ratio = step_idx / T
+    #         is_context = t_ratio < inf_context_ratio
+    #         # is_forced = jax.random.bernoulli(subk, p_forcing)       #TODO: use mode="high" for small p
+    #         # use_gt = jnp.logical_or(is_context, is_forced)
+    #         # is_forced = False
+    #         use_gt = is_context         ##TODO: basically, is_forced = False
 
-    #         t_ratio = step_idx / (T - 1)
-    #         is_context = t_ratio <= inf_context_ratio
-    #         is_forced = jax.random.bernoulli(subk, p_forcing)
-    #         use_gt = jnp.logical_or(is_context, is_forced)
+    #         # Encode the ground truth future
+    #         # z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
+    #         z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
 
-    #         z_target = jnp.where(use_gt, z_next_gt, z_next_base)
-    #         a_t = self.lam(z_prev, z_target)
+    #         # Compute the required action to hit GT
+    #         a_gt = self.lam(z_prev, z_next_gt)
+
+    #         # THE FIX: If using GT, use the LAM's action. Otherwise, default to 0.
+    #         a_t = jnp.where(use_gt, a_gt, jnp.zeros(self.lam_dim))
+
+    #         # SINGLE forward dynamics call handles both the forced and autoregressive paths!
     #         z_next = self.forward_dyn(z_prev, a_t)
 
     #         return z_next, (z_next, pred_out)
 
-    #     scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(T))
+    #     scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
     #     _, (pred_latents, pred_video) = jax.lax.scan(scan_step, z_init, scan_inputs)
 
     #     return pred_latents, pred_video
 
-    def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
+    def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, context_ratio):
         T = ref_video.shape[0]
         init_frame = ref_video[0]
 
         # 1. Initialize offset from first frame
         z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
 
-        def scan_step(z_prev, scan_inputs):
-            gt_curr_frame, step_idx = scan_inputs
-            k = jax.random.fold_in(key, step_idx)
-            k, subk = jax.random.split(k)
+        m_init = jnp.zeros(self.mem_dim)
 
-            # Render pixels explicitly using our helper
-            pred_out = self.render_frame(z_prev, coords_grid)
+        # @eqx.filter_checkpoint
+        def scan_step(carry, scan_inputs):
+            z_t, m_t = carry
+            o_tp1, step_idx = scan_inputs
 
             # Determine if we are forcing towards ground truth this step
-            t_ratio = step_idx / T - 1
-            is_context = t_ratio < inf_context_ratio
-            is_forced = jax.random.bernoulli(subk, p_forcing)
-            use_gt = jnp.logical_or(is_context, is_forced)
+            t_ratio = step_idx / T
+            is_context = t_ratio < context_ratio
 
-            # Encode the ground truth future
-            # z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
-            z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
+            # ONLY compute encoder and LAM when use_gt is True
+            a_t = jax.lax.cond(
+                is_context,
+                lambda: self.lam(
+                    z_t, 
+                    jax.lax.stop_gradient(self.encoder(jnp.transpose(o_tp1, (2, 0, 1))))
+                ),
+                lambda: self.memory.decode(m_t, t_ratio)
+            )
 
-            # Compute the required action to hit GT
-            a_gt = self.lam(z_prev, z_next_gt)
-
-            # THE FIX: If using GT, use the LAM's action. Otherwise, default to 0.
-            a_t = jnp.where(use_gt, a_gt, jnp.zeros(self.lam_dim))
+            ## Encode into the memory with C
+            m_tp1 = self.memory.encode(m_t, a_t, t_ratio)
 
             # SINGLE forward dynamics call handles both the forced and autoregressive paths!
-            z_next = self.forward_dyn(z_prev, a_t)
+            z_tp1 = self.forward_dyn(z_t, a_t)
 
-            return z_next, (z_next, pred_out)
+            return (z_tp1, m_tp1), z_t
 
         scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
-        _, (pred_latents, pred_video) = jax.lax.scan(scan_step, z_init, scan_inputs)
+        _, pred_latents = jax.lax.scan(scan_step, (z_init, m_init), scan_inputs)
+
+        pred_video = eqx.filter_vmap(self.render_frame, in_axes=(0, None))(pred_latents, coords_grid)
 
         return pred_latents, pred_video
 
@@ -458,6 +551,7 @@ model = WARP(
     num_freqs=CONFIG["num_fourier_freqs"],
     frame_shape=(H, W, C), 
     lam_dim=CONFIG["lam_space"],
+    mem_dim=CONFIG["mem_space"],
     split_forward=CONFIG["split_forward"],
     key=subkey
 )
@@ -505,6 +599,7 @@ if TRAIN:
             # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
 
             context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
+            # context_ratio = 1.0
             pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
 
             # --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
@@ -695,7 +790,7 @@ plot_pred_ref_videos_rollout(
     final_videos[test_seq_id], 
     sample_batch[test_seq_id],
     title=f"Pred", 
-    save_name="inference_forecast_rollout.png"
+    save_name=f"inference_forecast_rollout_seq{test_seq_id}.png"
 )
 
 # %%

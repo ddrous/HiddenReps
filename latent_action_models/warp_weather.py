@@ -47,7 +47,7 @@ SINGLE_BATCH = False
 USE_NLL_LOSS = False
 
 CONFIG = {
-    "seed": 2026,
+    "seed": 42,
     "nb_epochs": 5,
     "print_every": 1,
     "batch_size": 2 if SINGLE_BATCH else 64*1,
@@ -407,29 +407,65 @@ class WARP(eqx.Module):
         pred_flat = self.render_pixels(thetas_frame, flat_coords)
         return pred_flat.reshape(H, W, -1)
 
-    def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
+    # def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
+    #     T = ref_video.shape[0]
+    #     init_frame = ref_video[0]
+    #     z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
+
+    #     def scan_step(z_prev, scan_inputs):
+    #         gt_curr_frame, step_idx = scan_inputs
+    #         k = jax.random.fold_in(key, step_idx)
+    #         k, subk = jax.random.split(k)
+
+    #         pred_out = self.render_frame(z_prev, coords_grid)
+
+    #         t_ratio = step_idx / T - 1
+    #         is_context = t_ratio < inf_context_ratio
+    #         is_forced = jax.random.bernoulli(subk, p_forcing)
+    #         use_gt = jnp.logical_or(is_context, is_forced)
+
+    #         # z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
+    #         z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
+    #         a_gt = self.lam(z_prev, z_next_gt)
+    #         a_t = jnp.where(use_gt, a_gt, jnp.zeros(self.lam_dim))
+
+    #         z_next = self.forward_dyn(z_prev, a_t)
+    #         return z_next, (z_next, pred_out)
+
+    #     scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
+    #     _, (pred_latents, pred_video) = jax.lax.scan(scan_step, z_init, scan_inputs)
+
+    #     return pred_latents, pred_video
+
+    def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, context_ratio):
         T = ref_video.shape[0]
         init_frame = ref_video[0]
+
+        # 1. Initialize offset from first frame
         z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
 
         def scan_step(z_prev, scan_inputs):
             gt_curr_frame, step_idx = scan_inputs
-            k = jax.random.fold_in(key, step_idx)
-            k, subk = jax.random.split(k)
 
+            # Render pixels explicitly using our helper
             pred_out = self.render_frame(z_prev, coords_grid)
 
-            t_ratio = step_idx / T - 1
-            is_context = t_ratio < inf_context_ratio
-            is_forced = jax.random.bernoulli(subk, p_forcing)
-            use_gt = jnp.logical_or(is_context, is_forced)
+            # Determine if we are forcing towards ground truth this step
+            is_context = (step_idx / T) < context_ratio
 
-            # z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
-            z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
-            a_gt = self.lam(z_prev, z_next_gt)
-            a_t = jnp.where(use_gt, a_gt, jnp.zeros(self.lam_dim))
+            # ONLY compute encoder and LAM when use_gt is True
+            a_t = jax.lax.cond(
+                is_context,
+                lambda: self.lam(
+                    z_prev, 
+                    jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
+                ),
+                lambda: jnp.zeros(self.lam_dim)
+            )
 
+            # SINGLE forward dynamics call handles both the forced and autoregressive paths!
             z_next = self.forward_dyn(z_prev, a_t)
+
             return z_next, (z_next, pred_out)
 
         scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
