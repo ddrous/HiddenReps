@@ -40,7 +40,7 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 200*6,
+    "nb_epochs": 200*1,
     "print_every": 1,
     "batch_size": 2 if SINGLE_BATCH else 32*8,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
@@ -61,7 +61,7 @@ CONFIG = {
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 400,      
-    "lr_cooldown": 100,       
+    "lr_cooldown": 0,       
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
     "lr_accum_size": 5,     
