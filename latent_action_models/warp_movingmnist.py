@@ -39,10 +39,10 @@ SINGLE_BATCH = False
 USE_NLL_LOSS = False
 
 CONFIG = {
-    "seed": 42,
-    "nb_epochs": 5000,
+    "seed": 2026,
+    "nb_epochs": 2500,
     "print_every": 1,
-    "batch_size": 2 if SINGLE_BATCH else 256*6,
+    "batch_size": 2 if SINGLE_BATCH else 256*1,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.5,
     "inf_context_ratio": 0.5,
@@ -58,6 +58,7 @@ CONFIG = {
     "root_width": 12,
     "root_depth": 5,
     "num_fourier_freqs": 6,
+    "use_time_in_root": False,
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 400,      
@@ -399,7 +400,8 @@ class WARP(eqx.Module):
         # Set up implicit renderer (decoder)
         coord_dim = 2 + 2 * 2 * num_freqs 
         root_out_dim = C * 2 if CONFIG["use_nll_loss"] else C
-        template_root = RootMLP(coord_dim+0, root_out_dim, root_width, root_depth, k_root)
+        add_time = 1 if CONFIG["use_time_in_root"] else 0
+        template_root = RootMLP(coord_dim+add_time, root_out_dim, root_width, root_depth, k_root)
         
         flat_params, self.unravel_fn = ravel_pytree(template_root)
         self.d_theta = flat_params.shape[0]
@@ -423,8 +425,10 @@ class WARP(eqx.Module):
     def render_pixels(self, theta, coords):
         def render_pt(theta, coord):
             root = self.unravel_fn(theta)
-            encoded_coord = fourier_encode(coord[1:], self.num_freqs)
-            # encoded_coord = jnp.concatenate([coord[:1], fourier_encode(coord[1:], self.num_freqs)], axis=-1)      @TODO: maybe add time coord here in the future?
+            if CONFIG["use_time_in_root"]:
+                encoded_coord = jnp.concatenate([coord[:1], fourier_encode(coord[1:], self.num_freqs)], axis=-1)      ##@TODO: maybe add time coord here in the future?
+            else:
+                encoded_coord = fourier_encode(coord[1:], self.num_freqs)
             out = root(encoded_coord)
             if CONFIG["use_nll_loss"]:
                 mean, std = out[:C], out[C:]
