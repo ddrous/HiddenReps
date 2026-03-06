@@ -26,3 +26,4 @@ latent_action_models/nohup.log
 
 *.log
 
+*.eqx
