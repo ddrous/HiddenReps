@@ -40,7 +40,7 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 2500,
+    "nb_epochs": 1500,
     "print_every": 1,
     "batch_size": 2 if SINGLE_BATCH else 256*1,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
@@ -59,6 +59,7 @@ CONFIG = {
     "root_depth": 5,
     "num_fourier_freqs": 6,
     "use_time_in_root": False,
+    "pretrain_encoder": True, 
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 400,      
@@ -66,7 +67,7 @@ CONFIG = {
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
     "lr_accum_size": 5,     
-    "lr_min_scale": 1e-1     
+    "lr_min_scale": 1e-0     
 }
 
 key = jax.random.PRNGKey(CONFIG["seed"])
@@ -113,12 +114,11 @@ def numpy_collate(batch):
 print("Loading Moving MNIST Dataset...")
 try:
     data_path = './data' if TRAIN else '../../data'
-    # dataset = datasets.MovingMNIST(root=data_path, split=None, download=True)
 
-    ## Manulally load train and test splits to have more control over batching and shuffling
+    ## Manually load train and test splits to have more control over batching and shuffling
     mov_mnist_arrays = np.load(data_path + "/MovingMNIST/mnist_test_seq.npy")
     print(f"Original loaded MovingMNIST shape: {mov_mnist_arrays.shape} (T, N, H, W)")
-    ## SPlit, 8000 train, 2000 test
+    ## Split, 8000 train, 2000 test
     train_arrays = mov_mnist_arrays[:, :8000]
     test_arrays = mov_mnist_arrays[:, 8000:]
 
@@ -233,7 +233,7 @@ class RootMLP(eqx.Module):
 class CNNEncoder(eqx.Module):
     layers: list
 
-    def __init__(self, in_channels, out_dim, spatial_shape, key, hidden_width=16, depth=4):
+    def __init__(self, in_channels, out_dim, spatial_shape, key, hidden_width=8, depth=4):
         H, W = spatial_shape
         keys = jax.random.split(key, depth + 1)
         
@@ -265,7 +265,7 @@ class CNNEncoder(eqx.Module):
 class LAM(eqx.Module):
     mlp: eqx.nn.MLP
     def __init__(self, dyn_dim, lam_dim, key):
-        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim*1, depth=2, key=key)
+        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim*1, depth=3, key=key)
         
     def __call__(self, z_prev, z_target):
         return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
@@ -280,13 +280,13 @@ class ForwardDynamics(eqx.Module):
         self.split_forward = split_forward
         k1, k2, k3 = jax.random.split(key, 3)
         if split_forward:
-            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k1)
-            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k2)
+            self.mlp_A = eqx.nn.MLP(dyn_dim, dyn_dim, width_size=dyn_dim*2, depth=3, key=k1)
+            self.mlp_B = eqx.nn.MLP(lam_dim, dyn_dim, width_size=dyn_dim*2, depth=3, key=k2)
             self.giant_mlp = None
         else:
             self.mlp_A = None
             self.mlp_B = None
-            self.giant_mlp = eqx.nn.MLP(dyn_dim + lam_dim, dyn_dim, width_size=dyn_dim*2, depth=2, key=k3)
+            self.giant_mlp = eqx.nn.MLP(dyn_dim + lam_dim, dyn_dim, width_size=dyn_dim*2, depth=3, key=k3)
 
     def __call__(self, z_prev, a):
         if self.split_forward:
@@ -301,76 +301,109 @@ class ForwardDynamics(eqx.Module):
             return NotImplementedError("get_latents is only implemented for split_forward=True")
 
 
+# ==============================================================================
+# --- TRANSFORMER MEMORY MODULE (From MiniGrid Implementation) ---
+# ==============================================================================
+class TransformerBlock(eqx.Module):
+    attn: eqx.nn.MultiheadAttention
+    mlp: eqx.nn.MLP
+    ln1: eqx.nn.LayerNorm
+    ln2: eqx.nn.LayerNorm
+
+    def __init__(self, d_model, num_heads, key):
+        k1, k2 = jax.random.split(key)
+        self.attn = eqx.nn.MultiheadAttention(
+            num_heads=num_heads,
+            query_size=d_model,
+            use_query_bias=True,
+            use_key_bias=True,
+            use_value_bias=True,
+            use_output_bias=True,
+            key=k1
+        )
+        self.mlp = eqx.nn.MLP(d_model, d_model, width_size=d_model * 4, depth=1, key=k2)
+        self.ln1 = eqx.nn.LayerNorm(d_model)
+        self.ln2 = eqx.nn.LayerNorm(d_model)
+
+    def __call__(self, x, mask):
+        # Pre-LN architecture
+        x_norm = jax.vmap(self.ln1)(x)
+        attn_out = self.attn(x_norm, x_norm, x_norm, mask=mask)
+        x = x + attn_out
+        x = x + jax.vmap(self.mlp)(jax.vmap(self.ln2)(x))
+        return x
+
 class MemoryModule(eqx.Module):
     """
-    A Gated Memory Module.
-    Allows for dynamic remembering of latent actions over time.
+    Autoregressive Transformer Memory Module for Latent Actions.
+    Designed specifically to operate efficiently within a fixed-size jax.lax.scan block.
     """
-    self_mlp: eqx.nn.MLP
-    candidate_mlp: eqx.nn.MLP
-    decoder_mlp: eqx.nn.MLP
+    d_model: int
+    max_len: int
+    pos_emb: jax.Array
+    blocks: tuple
+    proj_in: eqx.nn.Linear
+    action_mlp: eqx.nn.MLP
 
-    def __init__(self, lam_dim, mem_dim, key):
-        k1, k2, k3 = jax.random.split(key, 3)
+    def __init__(self, lam_dim, mem_dim, latent_dim, key, max_len=20, num_heads=4, num_blocks=4):
+        self.d_model = mem_dim
+        self.max_len = max_len
         
-        # Encoding requires the action, the current memory state, and time.
-        # enc_in_dim = lam_dim + mem_dim + 1
-        enc_in_dim = lam_dim + 0
+        k1, k2, k3, k4 = jax.random.split(key, 4)
         
-        # int_dim = (mem_dim + lam_dim) // 2
-        int_dim = mem_dim * 2
-
-        # 1. The Gate Network: Outputs values squashed between 0 and 1 (via sigmoid)
-        # It decides WHAT to forget and WHAT to let in.
-        self.self_mlp = eqx.nn.MLP(mem_dim, mem_dim, width_size=mem_dim*2, depth=2, key=k1)
+        # 1. Project concatenated [state, action] tokens into model dimension
+        self.proj_in = eqx.nn.Linear(latent_dim + lam_dim, self.d_model, key=k1)
         
-        # 2. The Candidate Network: Outputs values squashed between -1 and 1 (via tanh)
-        # It represents the NEW information extracted from the current action.
-        self.candidate_mlp = eqx.nn.MLP(enc_in_dim, mem_dim, width_size=int_dim, depth=2, key=k2)
+        # 2. Learnable Positional Embeddings
+        self.pos_emb = jax.random.normal(k2, (max_len, self.d_model)) * 0.02
+        
+        # 3. Causal Transformer Blocks
+        block_keys = jax.random.split(k3, num_blocks)
+        self.blocks = tuple(TransformerBlock(self.d_model, num_heads, bk) for bk in block_keys)
+        
+        # 4. Final Decoder: Context + Current State -> Action
+        self.action_mlp = eqx.nn.MLP(self.d_model + latent_dim, lam_dim, width_size=self.d_model * 2, depth=3, key=k4)
 
-        # Decoding just needs the memory state and time.
-        dec_in_dim = mem_dim + 0
-        self.decoder_mlp = eqx.nn.MLP(dec_in_dim, lam_dim, width_size=int_dim, depth=2, key=k3)
+    def reset(self, T):
+        """Returns an empty fixed-size buffer for JAX scan"""
+        return jnp.zeros((T, self.d_model))
 
-    def reset(self, mem_dim):
-        """Returns an empty initial memory state."""
-        return jnp.zeros((mem_dim,))
-
-    def encode(self, m, a, t):
+    def encode(self, buffer, step_idx, z, a):
         """
-        Ingests a new action 'a' at time 't', updating memory 'm'.
+        Dynamically injects the new token at the correct sequence index.
+        JAX compiles `.at[].set()` to efficient in-place updates inside scan loops.
         """
-        # Combine the new action, current memory, and time
-        # x = jnp.concatenate([a, m, jnp.array([t], dtype=a.dtype)], axis=0)
-        # x = jnp.concatenate([a, jnp.array([t], dtype=a.dtype)], axis=0)
-        x = a
+        token = self.proj_in(jnp.concatenate([z, a], axis=-1))
+        return buffer.at[step_idx - 1].set(token)
+
+    def decode(self, buffer, step_idx, z_current):
+        """
+        Computes the causal context from the buffer and predicts the current action.
+        """
+        T = buffer.shape[0]
         
-        # gate ~ 1.0 means "overwrite with new candidate"
-        # gate ~ 0.0 means "ignore new action, keep old memory"
-        # gate = jax.nn.sigmoid(self.gate_mlp(x))
-
-        # The proposed new memory content based on this event
-        # candidate = jax.nn.tanh(self.candidate_mlp(x))
-        # candidate = self.candidate_mlp(x)
+        def compute_context():
+            # Apply positional embeddings to the full sequence
+            x = buffer + self.pos_emb[:T]
+            
+            # Pure lower-triangular causal mask to prevent leaking padding
+            mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+            
+            for block in self.blocks:
+                x = block(x, mask)
+                
+            # Extract the context specifically from the *last valid token*
+            return x[step_idx - 2]
+            
+        # Handle the edge-case where step_idx == 1 (no valid past history exists yet)
+        context = jax.lax.cond(
+            step_idx > 1,
+            compute_context,
+            lambda: jnp.zeros(self.d_model)
+        )
         
-        # Smooth interpolation: Forget part of the old, write part of the new.
-        # This guarantees the memory 'm' remains bounded between -1 and 1 over time.
-        # m_new = (1.0 - gate) * m + gate * candidate
-
-        # m_new = m + candidate
-
-        m_new = self.self_mlp(m) + self.candidate_mlp(x)
-
-        return m_new
-        # return jax.nn.tanh(m_new)
-
-    def decode(self, m, t):
-        """
-        Queries the memory 'm' to extract an action for time 't'.
-        """
-        # x = jnp.concatenate([m, jnp.array([t], dtype=m.dtype)], axis=0)
-        x = m
-        return self.decoder_mlp(x)
+        return self.action_mlp(jnp.concatenate([context, z_current], axis=-1))
+# ==============================================================================
 
 
 class WARP(eqx.Module):
@@ -407,13 +440,21 @@ class WARP(eqx.Module):
         self.d_theta = flat_params.shape[0]
         self.theta_base = flat_params
 
-        # Set up JEPA dynamics components
-        self.encoder = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_enc, hidden_width=64)
+        # Set up JEPA dynamics components. Retaining MovingMNIST larger hidden_width
+        self.encoder = CNNEncoder(in_channels=C, out_dim=self.d_theta, spatial_shape=(H, W), key=k_enc, hidden_width=64, depth=4)
+
+        if CONFIG.get("pretrain_encoder", False):
+            ## Load the pretrained encoder weights from the autoencoding phase
+            try:
+                self.encoder, self.theta_base = eqx.tree_deserialise_leaves("movingmnist_enc.eqx", (self.encoder, self.theta_base))
+            except:
+                print("Warning: could not load movingmnist_enc.eqx")
+
         self.lam = LAM(self.d_theta, lam_dim, key=k_lam)
         self.forward_dyn = ForwardDynamics(self.d_theta, lam_dim, split_forward, key=k_fwd)
 
         self.mem_dim = mem_dim
-        self.memory = MemoryModule(self.lam_dim, self.mem_dim, key=k_mem)
+        self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem, max_len=20)
 
     @property
     def A(self):
@@ -426,7 +467,7 @@ class WARP(eqx.Module):
         def render_pt(theta, coord):
             root = self.unravel_fn(theta)
             if CONFIG["use_time_in_root"]:
-                encoded_coord = jnp.concatenate([coord[:1], fourier_encode(coord[1:], self.num_freqs)], axis=-1)      ##@TODO: maybe add time coord here in the future?
+                encoded_coord = jnp.concatenate([coord[:1], fourier_encode(coord[1:], self.num_freqs)], axis=-1)
             else:
                 encoded_coord = fourier_encode(coord[1:], self.num_freqs)
             out = root(encoded_coord)
@@ -435,62 +476,20 @@ class WARP(eqx.Module):
                 std = jax.nn.softplus(std) + 1e-4
                 return jnp.concatenate([mean, std], axis=-1)
             return out
-        # return jax.vmap(render_pt)(thetas, coords)
         return jax.vmap(render_pt, in_axes=(None, 0))(theta, coords)
 
     def render_frame(self, theta_offset, coords_grid):
         H, W, C = self.frame_shape
         flat_coords = coords_grid.reshape(-1, 3)
         
-        # Add the base weights before rendering!
-        theta = theta_offset + self.theta_base
-        # thetas_frame = jnp.tile(theta, (H*W, 1))
-        
+        # Add the base weights before rendering
+        if not CONFIG.get("pretrain_encoder", False):
+            theta = theta_offset + self.theta_base
+        else:
+            theta = theta_offset + jax.lax.stop_gradient(self.theta_base)
+
         pred_flat = self.render_pixels(theta, flat_coords)
         return pred_flat.reshape(H, W, -1)
-
-    # def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, inf_context_ratio):
-    #     T = ref_video.shape[0]
-    #     init_frame = ref_video[0]
-
-    #     # 1. Initialize offset from first frame
-    #     z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
-
-    #     def scan_step(z_prev, scan_inputs):
-    #         gt_curr_frame, step_idx = scan_inputs
-    #         k = jax.random.fold_in(key, step_idx)
-    #         k, subk = jax.random.split(k)
-
-    #         # Render pixels explicitly using our helper
-    #         pred_out = self.render_frame(z_prev, coords_grid)
-
-    #         # Determine if we are forcing towards ground truth this step
-    #         t_ratio = step_idx / T
-    #         is_context = t_ratio < inf_context_ratio
-    #         # is_forced = jax.random.bernoulli(subk, p_forcing)       #TODO: use mode="high" for small p
-    #         # use_gt = jnp.logical_or(is_context, is_forced)
-    #         # is_forced = False
-    #         use_gt = is_context         ##TODO: basically, is_forced = False
-
-    #         # Encode the ground truth future
-    #         # z_next_gt = self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1)))
-    #         z_next_gt = jax.lax.stop_gradient(self.encoder(jnp.transpose(gt_curr_frame, (2, 0, 1))))
-
-    #         # Compute the required action to hit GT
-    #         a_gt = self.lam(z_prev, z_next_gt)
-
-    #         # THE FIX: If using GT, use the LAM's action. Otherwise, default to 0.
-    #         a_t = jnp.where(use_gt, a_gt, jnp.zeros(self.lam_dim))
-
-    #         # SINGLE forward dynamics call handles both the forced and autoregressive paths!
-    #         z_next = self.forward_dyn(z_prev, a_t)
-
-    #         return z_next, (z_next, pred_out)
-
-    #     scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
-    #     _, (pred_latents, pred_video) = jax.lax.scan(scan_step, z_init, scan_inputs)
-
-    #     return pred_latents, pred_video
 
     def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, context_ratio):
         T = ref_video.shape[0]
@@ -498,56 +497,54 @@ class WARP(eqx.Module):
 
         # 1. Initialize offset from first frame
         z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
+        if CONFIG.get("pretrain_encoder", False):
+            z_init = jax.lax.stop_gradient(z_init)
 
-        m_init = jnp.zeros(self.mem_dim)
+        # 2. Initialize fixed buffer for Transformer memory
+        m_init = self.memory.reset(T)
 
-        # 2. Add the Equinox checkpointing decorator here!
-        # Recompute internal activations during the backward pass.
+        is_context_init = False
+
+        # 3. Add the Equinox checkpointing decorator here
         @eqx.filter_checkpoint
         def scan_step(carry, scan_inputs):
-            z_t, m_t = carry
+            z_t, m_t, was_context = carry
             o_tp1, step_idx = scan_inputs
-            # subk = jax.random.fold_in(key, step_idx)
 
             # --- Rendering INSIDE the checkpointed step ---
-            # Concatenate the time t to the coordinates before rendering
             time_coord = jnp.array([(step_idx-1)/ (T-1)], dtype=z_t.dtype)
-            # print("SHapes in scan_step:", z_t.shape, m_t.shape, o_tp1.shape, coords_grid.shape)
             coords_grid_t = jnp.concatenate([jnp.full_like(coords_grid[..., :1], time_coord), coords_grid], axis=-1)
 
             pred_out = self.render_frame(z_t, coords_grid_t)
 
             # Determine if we are forcing towards ground truth this step
-            t_ratio = step_idx / T
-            is_context = t_ratio < context_ratio
-            # is_forced = jax.random.bernoulli(subk, p_forcing)       #TODO: use mode="high" for small p
-            # use_gt = jnp.logical_or(is_context, is_forced)
-            use_gt = is_context
+            is_context = (step_idx / T) < context_ratio
 
             # ONLY compute encoder and LAM when use_gt is True
             a_t = jax.lax.cond(
-                use_gt,
+                is_context,
                 lambda: self.lam(
                     z_t, 
                     jax.lax.stop_gradient(self.encoder(jnp.transpose(o_tp1, (2, 0, 1))))
                 ),
-                lambda: self.memory.decode(m_t, None)
+                lambda: self.memory.decode(m_t, step_idx, z_t)
             )
 
             ## Encode into the memory with C
-            m_tp1 = self.memory.encode(m_t, a_t, None)
+            m_tp1 = self.memory.encode(m_t, step_idx, z_t, a_t)
 
-            # SINGLE forward dynamics call handles both the forced and autoregressive paths!
+            # SINGLE forward dynamics call handles both the forced and autoregressive paths
             z_tp1 = self.forward_dyn(z_t, a_t)
 
-            return (z_tp1, m_tp1), (z_t, pred_out)
+            return (z_tp1, m_tp1, is_context), (z_t, pred_out)
 
         scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
         
-        # 3. Execute the scan as normal, collecting both latents and rendered frames
-        _, (pred_latents, pred_video) = jax.lax.scan(scan_step, (z_init, m_init), scan_inputs)
+        # 4. Execute the scan as normal, collecting both latents and rendered frames
+        _, (pred_latents, pred_video) = jax.lax.scan(scan_step, (z_init, m_init, is_context_init), scan_inputs)
 
         return pred_latents, pred_video
+
 
     def __call__(self, ref_videos, p_forcing, keys, coords_grid, inf_context_ratio, precompute_ref_diffs=False):
         is_single = (ref_videos.ndim == 4)
@@ -620,22 +617,16 @@ if TRAIN:
         def loss_fn(m):
             k_full, k_init = jax.random.split(keys[0], 2)
             
-            # Forward pass: Extract both predicted thetas and rendered pixels
-            # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, 0.0, precompute_ref_diffs=False)
-            # pred_thetas, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
-
-            # context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
-            # context_ratio = jax.random.uniform(k_full, minval=0.25, maxval=1.0)
-            context_ratio = CONFIG["inf_context_ratio"]
+            # Use randomized uniform context ratio for training, mirroring minigrid
+            context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
+            # context_ratio = CONFIG["inf_context_ratio"]
             _, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
 
-            # --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
-            # latent_loss = jnp.mean((pred_thetas - target_thetas_shifted)**2)
+            ## --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
             rec_loss = jnp.mean((pred_videos - ref_videos)**2)
 
             # --- 2. AUTOENCODING LOSS (Auxiliary) ---
             if CONFIG["aux_encoder_loss"]:
-
                 indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(CONFIG["aux_loss_num_steps"],), replace=False)
 
                 # Encode ground truth to target thetas
@@ -643,7 +634,6 @@ if TRAIN:
                 target_thetas = jax.vmap(jax.vmap(m.encoder))(ref_videos_enc)
 
                 # Render Target Thetas -> Match GT Pixels
-                # We vmap our fast render_frame function across Batches and Time steps
                 ## Concat t=0 to the coords
                 coords_grid_t0 = jnp.concatenate([jnp.zeros_like(coords_grid[..., :1]), coords_grid], axis=-1)
                 batched_render = jax.vmap(jax.vmap(lambda theta: m.render_frame(theta, coords_grid_t0)))
@@ -671,20 +661,16 @@ if TRAIN:
 
     @eqx.filter_jit
     def compute_p_forcing(epoch, schedule="linear", start=1.0, end=0.0):
-        ### if linear decay, make if JAX numpy compatible and compute outside of train_step
         if schedule == "linear":
             p = start + (end - start) * (epoch / CONFIG["nb_epochs"])
-            # return jnp.array(p, dtype=jnp.float32).item()
             return p
         elif schedule == "constant":
             return start
         elif schedule == "exponential":
             decay_rate = (end / start) ** (1 / CONFIG["nb_epochs"])
             p = start * (decay_rate ** epoch)
-            # return jnp.array(p, dtype=jnp.float32).item()
             return p
         elif schedule == "step":
-            ## 5 steps for now, can be made more flexible
             possible_ps = jnp.linspace(start, end, num=5)
             step_size = CONFIG["nb_epochs"] // 5
             step_idx = epoch // step_size
@@ -701,10 +687,6 @@ if TRAIN:
             batch_keys = jax.random.split(subkey, batch_videos.shape[0])
             
             model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, CONFIG["p_forcing"])
-
-            # p_forcing = compute_p_forcing(epoch, schedule="step", start=CONFIG["p_forcing"], end=0.0)
-            # model, opt_state, loss = train_step(model, opt_state, batch_keys, batch_videos, coords_grid, p_forcing)
-
             epoch_losses.append(loss)
 
             current_scale = optax.tree_utils.tree_get(opt_state, "scale")
@@ -714,7 +696,7 @@ if TRAIN:
 
         if not SINGLE_BATCH and ((epoch+1) % CONFIG["print_every"] == 0 or (epoch+1) == CONFIG["nb_epochs"] - 1):
             avg_epoch_loss = np.mean(epoch_losses)
-            print(f"Epoch {epoch+1}/{CONFIG['nb_epochs']} - Avg Loss: {avg_epoch_loss:.4f} - LR Scale: {current_scale:.4f}", flush=True)
+            print(f"Epoch {epoch+1}/{CONFIG['nb_epochs']} - Avg Loss: {avg_epoch_loss:.6f} - LR Scale: {current_scale:.4f}", flush=True)
 
         if epoch in [4, CONFIG["nb_epochs"]//2, 2*CONFIG["nb_epochs"]//3]:
             eqx.tree_serialise_leaves(artefacts_path / f"model_ep{epoch+1}.eqx", model)
@@ -747,8 +729,6 @@ else:
 
 #%% Cell 5: Final Visualizations
 print("\n=== Generating Dashboards ===")
-
-# print(len(all_losses), "loss points collected during training.")
 
 if len(all_losses) > 0:
     fig, ax1 = plt.subplots(figsize=(10, 5))
@@ -790,20 +770,17 @@ plt.tight_layout()
 plt.savefig(plots_path / "recurrence_matrix_A.png")
 plt.show()
 
-#%%
-
-# testing_subset = datasets.MovingMNIST(root=data_path, split="test", download=True)
-
+#%% Evaluate on Testing Dataset
 testing_subset = MovingMNISTDataset(test_arrays)
 test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=False)
 sample_batch = next(iter(test_loader))
 
-# sample_batch = next(iter(train_loader))
-
 print("Batch shape for evaluation:", sample_batch.shape, flush=True)
 
+# Padding shape up to 20 for Moving MNIST testing if needed
 pad_length = 20 - sample_batch.shape[1]
-sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)
+if pad_length > 0:
+    sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)
 
 val_keys = jax.random.split(key, sample_batch.shape[0])
 _, final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.5, precompute_ref_diffs=False)
@@ -812,8 +789,9 @@ if CONFIG["use_nll_loss"]:
     print(f"Final Predicted Video Mean Pixel Value Range: min={final_videos[...,:C].min():.4f}, max={final_videos[...,:C].max():.4f}")
     print(f"Final Predicted Video Std Pixel Value Range: min={final_videos[...,C:].min():.4f}, max={final_videos[...,C:].max():.4f}")
 
-#%%
+#%% Generate final forecast rollout
 test_seq_id = np.random.randint(0, sample_batch.shape[0])
+print(f"\nGenerating final forecast rollout visualization for test sequence ID: {test_seq_id}")
 
 plot_pred_ref_videos_rollout(
     final_videos[test_seq_id], 
@@ -822,8 +800,7 @@ plot_pred_ref_videos_rollout(
     save_name=f"inference_forecast_rollout_seq{test_seq_id}.png"
 )
 
-# %%
+# %% Save nohup
 os.system(f"cp -r nohup.log {run_path}/nohup.log")
 
 #%%
-
