@@ -41,7 +41,7 @@ USE_NLL_LOSS = False
 CONFIG = {
     "seed": 2026,
     "nb_epochs": 1500,
-    "print_every": 1,
+    "print_every": 100,
     "batch_size": 2 if SINGLE_BATCH else 256*1,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "p_forcing": 0.5,
@@ -52,14 +52,16 @@ CONFIG = {
     "aux_loss_num_steps": 4,
 
     # --- Architecture Params ---
-    "lam_space": 32,
+    "lam_space": 4,
     "mem_space": 128*2,
+    "icl_decoding": True,
+    "discrete_actions": False,
     "split_forward": True,
     "root_width": 12,
     "root_depth": 5,
     "num_fourier_freqs": 6,
     "use_time_in_root": False,
-    "pretrain_encoder": True, 
+    "pretrain_encoder": False, 
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 400,      
@@ -67,7 +69,7 @@ CONFIG = {
     "lr_factor": 0.5,        
     "lr_rtol": 1e-3,         
     "lr_accum_size": 5,     
-    "lr_min_scale": 1e-0     
+    "lr_min_scale": 1e-1     
 }
 
 key = jax.random.PRNGKey(CONFIG["seed"])
@@ -333,23 +335,40 @@ class TransformerBlock(eqx.Module):
         x = x + jax.vmap(self.mlp)(jax.vmap(self.ln2)(x))
         return x
 
+
 class MemoryModule(eqx.Module):
     """
     Autoregressive Transformer Memory Module for Latent Actions.
-    Designed specifically to operate efficiently within a fixed-size jax.lax.scan block.
+    Supports continuous actions (MLP) or discrete learned embeddings via In-Context Learning (ICL).
     """
     d_model: int
     max_len: int
     pos_emb: jax.Array
     blocks: tuple
     proj_in: eqx.nn.Linear
-    action_mlp: eqx.nn.MLP
+    
+    # Static fields for control flow and shapes
+    discrete_actions: bool = eqx.field(static=True)
+    lam_dim: int = eqx.field(static=True)
+    icl_decoding: bool = eqx.field(static=True)
+    
+    # Standard decoding components
+    action_mlp: Optional[eqx.nn.MLP]
+    
+    # ICL decoding components
+    action_embedding: Optional[eqx.nn.Embedding]
+    output_proj: Optional[eqx.nn.Linear]
 
-    def __init__(self, lam_dim, mem_dim, latent_dim, key, max_len=20, num_heads=4, num_blocks=4):
-        self.d_model = mem_dim
+    def __init__(self, lam_dim, mem_dim, latent_dim, key, max_len=12, num_heads=4, num_blocks=4, num_actions=4):
         self.max_len = max_len
+        self.discrete_actions = CONFIG["discrete_actions"]
+        self.icl_decoding = CONFIG["icl_decoding"]
+        self.lam_dim = lam_dim
+        ## d_model is the closest power of 2 after latent_dim + lam_dim for better transformer performance
+        # self.d_model = 2 ** int(jnp.ceil(jnp.log2(latent_dim + lam_dim)))
+        self.d_model = mem_dim
         
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
         
         # 1. Project concatenated [state, action] tokens into model dimension
         self.proj_in = eqx.nn.Linear(latent_dim + lam_dim, self.d_model, key=k1)
@@ -360,9 +379,23 @@ class MemoryModule(eqx.Module):
         # 3. Causal Transformer Blocks
         block_keys = jax.random.split(k3, num_blocks)
         self.blocks = tuple(TransformerBlock(self.d_model, num_heads, bk) for bk in block_keys)
-        
-        # 4. Final Decoder: Context + Current State -> Action
-        self.action_mlp = eqx.nn.MLP(self.d_model + latent_dim, lam_dim, width_size=self.d_model * 2, depth=3, key=k4)
+
+        # 4. Decoder Heads
+        if self.icl_decoding:
+            self.action_mlp = None
+            if self.discrete_actions:
+                # Learned discrete actions (num_actions -> lam_dim)
+                self.action_embedding = eqx.nn.Embedding(num_actions, lam_dim, key=k5)
+                # Projects transformer output to action logits
+                self.output_proj = eqx.nn.Linear(self.d_model, num_actions, key=k6)
+            else:
+                # Continuous actions with ICL decoding still use an MLP head
+                self.action_embedding = None
+                self.output_proj = eqx.nn.Linear(self.d_model, lam_dim, key=k6)
+        else:
+            self.action_mlp = eqx.nn.MLP(self.d_model + latent_dim, lam_dim, width_size=self.d_model * 2, depth=3, key=k4)
+            self.action_embedding = None
+            self.output_proj = None
 
     def reset(self, T):
         """Returns an empty fixed-size buffer for JAX scan"""
@@ -371,7 +404,6 @@ class MemoryModule(eqx.Module):
     def encode(self, buffer, step_idx, z, a):
         """
         Dynamically injects the new token at the correct sequence index.
-        JAX compiles `.at[].set()` to efficient in-place updates inside scan loops.
         """
         token = self.proj_in(jnp.concatenate([z, a], axis=-1))
         return buffer.at[step_idx - 1].set(token)
@@ -382,28 +414,64 @@ class MemoryModule(eqx.Module):
         """
         T = buffer.shape[0]
         
-        def compute_context():
-            # Apply positional embeddings to the full sequence
-            x = buffer + self.pos_emb[:T]
+        if self.icl_decoding:
+            # --- ICL Decoding Path ---
             
-            # Pure lower-triangular causal mask to prevent leaking padding
+            # 1. Create query token: [z_current, zeros]
+            zero_action = jnp.zeros((self.lam_dim,), dtype=z_current.dtype)
+            query_token = self.proj_in(jnp.concatenate([z_current, zero_action], axis=-1))
+            
+            # 2. Inject query token temporally into the buffer for the current step
+            temp_buffer = buffer.at[step_idx - 1].set(query_token)
+            
+            # 3. Apply positional embeddings and causal attention
+            x = temp_buffer + self.pos_emb[:T]
             mask = jnp.tril(jnp.ones((T, T), dtype=bool))
             
             for block in self.blocks:
                 x = block(x, mask)
+
+            # 4. Extract context specifically at the current query step
+            context = x[step_idx - 1]
+
+            if self.discrete_actions:
+                # 1. Get the raw logits from the transformer context
+                logits = self.output_proj(context)
+
+                # 2. Calculate the soft probabilities (this gives us our gradients!)
+                soft_probs = jax.nn.softmax(logits, axis=-1)
+
+                # 3. Calculate the strictly hard, discrete one-hot vector (this is what we want for the forward pass)
+                hard_idx = jnp.argmax(logits, axis=-1)
+                hard_probs = jax.nn.one_hot(hard_idx, num_classes=logits.shape[-1])
+
+                # 4. The Magic STE Formula:
+                ste_probs = soft_probs + jax.lax.stop_gradient(hard_probs - soft_probs)
+
+                # 5. Lookup the embedding
+                action = jnp.dot(ste_probs, self.action_embedding.weight)
+            else:
+                # If not using discrete actions, directly project to continuous action space
+                action = self.output_proj(context)
+
+            return action
+
+        else:
+            # --- Original Continuous MLP Decoding Path ---
+            def compute_context():
+                x = buffer + self.pos_emb[:T]
+                mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+                for block in self.blocks:
+                    x = block(x, mask)
+                return x[step_idx - 2]
                 
-            # Extract the context specifically from the *last valid token*
-            return x[step_idx - 2]
+            context = jax.lax.cond(
+                step_idx > 1,
+                compute_context,
+                lambda: jnp.zeros(self.d_model)
+            )
             
-        # Handle the edge-case where step_idx == 1 (no valid past history exists yet)
-        context = jax.lax.cond(
-            step_idx > 1,
-            compute_context,
-            lambda: jnp.zeros(self.d_model)
-        )
-        
-        return self.action_mlp(jnp.concatenate([context, z_current], axis=-1))
-# ==============================================================================
+            return self.action_mlp(jnp.concatenate([context, z_current], axis=-1))
 
 
 class WARP(eqx.Module):
@@ -454,7 +522,8 @@ class WARP(eqx.Module):
         self.forward_dyn = ForwardDynamics(self.d_theta, lam_dim, split_forward, key=k_fwd)
 
         self.mem_dim = mem_dim
-        self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem, max_len=20)
+        # self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem, max_len=20)
+        self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem, max_len=20, num_heads=4, num_blocks=4, num_actions=4)
 
     @property
     def A(self):
@@ -536,14 +605,14 @@ class WARP(eqx.Module):
             # SINGLE forward dynamics call handles both the forced and autoregressive paths
             z_tp1 = self.forward_dyn(z_t, a_t)
 
-            return (z_tp1, m_tp1, is_context), (z_t, pred_out)
+            return (z_tp1, m_tp1, is_context), (a_t, z_t, pred_out)
 
         scan_inputs = (jnp.concatenate([ref_video[1:], ref_video[-1:]], axis=0), jnp.arange(1, T+1))
         
         # 4. Execute the scan as normal, collecting both latents and rendered frames
-        _, (pred_latents, pred_video) = jax.lax.scan(scan_step, (z_init, m_init, is_context_init), scan_inputs)
+        _, (pred_actions, pred_latents, pred_video) = jax.lax.scan(scan_step, (z_init, m_init, is_context_init), scan_inputs)
 
-        return pred_latents, pred_video
+        return pred_actions, pred_latents, pred_video
 
 
     def __call__(self, ref_videos, p_forcing, keys, coords_grid, inf_context_ratio, precompute_ref_diffs=False):
@@ -553,11 +622,11 @@ class WARP(eqx.Module):
             keys = keys[None, ...] if keys.ndim == 1 else keys
             
         batched_fn = jax.vmap(self._get_preds_single, in_axes=(0, None, 0, None, None))
-        pred_latents, pred_videos = batched_fn(ref_videos, p_forcing, keys, coords_grid, inf_context_ratio)
+        pred_actions, pred_latents, pred_videos = batched_fn(ref_videos, p_forcing, keys, coords_grid, inf_context_ratio)
         
         if is_single:
             return pred_latents[0], pred_videos[0]
-        return pred_latents, pred_videos
+        return pred_actions, pred_latents, pred_videos
 
 @eqx.filter_jit
 def evaluate(m, batch, p_forcing, keys, coords, context_ratio, precompute_ref_diffs=False):
@@ -620,7 +689,7 @@ if TRAIN:
             # Use randomized uniform context ratio for training, mirroring minigrid
             context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
             # context_ratio = CONFIG["inf_context_ratio"]
-            _, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
+            _, _, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
 
             ## --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---
             rec_loss = jnp.mean((pred_videos - ref_videos)**2)
@@ -703,7 +772,7 @@ if TRAIN:
 
         if (epoch+1) % (max(CONFIG["nb_epochs"]//10, 1)) == 0:
             val_keys = jax.random.split(key, sample_batch.shape[0])
-            _, val_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
+            _, _, val_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, CONFIG["inf_context_ratio"], precompute_ref_diffs=False)
             plot_pred_ref_videos_rollout(val_videos[0], 
                                         sample_batch[0], 
                                         title=f"Pred", 
@@ -772,7 +841,7 @@ plt.show()
 
 #%% Evaluate on Testing Dataset
 testing_subset = MovingMNISTDataset(test_arrays)
-test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=numpy_collate, drop_last=False)
+test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"]*10, shuffle=False, collate_fn=numpy_collate, drop_last=False)
 sample_batch = next(iter(test_loader))
 
 print("Batch shape for evaluation:", sample_batch.shape, flush=True)
@@ -783,7 +852,7 @@ if pad_length > 0:
     sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)
 
 val_keys = jax.random.split(key, sample_batch.shape[0])
-_, final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.5, precompute_ref_diffs=False)
+final_actions, _, final_videos = evaluate(model, sample_batch, 0.0, val_keys, coords_grid, 0.95, precompute_ref_diffs=False)
 
 if CONFIG["use_nll_loss"]:
     print(f"Final Predicted Video Mean Pixel Value Range: min={final_videos[...,:C].min():.4f}, max={final_videos[...,:C].max():.4f}")
@@ -803,4 +872,320 @@ plot_pred_ref_videos_rollout(
 # %% Save nohup
 os.system(f"cp -r nohup.log {run_path}/nohup.log")
 
+
+# %%
+
+#%% Generate final forecast rollout
+test_seq_id = np.random.randint(0, sample_batch.shape[0])
+test_seq_id = 203
+print(f"\nGenerating final forecast rollout visualization for test sequence ID: {test_seq_id}")
+
+plot_pred_ref_videos_rollout(
+    final_videos[test_seq_id], 
+    sample_batch[test_seq_id],
+    title=f"Pred", 
+    save_name=f"inference_forecast_rollout_seq{test_seq_id}.png"
+)
+
+
+
+
+#%% 1. Action Variance (Finding the Joystick Dimensions)
+all_actions_flat = final_actions.reshape(-1, model.lam_dim)
+action_variances = np.var(all_actions_flat, axis=0)
+
+plt.figure(figsize=(10, 4))
+plt.bar(range(model.lam_dim), action_variances, color='teal')
+plt.xlabel("Latent Dimension")
+plt.ylabel("Variance across all data")
+plt.title("Latent Action Dimension Importance (Variance)")
+plt.xticks(range(model.lam_dim))
+plt.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.savefig(plots_path / "action_dimension_variance_mnist.png")
+plt.show()
+
+# Extract the top 4 most active dimensions
+top_dims = np.argsort(action_variances)[-4:][::-1]
+print(f"Top 4 most active latent dimensions: {top_dims}")
+
+#%% 2. Continuous Action Trajectories over Time
+seq_actions = final_actions[test_seq_id] # Shape: (T, lam_dim)
+T_steps = seq_actions.shape[0]
+
+plt.figure(figsize=(12, 6))
+colors = ['crimson', 'dodgerblue', 'forestgreen', 'darkorange']
+
+for i, dim in enumerate(top_dims):
+    plt.plot(range(T_steps), seq_actions[:, dim], marker='o', linewidth=2, 
+             color=colors[i], label=f"Dim {dim} (Rank {i+1})")
+
+plt.axhline(0, color='black', linestyle='--', alpha=0.5)
+plt.xlabel("Time Step (t)")
+plt.ylabel("Latent Action Value (Velocity Proxy)")
+plt.title(f"Continuous Action Evolution for Sequence {test_seq_id}\n(Sudden changes indicate wall bounces)")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(plots_path / f"action_lines_seq{test_seq_id}.png")
+plt.show()
+
+#%% 3. Dual Joystick Visualization (Phase Portrait)
+# Assume the top 4 dims split cleanly into two 2D joysticks. 
+# (Note: The network might entangle them slightly, but PCA/ICA could decouple them if needed. 
+# For now, we pair Rank 1 & 2, and Rank 3 & 4).
+
+joy1_x, joy1_y = top_dims[0], top_dims[1]
+joy2_x, joy2_y = top_dims[2], top_dims[3]
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+def plot_joystick(ax, x_dim, y_dim, title, color_map="Blues"):
+    x_vals = seq_actions[:, x_dim]
+    y_vals = seq_actions[:, y_dim]
+    
+    # Plot the path
+    ax.plot(x_vals, y_vals, color='gray', alpha=0.5, linestyle='--')
+    
+    # Scatter points colored by time
+    scatter = ax.scatter(x_vals, y_vals, c=range(T_steps), cmap=color_map, s=80, edgecolor='black', zorder=5)
+    
+    # Annotate time steps
+    for t in range(T_steps):
+        ax.annotate(str(t), (x_vals[t], y_vals[t]), xytext=(5,5), textcoords="offset points", fontsize=9)
+        
+    ax.axhline(0, color='black', linewidth=1, alpha=0.3)
+    ax.axvline(0, color='black', linewidth=1, alpha=0.3)
+    ax.set_xlabel(f"Latent Dim {x_dim}")
+    ax.set_ylabel(f"Latent Dim {y_dim}")
+    ax.set_title(title)
+    return scatter
+
+sc1 = plot_joystick(axes[0], joy1_x, joy1_y, "Joystick 1 (Top Dims 1 & 2)", "Reds")
+sc2 = plot_joystick(axes[1], joy2_x, joy2_y, "Joystick 2 (Top Dims 3 & 4)", "Blues")
+
+fig.colorbar(sc1, ax=axes[0], label="Time Step (t)")
+fig.colorbar(sc2, ax=axes[1], label="Time Step (t)")
+
+plt.suptitle(f"Continuous Latent Velocity phase portraits for Sequence {test_seq_id}")
+plt.tight_layout()
+plt.savefig(plots_path / f"joystick_phase_seq{test_seq_id}.png")
+plt.show()
+
+#%% 4. Continuous PCA Trajectory
+from sklearn.decomposition import PCA
+
+pca = PCA(n_components=3)
+actions_2d = pca.fit_transform(all_actions_flat)
+
+plt.figure(figsize=(10, 8))
+# Plot the background distribution, colored by magnitude (speed)
+magnitudes = np.linalg.norm(all_actions_flat[:, top_dims], axis=1)
+scatter = plt.scatter(actions_2d[:, 0], actions_2d[:, 1], c=magnitudes, 
+                      cmap='viridis', alpha=0.2, s=15)
+plt.colorbar(scatter, label="Velocity Magnitude (Norm of Top 4 Dims)")
+
+# Get the 2D coordinates for just our specific test sequence
+seq_actions_2d = pca.transform(final_actions[test_seq_id])
+
+# Plot the trajectory with arrows
+plt.plot(seq_actions_2d[:, 0], seq_actions_2d[:, 1], color='red', linewidth=2)
+plt.scatter(seq_actions_2d[:, 0], seq_actions_2d[:, 1], c=range(T_steps), cmap='autumn', s=60, edgecolor='black', zorder=5)
+
+for t in range(T_steps):
+    plt.annotate(f"t={t}", (seq_actions_2d[t, 0], seq_actions_2d[t, 1]), 
+                 textcoords="offset points", xytext=(5,5), ha='center', fontsize=9, fontweight='bold')
+
+plt.xlabel(f"Principal Component 1 ({pca.explained_variance_ratio_[0]*100:.1f}%)")
+plt.ylabel(f"Principal Component 2 ({pca.explained_variance_ratio_[1]*100:.1f}%)")
+plt.title(f"Continuous Action Trajectory (PCA) for Sequence {test_seq_id}")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(plots_path / f"action_pca_continuous_seq{test_seq_id}.png")
+plt.show()
+
+
 #%%
+import pandas as pd
+import seaborn as sns
+
+# Grab the top 4 active dimensions from all sequences
+top_actions = all_actions_flat[:, top_dims]
+
+# Put them in a DataFrame for easy plotting
+df_actions = pd.DataFrame(
+    top_actions, 
+    columns=[f"Dim {d} (Rank {i+1})" for i, d in enumerate(top_dims)]
+)
+
+# A pairplot plots every dimension against every other dimension
+plt.figure(figsize=(12, 12))
+sns.pairplot(df_actions, kind="hist", diag_kind="kde", corner=True, 
+             plot_kws={'cmap': 'viridis', 'cbar': False})
+plt.suptitle("Pairplot of Top 4 Action Dimensions\n(Looking for geometric structure / corners)", y=1.02)
+plt.show()
+
+#%%
+def plot_action_perturbation(model, ref_video, dim_to_perturb, magnitudes=[-5.0, 0.0, 5.0]):
+    T = ref_video.shape[0]
+    z_init = model.encoder(jnp.transpose(ref_video[0], (2, 0, 1)))
+    
+    fig, axes = plt.subplots(len(magnitudes), T, figsize=(40, 2.0 * len(magnitudes)))
+    
+    for row, mag in enumerate(magnitudes):
+        # 1. Autoregressive rollout with our hijacked action
+        def scan_step(carry, step_idx):
+            z_t, m_t = carry
+            
+            # Get the natural action the model WANTS to take
+            a_t_natural = model.memory.decode(m_t, step_idx, z_t)
+            
+            # Hijack the action! Add our magnitude to the specific dimension
+            a_t_hijacked = a_t_natural.at[dim_to_perturb].add(mag)
+            
+            # Step physics forward
+            m_tp1 = model.memory.encode(m_t, step_idx, z_t, a_t_hijacked)
+            # z_tp1 = model.forward_dyn(z_t, a_t_hijacked)
+            z_tp1 = model.forward_dyn.mlp_A(z_t) + model.forward_dyn.mlp_B(a_t_hijacked)
+            # z_tp1 = model.forward_dyn.mlp_A(z_t)
+            # z_tp1 = model.forward_dyn.mlp_B(a_t_hijacked)
+            # z_tp1 = model.forward_dyn.mlp_A(z_t) + model.forward_dyn.mlp_B(jnp.zeros_like(a_t_hijacked))
+
+            # Render
+            time_coord = jnp.array([(step_idx-1)/(T-1)], dtype=z_t.dtype)
+            coords_grid_t = jnp.concatenate([jnp.full_like(coords_grid[..., :1], time_coord), coords_grid], axis=-1)
+            frame = model.render_frame(z_t, coords_grid_t)
+            
+            return (z_tp1, m_tp1), frame
+
+        m_init = model.memory.reset(T)
+        _, frames = jax.lax.scan(scan_step, (z_init, m_init), jnp.arange(1, T+1))
+        
+        # 2. Plot the resulting hijacked video
+        for t in range(T):
+            ax = axes[row, t]
+            img = np.clip(frames[t, ..., :C], 0, 1) if CONFIG["use_nll_loss"] else np.clip(frames[t], 0, 1)
+            if img.shape[-1] == 1: img = np.repeat(img, 3, axis=-1)
+            
+            ax.imshow(img)
+            if t == 0:
+                # ax.set_ylabel(f"Perturb Dim {dim_to_perturb}\nby {mag}", fontsize=12, fontweight='bold')
+                ax.set_ylabel(f"by {mag}", fontsize=12, fontweight='bold')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if row == 0:
+                ax.set_title(f"t={t}")
+
+    plt.suptitle(f"Latent Perturbation Test on Action Dimension {dim_to_perturb}", fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+# Run this for your top dimensions!
+plot_action_perturbation(model, sample_batch[test_seq_id], dim_to_perturb=top_dims[3], magnitudes=[-3.0, 0.0, 3.0])
+
+
+#%%
+import numpy as np
+from scipy.ndimage import label, center_of_mass
+
+def extract_true_velocities(video):
+    """
+    Extracts (v_x1, v_y1, v_x2, v_y2) from a single Moving MNIST video.
+    video shape: (T, H, W, C) or (T, H, W)
+    """
+    T = video.shape[0]
+    centroids = np.zeros((T, 2, 2)) # (Time, Digit, [y, x])
+    
+    for t in range(T):
+        frame = video[t].squeeze()
+        # Threshold to find the digits
+        binary_mask = frame > 0.1 
+        labeled_array, num_features = label(binary_mask)
+        
+        if num_features >= 2:
+            # Find center of mass for the two largest blobs
+            coms = center_of_mass(frame, labeled_array, index=[1, 2])
+            centroids[t, 0] = coms[0]
+            centroids[t, 1] = coms[1]
+        else:
+            # If they overlap, just repeat the last known distinct positions
+            centroids[t] = centroids[t-1] if t > 0 else np.array([[16, 16], [48, 48]])
+
+    # To maintain consistent identities (Digit 1 vs Digit 2) across frames,
+    # sort them by their y-coordinate (or x-coordinate)
+    centroids = np.sort(centroids, axis=1)
+
+    # Velocity is the derivative of position (difference between frames)
+    # Pad the first frame with 0 velocity
+    velocities = np.zeros((T, 4))
+    velocities[1:] = (centroids[1:] - centroids[:-1]).reshape(-1, 4)
+    velocities[0] = velocities[1] # Assume constant initial velocity
+    
+    return velocities # Shape: (T, 4) -> [v_y1, v_x1, v_y2, v_x2]
+
+# Extract for your specific test sequence
+true_vels = extract_true_velocities(sample_batch[test_seq_id])
+latent_acts = final_actions[test_seq_id] # Your model's 4D actions
+
+#%%
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Create a DataFrame combining latent actions and true velocities
+data = np.hstack([latent_acts, true_vels])
+columns = [f"Latent {i}" for i in range(4)] + ["True v_y1", "True v_x1", "True v_y2", "True v_x2"]
+df = pd.DataFrame(data, columns=columns)
+
+plt.figure(figsize=(8, 6))
+correlation_matrix = df.corr().iloc[0:4, 4:8] # Just Latent vs True
+
+sns.heatmap(correlation_matrix, annot=True, cmap="coolwarm", center=0, vmin=-1, vmax=1)
+plt.title("Pearson Correlation: Latent Actions vs True Physical Velocities")
+plt.tight_layout()
+plt.show()
+# %%
+
+from sklearn.cross_decomposition import CCA
+
+# Initialize CCA to find 4 canonical components
+cca = CCA(n_components=4)
+cca.fit(latent_acts, true_vels)
+latent_c, true_vel_c = cca.transform(latent_acts, true_vels)
+
+# Calculate the correlation for each rotated component
+cca_corrs = [np.corrcoef(latent_c[:, i], true_vel_c[:, i])[0, 1] for i in range(4)]
+
+plt.figure(figsize=(8, 4))
+plt.bar([f"Component {i+1}" for i in range(4)], cca_corrs, color="purple")
+plt.ylim(0, 1.1)
+plt.ylabel("Canonical Correlation")
+plt.title("CCA: How much velocity information is in the latent space?")
+for i, v in enumerate(cca_corrs):
+    plt.text(i, v + 0.02, f"{v:.3f}", ha='center', fontweight='bold')
+plt.show()
+
+#%%
+from sklearn.linear_model import Ridge
+
+# Train a simple linear decoder to predict True Velocities from Latent Actions
+decoder = Ridge(alpha=1.0)
+decoder.fit(latent_acts, true_vels)
+predicted_vels = decoder.predict(latent_acts)
+
+fig, axes = plt.subplots(4, 1, figsize=(10, 8), sharex=True)
+titles = ["Velocity Y (Digit 1)", "Velocity X (Digit 1)", "Velocity Y (Digit 2)", "Velocity X (Digit 2)"]
+
+for i in range(4):
+    axes[i].plot(true_vels[:, i], label="Ground Truth Velocity", color="black", linewidth=2, linestyle="--")
+    axes[i].plot(predicted_vels[:, i], label="Decoded from Latent Action", color="red", linewidth=2, alpha=0.7)
+    axes[i].set_ylabel("Velocity")
+    axes[i].set_title(titles[i])
+    axes[i].legend(loc="upper right")
+    axes[i].grid(alpha=0.3)
+
+axes[3].set_xlabel("Time Step (t)")
+plt.suptitle("Decoding Physical Velocity directly from Latent Actions", fontsize=14)
+plt.tight_layout()
+plt.show()
+# %%

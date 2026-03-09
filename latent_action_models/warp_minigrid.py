@@ -40,8 +40,8 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 50*4*4*5,
-    "print_every": 1*5*4,
+    "nb_epochs": 4000,
+    "print_every": 10,
     "batch_size": 2 if SINGLE_BATCH else 16*4,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-5,
     "p_forcing": 0.5,
@@ -52,14 +52,16 @@ CONFIG = {
     "aux_loss_num_steps": 4,
 
     # --- Architecture Params ---
-    "lam_space": 10,
-    "mem_space": 128*2,
+    "lam_space": 2,
+    "mem_space": 128*2,     ## Not used if discrete actions
+    "icl_decoding": True,
+    "discrete_actions": True,
     "split_forward": True,
     "root_width": 12,
     "root_depth": 5,
     "num_fourier_freqs": 6,
     "use_time_in_root": False,
-    "pretrain_encoder": False,
+    "pretrain_encoder": True,
 
     # --- Plateau Scheduler Config ---
     "lr_patience": 300,      
@@ -111,7 +113,7 @@ def numpy_collate(batch):
         videos = videos / 255.0
     return videos
 
-print("Loading Moving MNIST Dataset...")
+print("Loading MiniGrid Dataset...")
 try:
     data_path = './data' if TRAIN else '../../data'
 
@@ -303,9 +305,6 @@ class ForwardDynamics(eqx.Module):
             return NotImplementedError("get_latents is only implemented for split_forward=True")
 
 
-# ==============================================================================
-# --- NEW TRANSFORMER MEMORY MODULE ---
-# ==============================================================================
 class TransformerBlock(eqx.Module):
     attn: eqx.nn.MultiheadAttention
     mlp: eqx.nn.MLP
@@ -335,23 +334,40 @@ class TransformerBlock(eqx.Module):
         x = x + jax.vmap(self.mlp)(jax.vmap(self.ln2)(x))
         return x
 
+
 class MemoryModule(eqx.Module):
     """
     Autoregressive Transformer Memory Module for Latent Actions.
-    Designed specifically to operate efficiently within a fixed-size jax.lax.scan block.
+    Supports continuous actions (MLP) or discrete learned embeddings via In-Context Learning (ICL).
     """
     d_model: int
     max_len: int
     pos_emb: jax.Array
     blocks: tuple
     proj_in: eqx.nn.Linear
-    action_mlp: eqx.nn.MLP
+    
+    # Static fields for control flow and shapes
+    discrete_actions: bool = eqx.field(static=True)
+    lam_dim: int = eqx.field(static=True)
+    icl_decoding: bool = eqx.field(static=True)
+    
+    # Standard decoding components
+    action_mlp: Optional[eqx.nn.MLP]
+    
+    # ICL decoding components
+    action_embedding: Optional[eqx.nn.Embedding]
+    output_proj: Optional[eqx.nn.Linear]
 
-    def __init__(self, lam_dim, mem_dim, latent_dim, key, max_len=12, num_heads=4, num_blocks=4):
-        self.d_model = mem_dim
+    def __init__(self, lam_dim, mem_dim, latent_dim, key, max_len=12, num_heads=4, num_blocks=4, num_actions=4):
         self.max_len = max_len
+        self.discrete_actions = CONFIG["discrete_actions"]
+        self.icl_decoding = CONFIG["icl_decoding"]
+        self.lam_dim = lam_dim
+        ## d_model is the closest power of 2 after latent_dim + lam_dim for better transformer performance
+        # self.d_model = 2 ** int(jnp.ceil(jnp.log2(latent_dim + lam_dim)))
+        self.d_model = mem_dim
         
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
         
         # 1. Project concatenated [state, action] tokens into model dimension
         self.proj_in = eqx.nn.Linear(latent_dim + lam_dim, self.d_model, key=k1)
@@ -362,9 +378,23 @@ class MemoryModule(eqx.Module):
         # 3. Causal Transformer Blocks
         block_keys = jax.random.split(k3, num_blocks)
         self.blocks = tuple(TransformerBlock(self.d_model, num_heads, bk) for bk in block_keys)
-        
-        # 4. Final Decoder: Context + Current State -> Action
-        self.action_mlp = eqx.nn.MLP(self.d_model + latent_dim, lam_dim, width_size=self.d_model * 2, depth=3, key=k4)
+
+        # 4. Decoder Heads
+        if self.icl_decoding:
+            self.action_mlp = None
+            if self.discrete_actions:
+                # Learned discrete actions (num_actions -> lam_dim)
+                self.action_embedding = eqx.nn.Embedding(num_actions, lam_dim, key=k5)
+                # Projects transformer output to action logits
+                self.output_proj = eqx.nn.Linear(self.d_model, num_actions, key=k6)
+            else:
+                # Continuous actions with ICL decoding still use an MLP head
+                self.action_embedding = None
+                self.output_proj = eqx.nn.Linear(self.d_model, lam_dim, key=k6)
+        else:
+            self.action_mlp = eqx.nn.MLP(self.d_model + latent_dim, lam_dim, width_size=self.d_model * 2, depth=3, key=k4)
+            self.action_embedding = None
+            self.output_proj = None
 
     def reset(self, T):
         """Returns an empty fixed-size buffer for JAX scan"""
@@ -373,7 +403,6 @@ class MemoryModule(eqx.Module):
     def encode(self, buffer, step_idx, z, a):
         """
         Dynamically injects the new token at the correct sequence index.
-        JAX compiles `.at[].set()` to efficient in-place updates inside scan loops.
         """
         token = self.proj_in(jnp.concatenate([z, a], axis=-1))
         return buffer.at[step_idx - 1].set(token)
@@ -384,28 +413,64 @@ class MemoryModule(eqx.Module):
         """
         T = buffer.shape[0]
         
-        def compute_context():
-            # Apply positional embeddings to the full sequence
-            x = buffer + self.pos_emb[:T]
+        if self.icl_decoding:
+            # --- ICL Decoding Path ---
             
-            # Pure lower-triangular causal mask to prevent leaking padding
+            # 1. Create query token: [z_current, zeros]
+            zero_action = jnp.zeros((self.lam_dim,), dtype=z_current.dtype)
+            query_token = self.proj_in(jnp.concatenate([z_current, zero_action], axis=-1))
+            
+            # 2. Inject query token temporally into the buffer for the current step
+            temp_buffer = buffer.at[step_idx - 1].set(query_token)
+            
+            # 3. Apply positional embeddings and causal attention
+            x = temp_buffer + self.pos_emb[:T]
             mask = jnp.tril(jnp.ones((T, T), dtype=bool))
             
             for block in self.blocks:
                 x = block(x, mask)
+
+            # 4. Extract context specifically at the current query step
+            context = x[step_idx - 1]
+
+            if self.discrete_actions:
+                # 1. Get the raw logits from the transformer context
+                logits = self.output_proj(context)
+
+                # 2. Calculate the soft probabilities (this gives us our gradients!)
+                soft_probs = jax.nn.softmax(logits, axis=-1)
+
+                # 3. Calculate the strictly hard, discrete one-hot vector (this is what we want for the forward pass)
+                hard_idx = jnp.argmax(logits, axis=-1)
+                hard_probs = jax.nn.one_hot(hard_idx, num_classes=logits.shape[-1])
+
+                # 4. The Magic STE Formula:
+                ste_probs = soft_probs + jax.lax.stop_gradient(hard_probs - soft_probs)
+
+                # 5. Lookup the embedding
+                action = jnp.dot(ste_probs, self.action_embedding.weight)
+            else:
+                # If not using discrete actions, directly project to continuous action space
+                action = self.output_proj(context)
+
+            return action
+
+        else:
+            # --- Original Continuous MLP Decoding Path ---
+            def compute_context():
+                x = buffer + self.pos_emb[:T]
+                mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+                for block in self.blocks:
+                    x = block(x, mask)
+                return x[step_idx - 2]
                 
-            # Extract the context specifically from the *last valid token*
-            return x[step_idx - 2]
+            context = jax.lax.cond(
+                step_idx > 1,
+                compute_context,
+                lambda: jnp.zeros(self.d_model)
+            )
             
-        # Handle the edge-case where step_idx == 1 (no valid past history exists yet)
-        context = jax.lax.cond(
-            step_idx > 1,
-            compute_context,
-            lambda: jnp.zeros(self.d_model)
-        )
-        
-        return self.action_mlp(jnp.concatenate([context, z_current], axis=-1))
-# ==============================================================================
+            return self.action_mlp(jnp.concatenate([context, z_current], axis=-1))
 
 
 class WARP(eqx.Module):
@@ -454,7 +519,8 @@ class WARP(eqx.Module):
 
         self.mem_dim = mem_dim
         # Using default max_len=128 which safely handles T=12 or T=16
-        self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem)
+        # self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem)
+        self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem, max_len=12, num_heads=4, num_blocks=4, num_actions=4)
 
     @property
     def A(self):
