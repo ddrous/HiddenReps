@@ -35,12 +35,12 @@ def count_trainable_params(model):
 TRAIN = True
 RUN_DIR = "./" if not TRAIN else None
 
-SINGLE_BATCH = False
+SINGLE_BATCH = True
 USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 1500*4,        ## 16 hours !
+    "nb_epochs": 1500*1,        ## 24 hours !
     "print_every": 100,
     "batch_size": 2 if SINGLE_BATCH else 256*2,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-5,
@@ -189,23 +189,15 @@ def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=Non
         ref_video = (ref_video + 1.0) / 2.0
 
     if video.shape[-1] == 1:
-        # fig, axes = plt.subplots(2, 1+(nb_frames//2), figsize=(20, 6))
-        # indices_to_plot = list(np.arange(0, nb_frames, 2)) + [nb_frames-1]
-
-        fig, axes = plt.subplots(2, nb_frames, figsize=(2*nb_frames, 2*2))
-        indices_to_plot = list(np.arange(0, nb_frames))
-
+        fig, axes = plt.subplots(2, 1+(nb_frames//2), figsize=(20, 6))
+        indices_to_plot = list(np.arange(0, nb_frames, 2)) + [nb_frames-1]
         for i, idx in enumerate(indices_to_plot):
             video_to_plot = video[idx] if not rescale else (video[idx] + 1.0) / 2.0
             sbimshow(video_to_plot, title=f"{title} t={idx}", ax=axes[0, i])
             sbimshow(ref_video[idx], title=f"Ref t={idx}", ax=axes[1, i])
     else:
-        # fig, axes = plt.subplots(3, 1+(nb_frames//2), figsize=(20, 7))
-        # indices_to_plot = list(np.arange(0, nb_frames, 2)) + [nb_frames-1]
-
-        fig, axes = plt.subplots(3, nb_frames, figsize=(2*nb_frames, 3*2))
-        indices_to_plot = list(np.arange(0, nb_frames))
-
+        fig, axes = plt.subplots(3, 1+(nb_frames//2), figsize=(20, 7))
+        indices_to_plot = list(np.arange(0, nb_frames, 2)) + [nb_frames-1]
         for i, idx in enumerate(indices_to_plot):
             video_to_plot = video[idx, ..., :C] if not rescale else (video[idx, ..., :C] + 1.0) / 2.0
             sbimshow(video_to_plot, title=f"Mean t={idx}", ax=axes[0, i])
@@ -303,7 +295,138 @@ class ForwardDynamics(eqx.Module):
             return self.mlp_A(z_prev), self.mlp_B(a)
         else:
             return NotImplementedError("get_latents is only implemented for split_forward=True")
+import jax
+import jax.numpy as jnp
+import equinox as eqx
+from typing import Optional
 
+class SelfTransformerBlock(eqx.Module):
+    # Standard Self-Attention Block
+    attn: eqx.nn.MultiheadAttention
+    mlp: eqx.nn.MLP
+    ln1: eqx.nn.LayerNorm
+    ln2: eqx.nn.LayerNorm
+
+    def __init__(self, d_model, num_heads, key):
+        k1, k2 = jax.random.split(key)
+        self.attn = eqx.nn.MultiheadAttention(
+            num_heads=num_heads,
+            query_size=d_model,
+            use_query_bias=True,
+            use_key_bias=True,
+            use_value_bias=True,
+            use_output_bias=True,
+            key=k1
+        )
+        self.mlp = eqx.nn.MLP(d_model, d_model, width_size=d_model * 4, depth=1, key=k2)
+        self.ln1 = eqx.nn.LayerNorm(d_model)
+        self.ln2 = eqx.nn.LayerNorm(d_model)
+
+    def __call__(self, x, mask=None):
+        # Pre-LN architecture
+        x_norm = jax.vmap(self.ln1)(x)
+        attn_out = self.attn(x_norm, x_norm, x_norm, mask=mask)
+        x = x + attn_out
+        x = x + jax.vmap(self.mlp)(jax.vmap(self.ln2)(x))
+        return x
+
+class CrossTransformerBlock(eqx.Module):
+    # Cross-Attention Block (State queries Action)
+    cross_attn: eqx.nn.MultiheadAttention
+    mlp: eqx.nn.MLP
+    ln1: eqx.nn.LayerNorm
+    ln2: eqx.nn.LayerNorm
+    ln_context: eqx.nn.LayerNorm
+
+    def __init__(self, d_model, num_heads, key):
+        k1, k2 = jax.random.split(key)
+        self.cross_attn = eqx.nn.MultiheadAttention(
+            num_heads=num_heads, 
+            query_size=d_model, 
+            key_size=d_model, 
+            value_size=d_model,
+            use_query_bias=True, 
+            use_key_bias=True, 
+            use_value_bias=True, 
+            use_output_bias=True, 
+            key=k1
+        )
+        self.mlp = eqx.nn.MLP(d_model, d_model, width_size=d_model * 4, depth=1, key=k2)
+        self.ln1 = eqx.nn.LayerNorm(d_model)
+        self.ln2 = eqx.nn.LayerNorm(d_model)
+        self.ln_context = eqx.nn.LayerNorm(d_model)
+
+    def __call__(self, x, context, mask=None):
+        # Pre-LN architecture adapted for Cross Attention
+        x_norm = jax.vmap(self.ln1)(x)
+        ctx_norm = jax.vmap(self.ln_context)(context)
+        
+        attn_out = self.cross_attn(query=x_norm, key_=ctx_norm, value=ctx_norm, mask=mask)
+        x = x + attn_out
+        x = x + jax.vmap(self.mlp)(jax.vmap(self.ln2)(x))
+        return x
+
+class ForwardDynamicsAtt(eqx.Module):
+    proj_in_state: eqx.nn.Linear
+    proj_in_action: eqx.nn.Linear
+    proj_out: eqx.nn.Linear
+
+    # Storing a tuple of blocks creates our "stack"
+    layers: tuple 
+    
+    split_forward: bool = eqx.field(static=True)
+    num_heads: int = eqx.field(static=True)
+    num_layers: int = eqx.field(static=True)
+
+    def __init__(self, embed_dim, split_forward, num_heads=4, num_layers=3, key=None):
+        self.split_forward = split_forward
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        
+        k1, k2, k3, k_layers = jax.random.split(key, 4)
+        layer_keys = jax.random.split(k_layers, num_layers)
+
+        self.proj_in_state = eqx.nn.Linear(1, embed_dim, key=k1)
+        self.proj_in_action = eqx.nn.Linear(1, embed_dim, key=k2)
+        self.proj_out = eqx.nn.Linear(embed_dim, 1, key=k3)
+
+        # Initialize the stack of layers
+        if split_forward:
+            self.layers = tuple(
+                CrossTransformerBlock(embed_dim, num_heads, k) for k in layer_keys
+            )
+        else:
+            self.layers = tuple(
+                SelfTransformerBlock(embed_dim, num_heads, k) for k in layer_keys
+            )
+
+    def __call__(self, z_prev, a):
+        # 1. Project Inputs into embedding space
+        z_prev = eqx.filter_vmap(self.proj_in_state)(z_prev[..., None])  # (seq_len_z, embed_dim)
+        a = eqx.filter_vmap(self.proj_in_action)(a[..., None])           # (seq_len_a, embed_dim)
+
+        # 2. Pass through the deep stack of layers
+        if self.split_forward:
+            # State continuously queries the action representation layer by layer
+            out = z_prev
+            for layer in self.layers:
+                out = layer(out, context=a, mask=None)
+        else:
+            # Jointly process State and Action
+            seq_len_z = z_prev.shape[0]
+            joint_seq = jnp.concatenate([z_prev, a], axis=0)
+            
+            for layer in self.layers:
+                joint_seq = layer(joint_seq, mask=None)
+            
+            # Extract only the updated state tokens from the joint sequence
+            out = joint_seq[:seq_len_z]
+
+        # 3. Project Outputs back to original space
+        return eqx.filter_vmap(self.proj_out)(out).squeeze(-1)
+
+    def get_latents(self, z_prev, a):
+        raise NotImplementedError("Latent extraction requires careful definition when stacking blocks.")
 
 class TransformerBlock(eqx.Module):
     attn: eqx.nn.MultiheadAttention
@@ -338,15 +461,15 @@ class InverseDynamics(eqx.Module):
     mlp: eqx.nn.MLP
     def __init__(self, dyn_dim, lam_dim, key, num_actions=None):
         if num_actions: ## Discrete case
-            self.mlp = eqx.nn.MLP(dyn_dim * 2, num_actions, width_size=dyn_dim*1, depth=2, key=key)
+            self.mlp = eqx.nn.MLP(dyn_dim * 2, num_actions, width_size=dyn_dim*1, depth=3, key=key)
         else:
-            self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim*1, depth=2, key=key)
+            self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim*1, depth=3, key=key)
         
     def __call__(self, z_prev, z_target):
         return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
 
 
-class MemoryModuleAtt(eqx.Module):
+class MemoryModule(eqx.Module):
     """
     Autoregressive Transformer Memory Module for Latent Actions.
     Supports continuous actions (MLP) or discrete learned embeddings via In-Context Learning (ICL).
@@ -455,85 +578,6 @@ class MemoryModuleAtt(eqx.Module):
             
             return self.action_mlp(jnp.concatenate([context, z_current], axis=-1))
 
-class MemoryModule(eqx.Module):
-    """
-    Recurrent Memory Module for Latent Actions.
-    Uses either a GRU or LSTM as the core memory architecture.
-    Supports both continuous (lam_dim) and discrete (num_actions) output spaces.
-    """
-    d_model: int
-    rnn_type: str = eqx.field(static=True)
-    lam_dim: int = eqx.field(static=True)
-    num_actions: Optional[int] = eqx.field(static=True)
-    
-    # Core recurrent cell
-    rnn_cell: eqx.Module
-    
-    # Decoder component
-    action_decoder: eqx.nn.MLP
-
-    def __init__(self, lam_dim, mem_dim, latent_dim, key, rnn_type="LSTM", num_actions=None, **kwargs):
-        self.lam_dim = lam_dim
-        self.d_model = mem_dim
-        self.rnn_type = rnn_type.upper()
-        self.num_actions = num_actions
-        
-        k1, k2 = jax.random.split(key, 2)
-        
-        # 1. Recurrent Cell Initialization
-        input_dim = latent_dim + lam_dim
-        if self.rnn_type == "LSTM":
-            self.rnn_cell = eqx.nn.LSTMCell(input_dim, self.d_model, key=k1)
-        elif self.rnn_type == "GRU":
-            self.rnn_cell = eqx.nn.GRUCell(input_dim, self.d_model, key=k1)
-        else:
-            raise ValueError(f"Unsupported rnn_type: {rnn_type}. Must be 'LSTM' or 'GRU'.")
-
-        # 2. Decoder Initialization
-        decode_input_dim = self.d_model + latent_dim
-        
-        # Route output dimension: discrete (logits) vs continuous (vector)
-        out_dim = num_actions if num_actions is not None else lam_dim
-        
-        self.action_decoder = eqx.nn.MLP(
-            in_size=decode_input_dim, 
-            out_size=out_dim, 
-            width_size=self.d_model * 1, 
-            depth=1, 
-            key=k2
-        )
-
-    def reset(self, T):
-        """
-        Returns the initial hidden state(s) for the RNN.
-        The 'T' argument is kept strictly to maintain the API.
-        """
-        if self.rnn_type == "LSTM":
-            return (jnp.zeros((self.d_model,)), jnp.zeros((self.d_model,)))
-        else:
-            return jnp.zeros((self.d_model,))
-
-    def encode(self, state, step_idx, z, a):
-        """
-        Takes the current RNN state, concatenates [z, a], and steps the RNN forward.
-        """
-        rnn_input = jnp.concatenate([z, a], axis=-1)
-        new_state = self.rnn_cell(rnn_input, state)
-        return new_state
-
-    def decode(self, state, step_idx, z_current):
-        """
-        Extracts the hidden memory, concatenates it with the current observation, 
-        and predicts the action via MLP.
-        """
-        if self.rnn_type == "LSTM":
-            h = state[0]
-        else:
-            h = state
-            
-        decode_input = jnp.concatenate([h, z_current], axis=-1)
-        return self.action_decoder(decode_input)
-    
 
 class LAM(eqx.Module):
     """ A LAM is made up of a IDM and a DMM, it produces the action based on context. It also stores discrete embeddings if needed """
@@ -693,7 +737,7 @@ class WARP(eqx.Module):
         pred_flat = self.render_pixels(theta, flat_coords)
         return pred_flat.reshape(H, W, -1)
 
-    def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, context_ratio_):
+    def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, context_ratio):
         T = ref_video.shape[0]
         init_frame = ref_video[0]
 
@@ -708,12 +752,6 @@ class WARP(eqx.Module):
         ## Flip a coin at the start of each step to decide whether to force towards GT or not
         # is_context_init = jax.random.bernoulli(key, p=0.5).astype(bool)
         is_context_init = False
-
-        ## Calculate the context ration
-        if context_ratio_ is not None:
-            context_ratio = context_ratio_
-        else:
-            context_ratio = jax.random.uniform(key, minval=0.0, maxval=1.0)
 
         # 3. Add the Equinox checkpointing decorator here!
         # Recompute internal activations during the backward pass.
@@ -835,9 +873,8 @@ if TRAIN:
             k_full, k_init = jax.random.split(keys[0], 2)
             
             # Use randomized uniform context ratio for training, mirroring minigrid
-            # context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
+            context_ratio = jax.random.uniform(k_full, minval=0.0, maxval=1.0)
             # context_ratio = CONFIG["inf_context_ratio"]
-            context_ratio = None
             _, _, pred_videos = m(ref_videos, p_forcing, keys, coords_grid, context_ratio, precompute_ref_diffs=False)
 
             ## --- 1. LATENT (WEIGHT-SPACE) DYNAMICS LOSS (Primary) ---

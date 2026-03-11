@@ -40,7 +40,7 @@ USE_NLL_LOSS = False
 
 CONFIG = {
     "seed": 2026,
-    "nb_epochs": 4000,
+    "nb_epochs": 4000*4,
     "print_every": 10,
     "batch_size": 2 if SINGLE_BATCH else 16*4,
     "learning_rate": 1e-4 if USE_NLL_LOSS else 1e-5,
@@ -113,7 +113,7 @@ def numpy_collate(batch):
         videos = videos / 255.0
     return videos
 
-print("Loading MiniGrid Dataset...")
+print("Loading Moving MNIST Dataset...")
 try:
     data_path = './data' if TRAIN else '../../data'
 
@@ -266,14 +266,6 @@ class CNNEncoder(eqx.Module):
         x = self.layers[-1](x)
         return x
 
-class LAM(eqx.Module):
-    mlp: eqx.nn.MLP
-    def __init__(self, dyn_dim, lam_dim, key):
-        self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim*1, depth=3, key=key)
-        
-    def __call__(self, z_prev, z_target):
-        return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
-
 class ForwardDynamics(eqx.Module):
     mlp_A: Optional[eqx.nn.MLP]
     mlp_B: Optional[eqx.nn.MLP]
@@ -334,6 +326,17 @@ class TransformerBlock(eqx.Module):
         x = x + jax.vmap(self.mlp)(jax.vmap(self.ln2)(x))
         return x
 
+class InverseDynamics(eqx.Module):
+    mlp: eqx.nn.MLP
+    def __init__(self, dyn_dim, lam_dim, key, num_actions=None):
+        if num_actions: ## Discrete case
+            self.mlp = eqx.nn.MLP(dyn_dim * 2, num_actions, width_size=dyn_dim*1, depth=3, key=key)
+        else:
+            self.mlp = eqx.nn.MLP(dyn_dim * 2, lam_dim, width_size=dyn_dim*1, depth=3, key=key)
+        
+    def __call__(self, z_prev, z_target):
+        return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
+
 
 class MemoryModule(eqx.Module):
     """
@@ -347,7 +350,6 @@ class MemoryModule(eqx.Module):
     proj_in: eqx.nn.Linear
     
     # Static fields for control flow and shapes
-    discrete_actions: bool = eqx.field(static=True)
     lam_dim: int = eqx.field(static=True)
     icl_decoding: bool = eqx.field(static=True)
     
@@ -355,12 +357,10 @@ class MemoryModule(eqx.Module):
     action_mlp: Optional[eqx.nn.MLP]
     
     # ICL decoding components
-    action_embedding: Optional[eqx.nn.Embedding]
     output_proj: Optional[eqx.nn.Linear]
 
     def __init__(self, lam_dim, mem_dim, latent_dim, key, max_len=12, num_heads=4, num_blocks=4, num_actions=4):
         self.max_len = max_len
-        self.discrete_actions = CONFIG["discrete_actions"]
         self.icl_decoding = CONFIG["icl_decoding"]
         self.lam_dim = lam_dim
         ## d_model is the closest power of 2 after latent_dim + lam_dim for better transformer performance
@@ -382,14 +382,9 @@ class MemoryModule(eqx.Module):
         # 4. Decoder Heads
         if self.icl_decoding:
             self.action_mlp = None
-            if self.discrete_actions:
-                # Learned discrete actions (num_actions -> lam_dim)
-                self.action_embedding = eqx.nn.Embedding(num_actions, lam_dim, key=k5)
-                # Projects transformer output to action logits
+            if num_actions:
                 self.output_proj = eqx.nn.Linear(self.d_model, num_actions, key=k6)
             else:
-                # Continuous actions with ICL decoding still use an MLP head
-                self.action_embedding = None
                 self.output_proj = eqx.nn.Linear(self.d_model, lam_dim, key=k6)
         else:
             self.action_mlp = eqx.nn.MLP(self.d_model + latent_dim, lam_dim, width_size=self.d_model * 2, depth=3, key=k4)
@@ -433,27 +428,7 @@ class MemoryModule(eqx.Module):
             # 4. Extract context specifically at the current query step
             context = x[step_idx - 1]
 
-            if self.discrete_actions:
-                # 1. Get the raw logits from the transformer context
-                logits = self.output_proj(context)
-
-                # 2. Calculate the soft probabilities (this gives us our gradients!)
-                soft_probs = jax.nn.softmax(logits, axis=-1)
-
-                # 3. Calculate the strictly hard, discrete one-hot vector (this is what we want for the forward pass)
-                hard_idx = jnp.argmax(logits, axis=-1)
-                hard_probs = jax.nn.one_hot(hard_idx, num_classes=logits.shape[-1])
-
-                # 4. The Magic STE Formula:
-                ste_probs = soft_probs + jax.lax.stop_gradient(hard_probs - soft_probs)
-
-                # 5. Lookup the embedding
-                action = jnp.dot(ste_probs, self.action_embedding.weight)
-            else:
-                # If not using discrete actions, directly project to continuous action space
-                action = self.output_proj(context)
-
-            return action
+            return self.output_proj(context)
 
         else:
             # --- Original Continuous MLP Decoding Path ---
@@ -473,14 +448,83 @@ class MemoryModule(eqx.Module):
             return self.action_mlp(jnp.concatenate([context, z_current], axis=-1))
 
 
+class LAM(eqx.Module):
+    """ A LAM is made up of a IDM and a DMM, it produces the action based on context. It also stores discrete embeddings if needed """
+    idm: InverseDynamics
+    dmm: MemoryModule
+
+    discrete_actions: bool = eqx.field(static=True)
+    action_embedding: Optional[eqx.nn.Embedding]
+
+    def __init__(self, dyn_dim, lam_dim, mem_dim, max_len, num_heads, num_blocks, num_actions, key):
+        k1, k2 = jax.random.split(key)
+        self.discrete_actions = num_actions is not None
+
+        self.idm = InverseDynamics(dyn_dim, 
+                                   lam_dim, 
+                                   key=k1, 
+                                   num_actions=num_actions if self.discrete_actions else None)
+        self.dmm = MemoryModule(lam_dim, 
+                                mem_dim, 
+                                dyn_dim, 
+                                key=k2, 
+                                num_heads=num_heads, 
+                                num_blocks=num_blocks, 
+                                max_len=max_len, 
+                                num_actions=num_actions if self.discrete_actions else None)
+
+        if self.discrete_actions:
+            self.action_embedding = eqx.nn.Embedding(num_actions, lam_dim, key=k2)
+        else:
+            self.action_embedding = None
+
+    def __call__(self, context):
+        return NameError("The module cannot be called. Please call either the MemoryModule directly for the autoregressive path, or the IDM for the forced path.")
+
+    def discretise_action(self, logits):
+        # 2. Calculate the soft probabilities (this gives us our gradients!)
+        soft_probs = jax.nn.softmax(logits, axis=-1)
+
+        # 3. Calculate the strictly hard, discrete one-hot vector (this is what we want for the forward pass)
+        hard_idx = jnp.argmax(logits, axis=-1)
+        hard_probs = jax.nn.one_hot(hard_idx, num_classes=logits.shape[-1])
+
+        # 4. The Magic STE Formula:
+        ste_probs = soft_probs + jax.lax.stop_gradient(hard_probs - soft_probs)
+
+        # 5. Lookup the embedding
+        action = jnp.dot(ste_probs, self.action_embedding.weight)
+
+        return action
+
+    def inverse_dynamics(self, z_prev, z_target):
+        if not self.discrete_actions:
+            return self.idm(z_prev, z_target)
+        else:
+            logits = self.idm(z_prev, z_target)
+            return self.discretise_action(logits)
+
+    def decode_memory(self, buffer, step_idx, z_current):
+        if not self.discrete_actions:
+            return self.dmm.decode(buffer, step_idx, z_current)
+        else:
+            logits = self.dmm.decode(buffer, step_idx, z_current)
+            return self.discretise_action(logits)
+
+    def encode_memory(self, buffer, step_idx, z_current, a):
+        return self.dmm.encode(buffer, step_idx, z_current, a)
+    
+    def reset_memory(self, T):
+        return self.dmm.reset(T)
+
+
+
 class WARP(eqx.Module):
     encoder: CNNEncoder
-    lam: LAM
     forward_dyn: ForwardDynamics
     theta_base: jax.Array
+    action_model: LAM
 
-    memory: Optional[MemoryModule]
-    
     unravel_fn: callable = eqx.field(static=True)
     d_theta: int = eqx.field(static=True)
     lam_dim: int = eqx.field(static=True)
@@ -514,13 +558,15 @@ class WARP(eqx.Module):
             ## Load the pretrained encoder weights from the autoencoding phase
             self.encoder, self.theta_base = eqx.tree_deserialise_leaves("minigrid_enc.eqx", (self.encoder, self.theta_base))
 
-        self.lam = LAM(self.d_theta, lam_dim, key=k_lam)
         self.forward_dyn = ForwardDynamics(self.d_theta, lam_dim, split_forward, key=k_fwd)
 
         self.mem_dim = mem_dim
-        # Using default max_len=128 which safely handles T=12 or T=16
-        # self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem)
-        self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem, max_len=12, num_heads=4, num_blocks=4, num_actions=4)
+
+        # self.lam = LAM(self.d_theta, lam_dim, key=k_lam)
+        # self.memory = MemoryModule(self.lam_dim, self.mem_dim, self.d_theta, key=k_mem, max_len=12, num_heads=4, num_blocks=4, num_actions=4)
+
+        num_actions = 4 if CONFIG["discrete_actions"] else None
+        self.action_model = LAM(self.d_theta, lam_dim, mem_dim, max_len=12, num_heads=4, num_blocks=4, num_actions=num_actions, key=k_lam)
 
     @property
     def A(self):
@@ -559,7 +605,6 @@ class WARP(eqx.Module):
         pred_flat = self.render_pixels(theta, flat_coords)
         return pred_flat.reshape(H, W, -1)
 
-
     def _get_preds_single(self, ref_video, p_forcing, key, coords_grid, context_ratio):
         T = ref_video.shape[0]
         init_frame = ref_video[0]
@@ -570,7 +615,7 @@ class WARP(eqx.Module):
             z_init = jax.lax.stop_gradient(z_init)
 
         # 2. Initialize fixed buffer for Transformer memory
-        m_init = self.memory.reset(T)
+        m_init = self.action_model.reset_memory(T)
 
         ## Flip a coin at the start of each step to decide whether to force towards GT or not
         # is_context_init = jax.random.bernoulli(key, p=0.5).astype(bool)
@@ -587,7 +632,6 @@ class WARP(eqx.Module):
             # --- Rendering INSIDE the checkpointed step ---
             # Concatenate the time t to the coordinates before rendering
             time_coord = jnp.array([(step_idx-1)/ (T-1)], dtype=z_t.dtype)
-            # print("SHapes in scan_step:", z_t.shape, m_t.shape, o_tp1.shape, coords_grid.shape)
             coords_grid_t = jnp.concatenate([jnp.full_like(coords_grid[..., :1], time_coord), coords_grid], axis=-1)
 
             pred_out = self.render_frame(z_t, coords_grid_t)
@@ -597,25 +641,18 @@ class WARP(eqx.Module):
             ## Calculate based n step_idx even or not
             # is_context = step_idx % 2 == 1
             is_context = (step_idx / T) < context_ratio
-            # is_context = True
 
-            # ONLY compute encoder and LAM when use_gt is True
             a_t = jax.lax.cond(
                 is_context,
-                lambda: self.lam(
+                lambda: self.action_model.inverse_dynamics(
                     z_t, 
                     jax.lax.stop_gradient(self.encoder(jnp.transpose(o_tp1, (2, 0, 1))))
                 ),
-                lambda: self.memory.decode(m_t, step_idx, z_t)
+                lambda: self.action_model.decode_memory(m_t, step_idx, z_t)
             )
 
-            # ## Discretise the action: the largest dimension should  bt 1 or -1, the rest should be 0
-            # a_t_discrete = jnp.zeros_like(a_t)
-            # max_idx = jnp.argmax(jnp.abs(a_t))
-            # a_t = a_t_discrete.at[max_idx].set(jnp.sign(a_t[max_idx]))
-
             ## Encode into the memory with C
-            m_tp1 = self.memory.encode(m_t, step_idx, z_t, a_t)
+            m_tp1 = self.action_model.encode_memory(m_t, step_idx, z_t, a_t)
 
             # SINGLE forward dynamics call handles both the forced and autoregressive paths!
             z_tp1 = self.forward_dyn(z_t, a_t)
@@ -635,7 +672,7 @@ class WARP(eqx.Module):
         if is_single:
             ref_videos = ref_videos[None, ...]
             keys = keys[None, ...] if keys.ndim == 1 else keys
-            
+
         batched_fn = jax.vmap(self._get_preds_single, in_axes=(0, None, 0, None, None))
         pred_actions, pred_latents, pred_videos = batched_fn(ref_videos, p_forcing, keys, coords_grid, inf_context_ratio)
         
@@ -660,8 +697,6 @@ model = WARP(
     split_forward=CONFIG["split_forward"],
     key=subkey
 )
-A_init = model.A.copy()
-
 
 print(f"Dynamics Weight Space Dimension (d_theta): {model.d_theta}")
 
@@ -669,8 +704,8 @@ print(f"Total Trainable Parameters in WARP: {count_trainable_params(model)}")
 
 count_A = count_trainable_params(model.forward_dyn.mlp_A)
 count_B = count_trainable_params(model.forward_dyn.mlp_B)
-count_lam = count_trainable_params(model.lam)
-count_memory = count_trainable_params(model.memory)
+count_lam = count_trainable_params(model.action_model.idm)
+count_memory = count_trainable_params(model.action_model.dmm)
 count_encoder = count_trainable_params(model.encoder)
 theta_base = count_trainable_params(model.theta_base)
 print(" - in the Encoder:", count_encoder)
@@ -873,23 +908,6 @@ if len(all_losses) > 0:
     plt.savefig(plots_path / "loss_and_lr_history.png")
     plt.show()
 
-A_final = model.A
-subsample_step = max(1, 1) 
-vmin, vmax = -1e-4, 1e-4
-
-fig, axes = plt.subplots(1, 2, figsize=(20, 9))
-im1 = axes[0].imshow(A_init[::subsample_step, ::subsample_step], cmap='viridis', vmin=vmin, vmax=vmax)
-axes[0].set_title(f"Recurrence Matrix A (Init)\nSubsampled step={subsample_step}")
-plt.colorbar(im1, ax=axes[0])
-
-im2 = axes[1].imshow(A_final[::subsample_step, ::subsample_step], cmap='viridis', vmin=vmin, vmax=vmax)
-axes[1].set_title(f"Recurrence Matrix A (Final)\nSubsampled step={subsample_step}")
-plt.colorbar(im2, ax=axes[1])
-
-plt.tight_layout()
-plt.savefig(plots_path / "recurrence_matrix_A.png")
-plt.show()
-
 #%%
 
 # testing_subset = datasets.MiniGrid(root=data_path, split="test", download=True)
@@ -1016,29 +1034,5 @@ plt.tight_layout()
 plt.savefig(plots_path / f"action_trajectory_seq{test_seq_id}.png")
 plt.show()
 
-
-#%%
-
-## Same as the previous plot, but zoomed in ont he area around the trajectory to better see the action changes
-plt.figure(figsize=(10, 8))
-# Plot the background distribution in grey
-plt.scatter(actions_2d[:, 0], actions_2d[:, 1], c='lightgrey', alpha=0.3, s=10)
-# Get the 2D coordinates for just our specific test sequence
-seq_actions_2d = pca.transform(final_actions[test_seq_id])
-# Plot the trajectory with arrows
-plt.plot(seq_actions_2d[:, 0], seq_actions_2d[:, 1], marker='o', color='green', markersize=6, linewidth=2)
-# Annotate the time steps
-for t in range(seq_actions_2d.shape[0]):
-    plt.annotate(f"t={t}", (seq_actions_2d[t, 0], seq_actions_2d[t, 1]), 
-                 textcoords="offset points", xytext=(5,5), ha='center', fontsize=8) 
-plt.xlabel("Principal Component 1")
-plt.ylabel("Principal Component 2")
-plt.title(f"Zoomed Action Trajectory for Sequence {test_seq_id} in Latent Space")
-plt.grid(alpha=0.3)
-plt.xlim(seq_actions_2d[:, 0].min() - 0.5, seq_actions_2d[:, 0].max() + 0.5)
-plt.ylim(seq_actions_2d[:, 1].min() - 0.5, seq_actions_2d[:, 1].max() + 0.5)
-plt.tight_layout()
-plt.savefig(plots_path / f"action_trajectory_zoomed_seq{test_seq_id}.png")
-plt.show()
 
 # %%
