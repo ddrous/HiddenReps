@@ -35,16 +35,16 @@ def count_trainable_params(model):
 TRAIN_PHASE_0 = False  # Optional pretraining of Encoder + Base Theta via autoencoding
 TRAIN_PHASE_1 = True  # Train IDM, FDM, and maybe (Encoder, Base Theta)
 TRAIN_PHASE_2 = True  # Train GCM (Memory Model) to match IDM
-RUN_DIR = "./" if (TRAIN_PHASE_1 or TRAIN_PHASE_2) else None
+RUN_DIR = "./" if (not TRAIN_PHASE_1 or not TRAIN_PHASE_2) else None
 
 SINGLE_BATCH = False
 USE_NLL_LOSS = False
 
 CONFIG = {
-    "seed": 2026,
+    "seed": 42,
     
     # Phase 1 Params
-    "p1_nb_epochs": 600,        
+    "p1_nb_epochs": 2500,        
     "p1_learning_rate": 1e-4 if USE_NLL_LOSS else 1e-4,
     "reverse_video_aug": True,
     "static_video_aug": True,
@@ -55,8 +55,8 @@ CONFIG = {
     "aux_loss_num_steps": 4,
 
     # Phase 2 Params
-    "p2_nb_epochs": 100,
-    "p2_learning_rate": 1e-5,
+    "p2_nb_epochs": 1500,
+    "p2_learning_rate": 1e-4,
 
     "print_every": 10,
     "batch_size": 2 if SINGLE_BATCH else 128*2,
@@ -884,15 +884,14 @@ if TRAIN_PHASE_1:
 
             ## Repeat either the 0th or the mid frame at the end to ensure scan has T frames (since it looks at t+1)
             if CONFIG["static_video_aug"]:
-                if jax.random.bernoulli(k_init, 0.5): 
-                    add_to_front = jax.random.bernoulli(k_init, 0.5, shape=(ref_videos.shape[0],))
-                    nb_frames = ref_videos.shape[1]
-                    repeat_frames = nb_frames // 4
-                    ref_videos = jax.vmap(lambda add_front, vid: jax.lax.cond(add_front, 
-                                                                                # Add static frames at the front
-                                                                                lambda v_in: jnp.concatenate([jnp.repeat(v_in[:1], repeats=repeat_frames, axis=0), v_in[1:nb_frames-repeat_frames+1]], axis=0),
-                                                                                # Add static frames at the back
-                                                                                lambda v_in: jnp.concatenate([v_in[:nb_frames-repeat_frames], jnp.repeat(v_in[nb_frames-repeat_frames:nb_frames-repeat_frames+1], repeats=repeat_frames, axis=0)], axis=0),
+                add_to_front = jax.random.bernoulli(k_init, 0.5, shape=(ref_videos.shape[0],))
+                nb_frames = ref_videos.shape[1]
+                repeat_frames = nb_frames // 4
+                ref_videos = jax.vmap(lambda add_front, vid: jax.lax.cond(add_front, 
+                                                                            # Add static frames at the front
+                                                                            lambda v_in: jnp.concatenate([jnp.repeat(v_in[:1], repeats=repeat_frames, axis=0), v_in[1:nb_frames-repeat_frames+1]], axis=0),
+                                                                            # Add static frames at the back
+                                                                            lambda v_in: jnp.concatenate([v_in[:nb_frames-repeat_frames], jnp.repeat(v_in[nb_frames-repeat_frames:nb_frames-repeat_frames+1], repeats=repeat_frames, axis=0)], axis=0),
                                                                                 vid))(add_to_front, ref_videos)
 
             actions, _, pred_videos = jax.vmap(m.phase1_forward, in_axes=(0, None))(ref_videos, coords_grid)

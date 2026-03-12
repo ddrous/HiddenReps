@@ -35,27 +35,26 @@ def count_trainable_params(model):
 TRAIN_PHASE_0 = True  # Optional pretraining of Encoder + Base Theta via autoencoding
 TRAIN_PHASE_1 = True  # Train IDM, FDM, and Base Theta
 TRAIN_PHASE_2 = True  # Train GCM (Memory Model) to match IDM
-RUN_DIR = "./" if (not TRAIN_PHASE_1 or not TRAIN_PHASE_2) else None
+RUN_DIR = "./" if (TRAIN_PHASE_1 or TRAIN_PHASE_2) else None
 
 SINGLE_BATCH = False
 USE_NLL_LOSS = False
 
 CONFIG = {
-    "seed": 42,
+    "seed": 2026,
     
     # Phase 1 Params
-    "p1_nb_epochs": 100,        
+    "p1_nb_epochs": 4000,        
     "p1_learning_rate": 1e-4 if USE_NLL_LOSS else 1e-5,
-    "reverse_video_aug": True,
-    "static_video_aug": True,  # Ported from MovingMNIST
-    "action_l1_reg": 0.00,     # Skipped automatically if discrete_actions=True
-    "mse_weight": 1.0,        
+    "reverse_video_aug": False,
+    "action_l1_reg": 0.01,     # Skipped automatically if discrete_actions=True
+    "mse_weight": 0.16,        
     "aux_encoder_loss": False,
     "aux_loss_weight": 1.0,
     "aux_loss_num_steps": 4,
 
     # Phase 2 Params
-    "p2_nb_epochs": 100,
+    "p2_nb_epochs": 2000,
     "p2_learning_rate": 1e-5,
 
     "print_every": 10,
@@ -68,7 +67,6 @@ CONFIG = {
     "mem_space": 256,
     "icl_decoding": True,
     "discrete_actions": True,  # Key difference for MiniGrid!
-    "num_actions": 5,
     "split_forward": True,
     "root_width": 12,
     "root_depth": 5,
@@ -208,7 +206,7 @@ def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=Non
         ref_video = (ref_video + 1.0) / 2.0
 
     if video.shape[-1] == C:
-        fig, axes = plt.subplots(2, nb_frames, figsize=(2.5*nb_frames, 2.5*2))
+        fig, axes = plt.subplots(2, nb_frames, figsize=(30, 6))
         indices_to_plot = np.arange(0, nb_frames, 1)
         for i, idx in enumerate(indices_to_plot):
             video_to_plot = video[idx] if not rescale else (video[idx] + 1.0) / 2.0
@@ -216,7 +214,7 @@ def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=Non
             ref_idx = min(idx, ref_video.shape[0]-1)
             sbimshow(ref_video[ref_idx], title=f"Ref t={ref_idx}", ax=axes[1, i])
     else:
-        fig, axes = plt.subplots(3, nb_frames, figsize=(2.5*nb_frames, 3.5*2))
+        fig, axes = plt.subplots(3, nb_frames, figsize=(30, 7))
         indices_to_plot = np.arange(0, nb_frames, 1)
         for i, idx in enumerate(indices_to_plot):
             video_to_plot = video[idx, ..., :C] if not rescale else (video[idx, ..., :C] + 1.0) / 2.0
@@ -227,78 +225,8 @@ def plot_pred_ref_videos_rollout(video, ref_video, title="Render", save_name=Non
 
     plt.tight_layout()
     if save_name:
-        plt.savefig(save_name)
+        plt.savefig(plots_path / save_name)
     plt.show()
-    plt.close()
-
-#%% Visualize Augmentations (Ported from MovingMNIST)
-print("\n=== Visualizing Video Augmentations ===")
-
-# 1. Grab a single video and duplicate it to make a test batch of 4 identical videos
-test_vid = sample_batch[0:1] # Shape: (1, T, H, W, C)
-test_batch = jnp.repeat(test_vid, 4, axis=0)
-
-# 2. Force deterministic boolean arrays to test every combination
-# Row 0: Original
-# Row 1: Reversed
-# Row 2: Static Front
-# Row 3: Static Back
-do_reverse = jnp.array([False, True, False, False])
-do_static  = jnp.array([False, False, True, True])
-add_to_front = jnp.array([False, False, True, False]) 
-
-# --- Apply Reverse Augmentation ---
-aug_batch = jax.vmap(lambda rev, vid: jax.lax.cond(
-    rev, 
-    lambda v: jnp.flip(v, axis=0), 
-    lambda v: v, 
-    vid
-))(do_reverse, test_batch)
-
-# --- Apply Static Augmentation ---
-nb_frames = aug_batch.shape[1]
-repeat_frames = nb_frames // 4
-
-def static_aug(add_front, v):
-    return jax.lax.cond(
-        add_front, 
-        lambda v_in: jnp.concatenate([jnp.repeat(v_in[:1], repeats=repeat_frames, axis=0), v_in[1:nb_frames-repeat_frames+1]], axis=0),
-        lambda v_in: jnp.concatenate([v_in[:nb_frames-repeat_frames], jnp.repeat(v_in[nb_frames-repeat_frames:nb_frames-repeat_frames+1], repeats=repeat_frames, axis=0)], axis=0),
-        v
-    )
-
-aug_batch = jax.vmap(lambda apply_stat, add_front, vid: jax.lax.cond(
-    apply_stat,
-    lambda v: static_aug(add_front, v),
-    lambda v: v,
-    vid
-))(do_static, add_to_front, aug_batch)
-
-# --- Plot the Results ---
-fig, axes = plt.subplots(4, nb_frames, figsize=(nb_frames * 1.5, 4 * 1.5))
-row_titles = ["Original", "Reversed", "Static (Front)", "Static (Back)"]
-
-for row in range(4):
-    for t in range(nb_frames):
-        ax = axes[row, t]
-        img = aug_batch[row, t]
-        
-        if img.shape[-1] == 1:
-            img = np.repeat(img, 3, axis=-1)
-            
-        ax.imshow(np.clip(img, 0, 1))
-        ax.set_xticks([])
-        ax.set_yticks([])
-        
-        if t == 0:
-            ax.set_ylabel(row_titles[row], fontsize=14, rotation=0, labelpad=60, ha='center', va='center', fontweight='bold')
-        if row == 0:
-            ax.set_title(f"t={t}")
-
-plt.suptitle("Effect of Temporal Video Augmentations on MiniGrid", y=1.00, fontsize=20, fontweight='bold')
-plt.tight_layout()
-plt.savefig(plots_path / "minigrid_augmentations.png")
-plt.show()
 
 #%% Cell 3: Model Definition
 
@@ -414,9 +342,78 @@ class InverseDynamics(eqx.Module):
     def __call__(self, z_prev, z_target):
         return self.mlp(jnp.concatenate([z_prev, z_target], axis=-1))
 
+class MemoryModuleAtt(eqx.Module):
+    """ Autoregressive Transformer Memory Module for Latent Actions (GCM). """
+    d_model: int
+    max_len: int
+    pos_emb: jax.Array
+    blocks: tuple
+    proj_in: eqx.nn.Linear
+    
+    lam_dim: int = eqx.field(static=True)
+    icl_decoding: bool = eqx.field(static=True)
+    
+    action_mlp: Optional[eqx.nn.MLP]
+    output_proj: Optional[eqx.nn.Linear]
+
+    def __init__(self, lam_dim, mem_dim, latent_dim, key, max_len=12, num_heads=4, num_blocks=4, num_actions=4):
+        self.max_len = max_len
+        self.icl_decoding = CONFIG["icl_decoding"]
+        self.lam_dim = lam_dim
+        self.d_model = mem_dim
+        
+        k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
+        
+        self.proj_in = eqx.nn.Linear(latent_dim + lam_dim, self.d_model, key=k1)
+        self.pos_emb = jax.random.normal(k2, (max_len, self.d_model)) * 0.02
+        
+        block_keys = jax.random.split(k3, num_blocks)
+        self.blocks = tuple(TransformerBlock(self.d_model, num_heads, bk) for bk in block_keys)
+
+        if self.icl_decoding:
+            self.action_mlp = None
+            if num_actions:
+                self.output_proj = eqx.nn.Linear(self.d_model, num_actions, key=k6)
+            else:
+                self.output_proj = eqx.nn.Linear(self.d_model, lam_dim, key=k6)
+        else:
+            self.action_mlp = eqx.nn.MLP(self.d_model + latent_dim, lam_dim, width_size=self.d_model * 2, depth=3, key=k4)
+            self.output_proj = None
+
+    def reset(self, T):
+        return jnp.zeros((T, self.d_model))
+
+    def encode(self, buffer, step_idx, z, a):
+        token = self.proj_in(jnp.concatenate([z, a], axis=-1))
+        return buffer.at[step_idx - 1].set(token)
+
+    def decode(self, buffer, step_idx, z_current):
+        T = buffer.shape[0]
+        if self.icl_decoding:
+            zero_action = jnp.zeros((self.lam_dim,), dtype=z_current.dtype)
+            query_token = self.proj_in(jnp.concatenate([z_current, zero_action], axis=-1))
+            temp_buffer = buffer.at[step_idx - 1].set(query_token)
+            
+            x = temp_buffer + self.pos_emb[:T]
+            mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+            
+            for block in self.blocks:
+                x = block(x, mask)
+            context = x[step_idx - 1]
+            return self.output_proj(context)
+        else:
+            def compute_context():
+                x = buffer + self.pos_emb[:T]
+                mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+                for block in self.blocks:
+                    x = block(x, mask)
+                return x[step_idx - 2]
+                
+            context = jax.lax.cond(step_idx > 1, compute_context, lambda: jnp.zeros(self.d_model))
+            return self.action_mlp(jnp.concatenate([context, z_current], axis=-1))
+
 
 class VanillaRNNCell(eqx.Module):
-    """A standard Elman RNN cell for lightweight baselining."""
     weight_ih: eqx.nn.Linear
     weight_hh: eqx.nn.Linear
 
@@ -430,10 +427,7 @@ class VanillaRNNCell(eqx.Module):
 
 
 class MemoryModule(eqx.Module):
-    """
-    Recurrent Memory Module for Latent Actions.
-    Uses either a Vanilla RNN, GRU, or LSTM as the core memory architecture.
-    """
+    """ Recurrent Memory Module for Latent Actions. """
     d_model: int
     rnn_type: str = eqx.field(static=True)
     lam_dim: int = eqx.field(static=True)
@@ -592,7 +586,7 @@ class WARP(eqx.Module):
         self.forward_dyn = ForwardDynamics(self.d_theta, lam_dim, split_forward, key=k_fwd)
         self.mem_dim = mem_dim
 
-        num_actions = CONFIG["num_actions"] if CONFIG["discrete_actions"] else None
+        num_actions = 4 if CONFIG["discrete_actions"] else None
         self.action_model = LAM(self.d_theta, lam_dim, mem_dim, max_len=12, num_heads=4, num_blocks=4, num_actions=num_actions, key=k_lam, phase=self.phase)
 
     def render_pixels(self, theta, coords):
@@ -693,51 +687,33 @@ class WARP(eqx.Module):
         return a_preds, a_targets
 
     # -------------------------------------------------------------------------------------
-    # INFERENCE ROLLOUT: Context-Conditioned Autoregressive Generation
+    # INFERENCE ROLLOUT: Pure Autoregressive via GCM
     # -------------------------------------------------------------------------------------
-    def inference_rollout(self, ref_video, coords_grid, context_ratio=0.0):
+    def inference_rollout(self, ref_video, coords_grid):
         T = ref_video.shape[0]
-        init_frame = ref_video[0]
-        
-        z_init = self.encoder(jnp.transpose(init_frame, (2, 0, 1)))
+        z_init = self.encoder(jnp.transpose(ref_video[0], (2, 0, 1)))
         m_init = self.action_model.reset_memory(T)
 
         @eqx.filter_checkpoint
-        def scan_step(carry, scan_inputs):
+        def scan_step(carry, step_idx):
             z_t, m_t = carry
-            o_tp1, step_idx = scan_inputs
 
             time_coord = jnp.array([(step_idx-1)/(T-1)], dtype=z_t.dtype)
             coords_grid_t = jnp.concatenate([jnp.full_like(coords_grid[..., :1], time_coord), coords_grid], axis=-1)
             pred_out = self.render_frame(z_t, coords_grid_t)
 
-            # Determine if we are still in the context window
-            is_context = (step_idx / T) < context_ratio
-
-            # Conditionally choose action: IDM (Teacher Forcing) vs GCM (Autoregressive)
-            a_t = jax.lax.cond(
-                is_context,
-                lambda: self.action_model.inverse_dynamics(
-                    z_t, 
-                    self.encoder(jnp.transpose(o_tp1, (2, 0, 1)))
-                ),
-                lambda: self.action_model.decode_memory(m_t, step_idx, z_t)
-            )
-
+            a_t = self.action_model.decode_memory(m_t, step_idx, z_t)
             m_tp1 = self.action_model.encode_memory(m_t, step_idx, z_t, a_t)
             z_tp1 = self.forward_dyn(z_t, a_t)
 
             return (z_tp1, m_tp1), (a_t, z_t, pred_out)
 
-        # Pass the future ground truth frames into the scan so the IDM can use them
-        scan_inputs = (jnp.concatenate([ref_video[1:], jnp.zeros_like(ref_video[:1])], axis=0), jnp.arange(1, T+1))
-        _, (actions, pred_latents, pred_video) = jax.lax.scan(scan_step, (z_init, m_init), scan_inputs)
-        
+        _, (actions, pred_latents, pred_video) = jax.lax.scan(scan_step, (z_init, m_init), jnp.arange(1, T))
         return actions, pred_latents, pred_video
 
 #%% Cell 4: Phase 1 Training (Base Model & IDM)
 if TRAIN_PHASE_1:
-    print(f"\n噫 [PHASE 1] Starting Base Training (IDM + FDM + maybe Enc) -> Saving to {run_path}")
+    print(f"\n🚀 [PHASE 1] Starting Base Training (IDM + FDM + maybe Enc) -> Saving to {run_path}")
     key, subkey = jax.random.split(key)
 
     model_p1 = WARP(
@@ -760,31 +736,21 @@ if TRAIN_PHASE_1:
     opt_state_p1 = optimizer_p1.init(eqx.filter(model_p1, eqx.is_inexact_array))
 
     @eqx.filter_jit
-    def train_step_p1(model, opt_state, keys, in_videos, coords_grid):
+    def train_step_p1(model, opt_state, keys, ref_videos, coords_grid):
         def loss_fn(m):
             k_aug, k_init = jax.random.split(keys[0], 2)
-            ref_videos = in_videos
             
             # 1. Reverse Video Augmentation
             if CONFIG["reverse_video_aug"]:
                 do_reverse = jax.random.bernoulli(k_aug, 0.5, shape=(ref_videos.shape[0],))
-                ref_videos = jax.vmap(lambda rev, vid: jax.lax.cond(rev, lambda v: jnp.flip(v, axis=0), lambda v: v, vid))(do_reverse, ref_videos)
-
-            ## 1.5 Static Augmentation 
-            if CONFIG["static_video_aug"]:
-                add_to_front = jax.random.bernoulli(k_init, 0.5, shape=(ref_videos.shape[0],))
-                nb_frames = ref_videos.shape[1]
-                repeat_frames = nb_frames // 4
-                ref_videos = jax.vmap(lambda add_front, vid: jax.lax.cond(add_front, 
-                                                                            # Add static frames at the front
-                                                                            lambda v_in: jnp.concatenate([jnp.repeat(v_in[:1], repeats=repeat_frames, axis=0), v_in[1:nb_frames-repeat_frames+1]], axis=0),
-                                                                            # Add static frames at the back
-                                                                            lambda v_in: jnp.concatenate([v_in[:nb_frames-repeat_frames], jnp.repeat(v_in[nb_frames-repeat_frames:nb_frames-repeat_frames+1], repeats=repeat_frames, axis=0)], axis=0),
-                                                                                vid))(add_to_front, ref_videos)
-
+                ref_videos_in = jax.vmap(lambda rev, vid: jax.lax.cond(rev, lambda v: jnp.flip(v, axis=0), lambda v: v, vid))(do_reverse, ref_videos)
+            else:
+                ref_videos_in = ref_videos
 
             batched_fn = jax.vmap(m.phase1_forward, in_axes=(0, None))
-            actions, _, pred_videos = batched_fn(ref_videos, coords_grid)
+            actions, _, pred_videos = batched_fn(ref_videos_in, coords_grid)
+
+            ref_targets = ref_videos_in
 
             # 2. SSIM + MSE Loss
             def ssim(x, y, data_range=1.0):
@@ -794,12 +760,9 @@ if TRAIN_PHASE_1:
                 sigma_xy = jnp.mean((x - mu_x) * (y - mu_y))
                 return ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / ((mu_x**2 + mu_y**2 + C1) * (sigma_x + sigma_y + C2))
             
-            # ssim_loss = 1.0 - jnp.mean(jax.vmap(jax.vmap(ssim))(pred_videos, ref_videos))
-            mse_loss = jnp.mean((pred_videos - ref_videos)**2)
-            
-            # Choose loss combination
-            # rec_loss = ssim_loss + CONFIG["mse_weight"] * mse_loss
-            rec_loss = mse_loss
+            rec_loss_ssim = 1.0 - jnp.mean(jax.vmap(jax.vmap(ssim))(pred_videos, ref_targets))
+            mse_loss = jnp.mean((pred_videos - ref_targets)**2)
+            rec_loss = rec_loss_ssim + CONFIG["mse_weight"] * mse_loss
 
             # 3. L1 Continuous Action Regularisation
             action_l1_loss = 0.0
@@ -809,13 +772,13 @@ if TRAIN_PHASE_1:
             # 4. Aux Autoencoding Loss
             ae_loss = 0.0
             if CONFIG["aux_encoder_loss"]:
-                indices = jax.random.choice(k_init, ref_videos.shape[1], shape=(CONFIG["aux_loss_num_steps"],), replace=False)
-                ref_videos_enc = jnp.transpose(ref_videos[:, indices], (0, 1, 4, 2, 3))
+                indices = jax.random.choice(k_init, ref_targets.shape[1], shape=(CONFIG["aux_loss_num_steps"],), replace=False)
+                ref_videos_enc = jnp.transpose(ref_targets[:, indices], (0, 1, 4, 2, 3))
                 target_thetas = jax.vmap(jax.vmap(m.encoder))(ref_videos_enc)
                 coords_grid_t0 = jnp.concatenate([jnp.zeros_like(coords_grid[..., :1]), coords_grid], axis=-1)
                 batched_render = jax.vmap(jax.vmap(lambda theta: m.render_frame(theta, coords_grid_t0)))
                 decoded_pixels = batched_render(target_thetas)
-                ae_loss = jnp.mean((decoded_pixels - ref_videos[:, indices])**2)
+                ae_loss = jnp.mean((decoded_pixels - ref_targets[:, indices])**2)
 
             total_loss = rec_loss + action_l1_loss + CONFIG["aux_loss_weight"] * ae_loss
             return total_loss
@@ -828,8 +791,6 @@ if TRAIN_PHASE_1:
     all_losses_p1 = []
     lr_scales_p1 = []
     start_time = time.time()
-
-    sample_videos_vis = next(iter(train_loader))[:1]
 
     for epoch in range(CONFIG["p1_nb_epochs"]):
         epoch_losses = []
@@ -845,15 +806,6 @@ if TRAIN_PHASE_1:
         if not SINGLE_BATCH and ((epoch+1) % CONFIG["print_every"] == 0 or (epoch+1) == CONFIG["p1_nb_epochs"]):
             avg_loss = np.mean(epoch_losses)
             print(f"Phase 1 - Epoch {epoch+1}/{CONFIG['p1_nb_epochs']} - Avg Loss: {avg_loss:.6f}", flush=True)
-
-        ## Save checkpoints and visualizations
-        if (epoch+1) % (CONFIG["p1_nb_epochs"]//2) == 0 or (epoch+1) == CONFIG["p1_nb_epochs"]:
-            eqx.tree_serialise_leaves(artefacts_path / f"model_phase1_epoch{epoch+1}.eqx", model_p1)
-
-        if (epoch+1) % (CONFIG["p1_nb_epochs"]//10) == 0 or (epoch+1) == CONFIG["p1_nb_epochs"]:
-            _, _, pred_videos = jax.vmap(model_p1.phase1_forward, in_axes=(0, None))(sample_videos_vis, coords_grid)
-            for i in range(pred_videos.shape[0]):
-                plot_pred_ref_videos_rollout(pred_videos[i], sample_videos_vis[i], f"Epoch {epoch+1}", plots_path / f"p1_vis_epoch{epoch+1}_sample{i}.png")
 
     print("\nPhase 1 Wall time:", time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time)))
     
@@ -877,7 +829,7 @@ if TRAIN_PHASE_1:
 
 #%% Cell 5: Phase 2 Training (GCM Matching)
 if TRAIN_PHASE_2:
-    print(f"\n噫 [PHASE 2] Starting GCM Training (Action Matching) -> Saving to {run_path}")
+    print(f"\n🚀 [PHASE 2] Starting GCM Training (Action Matching) -> Saving to {run_path}")
     key, subkey = jax.random.split(key)
 
     # 1. Initialize fresh Phase 2 model (with GCM enabled)
@@ -889,7 +841,7 @@ if TRAIN_PHASE_2:
     )
 
     # 2. Transplant weights from Phase 1
-    print("踏 Loading Base weights from Phase 1...")
+    print("📥 Loading Base weights from Phase 1...")
     dummy_p1 = WARP(
         root_width=CONFIG["root_width"], root_depth=CONFIG["root_depth"],
         num_freqs=CONFIG["num_fourier_freqs"], frame_shape=(H, W, C), 
@@ -906,15 +858,13 @@ if TRAIN_PHASE_2:
     model_p2 = eqx.tree_at(lambda m: m.action_model.idm, model_p2, dummy_p1.action_model.idm)
 
     # 3. Partition parameters: Freeze everything except GCM
-    # First, create a mask where absolutely everything is False
+    # Create mask where everything is False
     filter_spec = jax.tree_util.tree_map(lambda _: False, model_p2)
-    
-    # Next, compute the proper gradient mask (True for float arrays) using the ACTUAL model
-    gcm_mask = jax.tree_util.tree_map(eqx.is_inexact_array, model_p2.action_model.gcm)
-    
-    # Graft the active GCM mask into our all-False filter_spec
-    filter_spec = eqx.tree_at(lambda m: m.action_model.gcm, filter_spec, gcm_mask)
-    
+    # Turn on gradients for GCM
+    filter_spec = eqx.tree_at(
+        lambda m: m.action_model.gcm, filter_spec, 
+        replace_fn=lambda gcm: jax.tree_util.tree_map(eqx.is_inexact_array, gcm)
+    )
     diff_model_p2, static_model_p2 = eqx.partition(model_p2, filter_spec)
 
     print(f"Trainable Parameters in Phase 2 (GCM only): {count_trainable_params(diff_model_p2)}")
@@ -965,14 +915,6 @@ if TRAIN_PHASE_2:
             avg_loss = np.mean(epoch_losses)
             print(f"Phase 2 - Epoch {epoch+1}/{CONFIG['p2_nb_epochs']} - Avg Loss: {avg_loss:.6f}", flush=True)
 
-        ## Visualize the Phase 2 predictions
-        if (epoch+1) % (CONFIG["p2_nb_epochs"]//10) == 0 or (epoch+1) == CONFIG["p2_nb_epochs"]:
-            model_vis = eqx.combine(diff_model_p2, static_model_p2)
-            # Generating visualizations mid-training for Phase 2 tracking
-            _, _, pred_videos = jax.vmap(model_vis.phase1_forward, in_axes=(0, None))(sample_videos_vis, coords_grid)
-            for i in range(pred_videos.shape[0]):
-                plot_pred_ref_videos_rollout(pred_videos[i], sample_videos_vis[i], f"P2 Epoch {epoch+1}", plots_path / f"p2_vis_epoch{epoch+1}_sample{i}.png")
-
     print("\nPhase 2 Wall time:", time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time)))
     
     # Save Phase 2 artifacts
@@ -999,7 +941,7 @@ print("\n=== Evaluating Phase 2 Model ===")
 
 # If we skipped training, load the Phase 2 model
 if not TRAIN_PHASE_2:
-    print(f"踏 Loading completed Phase 2 WARP model from {artefacts_path}")
+    print(f"📥 Loading completed Phase 2 WARP model from {artefacts_path}")
     key, subkey = jax.random.split(key)
     model_final = WARP(
         root_width=CONFIG["root_width"], root_depth=CONFIG["root_depth"],
@@ -1010,9 +952,9 @@ if not TRAIN_PHASE_2:
     model_final = eqx.tree_deserialise_leaves(artefacts_path / "model_phase2_final.eqx", model_final)
 
 @eqx.filter_jit
-def evaluate(m, batch, coords, context_ratio):
-    batched_fn = jax.vmap(m.inference_rollout, in_axes=(0, None, None))
-    return batched_fn(batch, coords, context_ratio)
+def evaluate(m, batch, coords):
+    batched_fn = jax.vmap(m.inference_rollout, in_axes=(0, None))
+    return batched_fn(batch, coords)
 
 testing_subset = MiniGridDataset(test_arrays)
 test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"]*10, shuffle=False, collate_fn=numpy_collate, drop_last=False)
@@ -1025,8 +967,8 @@ pad_length = 12 - sample_batch.shape[1]
 if pad_length > 0:
     sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)
 
-# Evaluation using context-conditioned autoregressive rollout
-final_actions, _, final_videos = evaluate(model_final, sample_batch, coords_grid, CONFIG["inf_context_ratio"])
+# Evaluation using purely the GCM inference rollout
+final_actions, _, final_videos = evaluate(model_final, sample_batch, coords_grid)
 
 if CONFIG["use_nll_loss"]:
     print(f"Final Predicted Video Mean Pixel Value Range: min={final_videos[...,:C].min():.4f}, max={final_videos[...,:C].max():.4f}")
@@ -1040,7 +982,7 @@ plot_pred_ref_videos_rollout(
     final_videos[test_seq_id], 
     sample_batch[test_seq_id, 1:], # Ground truth targets (shifted by 1 for causality)
     title=f"Pred", 
-    save_name=plots_path / f"inference_forecast_rollout_seq{test_seq_id}.png"
+    save_name=f"inference_forecast_rollout_seq{test_seq_id}.png"
 )
 
 #%%
