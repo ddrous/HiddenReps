@@ -44,9 +44,9 @@ CONFIG = {
     "seed": 42,
     
     # Phase 1 Params
-    "p1_nb_epochs": 2000,        
+    "p1_nb_epochs": 10000,        
     "p1_learning_rate": 1e-4 if USE_NLL_LOSS else 1e-5,
-    "reverse_video_aug": True,
+    "reverse_video_aug": False,
     "static_video_aug": True,
     "action_l1_reg": 0.00,     # Skipped automatically if discrete_actions=True
     "mse_weight": 1.0,        
@@ -55,20 +55,20 @@ CONFIG = {
     "aux_loss_num_steps": 4,
 
     # Phase 2 Params
-    "p2_nb_epochs": 2000,
+    "p2_nb_epochs": 10000,
     "p2_learning_rate": 1e-5,
 
     "print_every": 10,
-    "batch_size": 2 if SINGLE_BATCH else 16,
-    "inf_context_ratio": 1.0,
+    "batch_size": 2 if SINGLE_BATCH else 8,
+    "inf_context_ratio": 0.5,
     "use_nll_loss": USE_NLL_LOSS,
 
     # --- Architecture Params ---
-    "lam_space": 32,            # Embedding dimension size
+    "lam_space": 8,            # Embedding dimension size
     "mem_space": 256,
     "icl_decoding": True,
     "discrete_actions": True,  # Key difference for MiniGrid!
-    "num_actions": 20,
+    "num_actions": 4,
     "split_forward": True,
     "root_width": 12,
     "root_depth": 5,
@@ -159,10 +159,10 @@ try:
     dataset = MiniGridDataset(train_arrays)
 
     if SINGLE_BATCH:
-        training_subset = Subset(dataset, range(2))
+        training_subset = Subset(dataset, range(CONFIG["batch_size"]))
         train_loader = DataLoader(
             training_subset, 
-            batch_size=2, 
+            batch_size=CONFIG["batch_size"]//1, 
             shuffle=False, 
             collate_fn=numpy_collate, 
             drop_last=True
@@ -500,35 +500,39 @@ class LAM(eqx.Module):
         k1, k2 = jax.random.split(key)
         self.discrete_actions = num_actions is not None
 
-        self.idm = InverseDynamics(dyn_dim, lam_dim, key=k1, num_actions=None)
-
+        self.idm = InverseDynamics(dyn_dim, lam_dim, key=k1, num_actions=num_actions if self.discrete_actions else None)
+        
         # Instantiate GCM in Phase 2
         if phase == 2:
-            self.gcm = MemoryModule(lam_dim, mem_dim, dyn_dim, key=k2, rnn_type="GRU", num_actions=None)
+            self.gcm = MemoryModule(lam_dim, mem_dim, dyn_dim, key=k2, rnn_type="GRU", num_actions=num_actions if self.discrete_actions else None)
         else:
             self.gcm = None
 
         if self.discrete_actions:
-            # self.action_embedding = eqx.nn.Embedding(num_actions, lam_dim, key=k2)
-            emb_weights = jnp.zeros((num_actions, lam_dim))
-            self.action_embedding = eqx.nn.Embedding(weight=emb_weights, key=k2)
+            self.action_embedding = eqx.nn.Embedding(num_actions, lam_dim, key=k2)
         else:
             self.action_embedding = None
 
-    def quantise_action(self, raw_action):
-        ## We use the VQ-VAE approach: we find the closest quantized_action to the raw one (\in R^lam_dim)
-        dists = jnp.sum((raw_action - self.action_embedding.weight) ** 2, axis=-1)
-        closest_idx = jnp.argmin(dists)
-        quantised_action = self.action_embedding(closest_idx)
-
-        return raw_action, quantised_action
+    def discretise_action(self, logits):
+        soft_probs = jax.nn.softmax(logits, axis=-1)
+        hard_idx = jnp.argmax(logits, axis=-1)
+        hard_probs = jax.nn.one_hot(hard_idx, num_classes=logits.shape[-1])
+        ste_probs = soft_probs + jax.lax.stop_gradient(hard_probs - soft_probs)
+        action = jnp.dot(ste_probs, self.action_embedding.weight)
+        return action
 
     def inverse_dynamics(self, z_prev, z_target):
         if not self.discrete_actions:
             return self.idm(z_prev, z_target)
         else:
-            raw_action = self.idm(z_prev, z_target)
-            return self.quantise_action(raw_action)
+            logits = self.idm(z_prev, z_target)
+            return self.discretise_action(logits)
+    
+    def inverse_dynamics_logits(self, z_prev, z_target):
+        if not self.discrete_actions:
+            raise ValueError("IDM does not produce logits in continuous action setting.")
+        else:
+            return self.idm(z_prev, z_target)
 
     def decode_memory(self, buffer, step_idx, z_current):
         if self.gcm is None:
@@ -536,8 +540,16 @@ class LAM(eqx.Module):
         if not self.discrete_actions:
             return self.gcm.decode(buffer, step_idx, z_current)
         else:
-            raw_action = self.gcm.decode(buffer, step_idx, z_current)
-            return self.quantise_action(raw_action)
+            logits = self.gcm.decode(buffer, step_idx, z_current)
+            return self.discretise_action(logits)
+        
+    def decode_memory_logits(self, buffer, step_idx, z_current):
+        if self.gcm is None:
+            raise ValueError("GCM is not initialized in Phase 1.")
+        if not self.discrete_actions:
+            raise ValueError("GCM does not produce logits in continuous action setting.")
+        else:
+            return self.gcm.decode(buffer, step_idx, z_current)
 
     def encode_memory(self, buffer, step_idx, z_current, a):
         if self.gcm is None:
@@ -635,11 +647,8 @@ class WARP(eqx.Module):
         if CONFIG["pretrain_encoder"]:
             z_init = jax.lax.stop_gradient(z_init)
 
-        a_init = jnp.zeros((self.lam_dim,))
-
         @eqx.filter_checkpoint
-        def scan_step(carry, scan_inputs):
-            z_t, a_tm1 = carry
+        def scan_step(z_t, scan_inputs):
             o_tp1, step_idx = scan_inputs
 
             if render:
@@ -653,19 +662,13 @@ class WARP(eqx.Module):
             if CONFIG["pretrain_encoder"]:
                 z_tp1_enc = jax.lax.stop_gradient(z_tp1_enc)
 
-            a_t_raw, a_t_quant = self.action_model.inverse_dynamics(z_t, z_tp1_enc)
-
-            a_t = a_t_raw + jax.lax.stop_gradient(a_t_quant - a_t_raw)      ## gradient STE estimator
-
-            ## Additiove action residuals
-            a_t = a_t + a_tm1
-
+            a_t = self.action_model.inverse_dynamics(z_t, z_tp1_enc)
             z_tp1 = self.forward_dyn(z_t, a_t)
 
-            return (z_tp1, a_t), ((a_t_raw, a_t_quant), (z_tp1, z_tp1_enc), pred_out)
+            return z_tp1, (a_t, (z_tp1, z_tp1_enc), pred_out)
 
         scan_inputs = (jnp.concatenate([ref_video[1:], jnp.zeros_like(ref_video[:1])], axis=0), jnp.arange(1, T+1))
-        _, (actions, latents, pred_video) = jax.lax.scan(scan_step, (z_init, a_init), scan_inputs)
+        _, (actions, latents, pred_video) = jax.lax.scan(scan_step, z_init, scan_inputs)
 
         return actions, latents, pred_video
 
@@ -688,15 +691,11 @@ class WARP(eqx.Module):
             z_tp1_enc = jax.lax.stop_gradient(self.encoder(jnp.transpose(o_tp1, (2, 0, 1))))
             
             # Ground truth action from IDM (frozen)
-            # raw_act_target, quant_act_target = jax.lax.stop_gradient(self.action_model.inverse_dynamics_logits(z_t, z_tp1_enc))
-            # # a_target = jax.lax.stop_gradient(self.action_model.discretise_action(logits_target))
-
-            # a_target = raw_act_target + jax.lax.stop_gradient(quant_act_target - raw_act_target)  ## @TODO: STE estimator for discrete actions. Not needed ?
-
-            raw_a_target, a_target = jax.lax.stop_gradient(self.action_model.inverse_dynamics(z_t, z_tp1_enc))
+            logits_target = jax.lax.stop_gradient(self.action_model.inverse_dynamics_logits(z_t, z_tp1_enc))
+            a_target = jax.lax.stop_gradient(self.action_model.discretise_action(logits_target))
 
             # Predicted action from GCM
-            raw_a_pred, quant_a_pred = self.action_model.decode_memory(m_t, step_idx, jax.lax.stop_gradient(z_t))
+            logits_pred = self.action_model.decode_memory_logits(m_t, step_idx, jax.lax.stop_gradient(z_t))
 
             # Update memory buffer using target action (Teacher Forcing)
             m_tp1 = self.action_model.encode_memory(m_t, step_idx, jax.lax.stop_gradient(z_t), a_target)
@@ -704,12 +703,12 @@ class WARP(eqx.Module):
             # Step dynamics (frozen)
             z_tp1 = jax.lax.stop_gradient(self.forward_dyn(z_t, a_target))
 
-            return (z_tp1, m_tp1), (raw_a_pred, a_target)
+            return (z_tp1, m_tp1), (logits_pred, logits_target)
 
         scan_inputs = (ref_video[1:], jnp.arange(1, T))
-        _, (actions_preds, actions_targets) = jax.lax.scan(scan_step, (z_init, m_init), scan_inputs)
+        _, (logits_preds, logits_targets) = jax.lax.scan(scan_step, (z_init, m_init), scan_inputs)
 
-        return actions_preds, actions_targets
+        return logits_preds, logits_targets
 
     # -------------------------------------------------------------------------------------
     # INFERENCE ROLLOUT: Context-Conditioned Autoregressive Generation
@@ -734,19 +733,19 @@ class WARP(eqx.Module):
             is_context = (step_idx / T) < context_ratio
 
             # Conditionally choose action: IDM (Teacher Forcing) vs GCM (Autoregressive)
-            a_t_raw, a_t = jax.lax.cond(                ## @TODO: The action is the quantised one.
-                                        is_context,
-                                        lambda: self.action_model.inverse_dynamics(
-                                            z_t, 
-                                            self.encoder(jnp.transpose(o_tp1, (2, 0, 1)))
-                                        ),
-                                        lambda: self.action_model.decode_memory(m_t, step_idx, z_t)
-                                    )
+            a_t = jax.lax.cond(
+                is_context,
+                lambda: self.action_model.inverse_dynamics(
+                    z_t, 
+                    self.encoder(jnp.transpose(o_tp1, (2, 0, 1)))
+                ),
+                lambda: self.action_model.decode_memory(m_t, step_idx, z_t)
+            )
 
             m_tp1 = self.action_model.encode_memory(m_t, step_idx, z_t, a_t)
             z_tp1 = self.forward_dyn(z_t, a_t)
 
-            return (z_tp1, m_tp1), ((a_t_raw, a_t), z_t, pred_out)
+            return (z_tp1, m_tp1), (a_t, z_t, pred_out)
 
         # Pass the future ground truth frames into the scan so the IDM can use them
         scan_inputs = (jnp.concatenate([ref_video[1:], jnp.zeros_like(ref_video[:1])], axis=0), jnp.arange(1, T+1))
@@ -803,7 +802,7 @@ if TRAIN_PHASE_1:
 
 
             batched_fn = jax.vmap(m.phase1_forward, in_axes=(0, None, None))
-            (raw_actions, quant_actions), (pred_lats, gt_lats), pred_videos = batched_fn(ref_videos, coords_grid, False)
+            actions, (pred_lats, gt_lats), pred_videos = batched_fn(ref_videos, coords_grid, False)
 
             # # 2. SSIM + MSE Loss
             # def ssim(x, y, data_range=1.0):
@@ -815,18 +814,17 @@ if TRAIN_PHASE_1:
             
             # # ssim_loss = 1.0 - jnp.mean(jax.vmap(jax.vmap(ssim))(pred_videos, ref_videos))
             # mse_loss = jnp.mean((pred_videos - ref_videos)**2)
-
+            
             mse_loss = jnp.mean((pred_lats[:, :-1] - gt_lats[:, :-1])**2)       ## @TODO: assumes a well-pretrained encoder
-
-            ## Compute codebook and comit losses for discrete action setting
-            if CONFIG["discrete_actions"]:
-                book_loss = jnp.mean((jax.lax.stop_gradient(raw_actions) - quant_actions)**2)
-                commit_loss = jnp.mean((raw_actions - jax.lax.stop_gradient(quant_actions))**2)
-                mse_loss += 1*book_loss + 1*commit_loss
 
             # Choose loss combination
             # rec_loss = ssim_loss + CONFIG["mse_weight"] * mse_loss
             rec_loss = mse_loss
+
+            # 3. L1 Continuous Action Regularisation
+            action_l1_loss = 0.0
+            if not CONFIG["discrete_actions"] and CONFIG["action_l1_reg"] > 0:
+                action_l1_loss = CONFIG["action_l1_reg"] * jnp.mean(jnp.abs(actions))
 
             # 4. Aux Autoencoding Loss
             ae_loss = 0.0
@@ -839,7 +837,7 @@ if TRAIN_PHASE_1:
                 decoded_pixels = batched_render(target_thetas)
                 ae_loss = jnp.mean((decoded_pixels - ref_videos[:, indices])**2)
 
-            total_loss = rec_loss + CONFIG["aux_loss_weight"] * ae_loss
+            total_loss = rec_loss + action_l1_loss + CONFIG["aux_loss_weight"] * ae_loss
             return total_loss
 
         loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
@@ -875,7 +873,7 @@ if TRAIN_PHASE_1:
             eqx.tree_serialise_leaves(artefacts_path / f"model_phase1_epoch{epoch+1}.eqx", model_p1)
 
         if (epoch+1) % (CONFIG["p1_nb_epochs"]//10) == 0 or (epoch+1) == CONFIG["p1_nb_epochs"]:
-            (raw_actions, quant_actions), _, pred_videos = jax.vmap(model_p1.phase1_forward, in_axes=(0, None, None))(sample_videos_vis, coords_grid, True)
+            _, _, pred_videos = jax.vmap(model_p1.phase1_forward, in_axes=(0, None, None))(sample_videos_vis, coords_grid, True)
             for i in range(pred_videos.shape[0]):
                 plot_pred_ref_videos_rollout(pred_videos[i], sample_videos_vis[i], f"Pred", plots_path / f"p1_vis_epoch{epoch+1}_sample{i}.png")
 
@@ -898,21 +896,6 @@ if TRAIN_PHASE_1:
     fig.tight_layout()
     plt.savefig(plots_path / "p1_loss_history.png")
     plt.show()
-
-
-    print("Predicted Latent Actions at Phase 1")
-
-    plt.figure(figsize=(12, 6))
-    # Transpose to have dimensions on Y axis and time on X axis
-    sns.heatmap(quant_actions[0].T, cmap="coolwarm", center=0, 
-                annot=True, fmt=".4f", cbar_kws={'label': 'Latent Action Value'}, annot_kws={'size': 8})
-    plt.xlabel("Time Step (t)")
-    plt.ylabel(f"Latent Dimension (0-{model_p1.lam_dim-1})")
-    plt.title(f"Latent Action Heatmap for Train Sequence 0")
-    plt.tight_layout()
-    plt.savefig(plots_path / f"action_heatmap_p1_seq.png")
-    plt.show()
-
 
 #%% Cell 5: Phase 2 Training (GCM Matching)
 if TRAIN_PHASE_2:
@@ -976,17 +959,16 @@ if TRAIN_PHASE_2:
             
             # Action matching phase forward
             batched_fn = jax.vmap(m.phase2_forward, in_axes=(0,))
-            a_preds, a_targets = batched_fn(ref_videos)
+            logits_preds, logits_targets = batched_fn(ref_videos)
             
             # L1 Match Loss (GCM matching IDM)
             # total_loss = jnp.mean(jnp.abs(a_preds - a_targets))
-            total_loss = jnp.mean((a_preds - a_targets)**2)
 
-            # ## Cross-Entropy Loss for discrete actions
-            # ## Ground thruth actions are argmax of target logits
-            # gt_actions = jax.lax.stop_gradient(jnp.argmax(logits_targets, axis=-1))     #@TODO: we could just use the softmax, to match the same uncertainties?
-            # ce_loss = optax.softmax_cross_entropy(logits_preds, jax.nn.one_hot(gt_actions, num_classes=logits_preds.shape[-1]))
-            # total_loss = jnp.mean(ce_loss)
+            ## Cross-Entropy Loss for discrete actions
+            ## Ground thruth actions are argmax of target logits
+            gt_actions = jax.lax.stop_gradient(jnp.argmax(logits_targets, axis=-1))     #@TODO: we could just use the softmax, to match the same uncertainties?
+            ce_loss = optax.softmax_cross_entropy(logits_preds, jax.nn.one_hot(gt_actions, num_classes=logits_preds.shape[-1]))
+            total_loss = jnp.mean(ce_loss)
 
             return total_loss
 
@@ -1063,7 +1045,7 @@ def evaluate(m, batch, coords, context_ratio):
     return batched_fn(batch, coords, context_ratio)
 
 testing_subset = MiniGridDataset(test_arrays)
-test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"]*1, shuffle=False, collate_fn=numpy_collate, drop_last=False)
+test_loader = DataLoader(testing_subset, batch_size=CONFIG["batch_size"]*10, shuffle=False, collate_fn=numpy_collate, drop_last=False)
 sample_batch = next(iter(test_loader))
 
 print("Batch shape for evaluation:", sample_batch.shape, flush=True)
@@ -1074,7 +1056,7 @@ if pad_length > 0:
     sample_batch = jnp.concatenate([sample_batch, np.zeros((sample_batch.shape[0], pad_length, H, W, C), dtype=sample_batch.dtype)], axis=1)
 
 # Evaluation using context-conditioned autoregressive rollout
-(final_actions, _), _, final_videos = evaluate(model_final, sample_batch, coords_grid, CONFIG["inf_context_ratio"])
+final_actions, _, final_videos = evaluate(model_final, sample_batch, coords_grid, CONFIG["inf_context_ratio"])
 
 if CONFIG["use_nll_loss"]:
     print(f"Final Predicted Video Mean Pixel Value Range: min={final_videos[...,:C].min():.4f}, max={final_videos[...,:C].max():.4f}")
@@ -1101,7 +1083,7 @@ print("Predicted Latent Actions for the selected test sequence:")
 plt.figure(figsize=(12, 6))
 # Transpose to have dimensions on Y axis and time on X axis
 sns.heatmap(final_actions[test_seq_id].T, cmap="coolwarm", center=0, 
-            annot=True, fmt=".4f", cbar_kws={'label': 'Latent Action Value'}, annot_kws={'size': 8})
+            annot=True, fmt=".2f", cbar_kws={'label': 'Latent Action Value'}, annot_kws={'size': 8})
 plt.xlabel("Time Step (t)")
 plt.ylabel(f"Latent Dimension (0-{model_final.lam_dim-1})")
 plt.title(f"Latent Action Heatmap for Sequence {test_seq_id}")

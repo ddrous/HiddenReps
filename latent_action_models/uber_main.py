@@ -25,15 +25,15 @@ import os
 import subprocess
 import time
 
-target_pid = 4112807
+target_pid = 3537134
 print(f"Waiting for process {target_pid} to finish...", flush=True)
 # Loop and wait as long as the process directory exists in /proc
 while os.path.exists(f"/proc/{target_pid}"):
-    time.sleep(60*15)  # Check every 30 seconds to save CPU cycles
+    time.sleep(60*1)  # Check every 30 seconds to save CPU cycles
 print(f"Process {target_pid} has finished. Initiating the über script runs...", flush=True)
 
 # files = ["warp_movingmnist.py", "wm_movingmnist.py", "warp_weather.py", "wm_weather.py"]
-files = ["warp_movingmnist.py"]
+files = ["warp_minigrid.py"]
 
 for i, file in enumerate(files):
     print(f"Running {file}...", flush=True)
