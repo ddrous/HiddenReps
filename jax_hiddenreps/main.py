@@ -34,7 +34,7 @@ config = {
     "latent_dim": 2,
     "lr": 1e-3,
     "batch_size": 64,
-    "epochs": 1500,
+    "epochs": 15,
     "val_every": 100,
     "num_points": 1500,
     "seed": 2018
