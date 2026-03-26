@@ -104,7 +104,7 @@ class WARP(eqx.Module):
     
     d_theta: int = eqx.field(static=True)
 
-    hypernet: any
+    # hypernet: any
 
     def __init__(self, data_size, root_width, root_depth, key):
         k_root, k_A, k_B, k_theta = jax.random.split(key, 4)

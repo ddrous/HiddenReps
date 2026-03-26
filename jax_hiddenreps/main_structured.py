@@ -1,4 +1,4 @@
-#%%
+#%% TODO: Fuck, I could get this dateset from https://scikit-learn.org/stable/modules/generated/sklearn.datasets.make_swiss_roll.html
 import jax
 import jax.numpy as jnp
 import equinox as eqx
@@ -45,6 +45,7 @@ def plot_loss_curves(history, run_dir, title="Autoencoder Loss Curves"):
 # 2. DATA HANDLER (Disjoint Spirals & ID Testing)
 # ==========================================
 class SpiralDataHandler:
+    """## To get a better version of this dateset: https://scikit-learn.org/stable/modules/generated/sklearn.datasets.make_swiss_roll.html"""
     def __init__(self, batch_size=64, num_points=1500, num_clusters=6, val_split=0.2, cluster_spread=0.2, seed=2018):
         self.batch_size = batch_size
         self.rng = np.random.default_rng(seed)
