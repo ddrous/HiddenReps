@@ -83,8 +83,7 @@ class DSpritesDataHandler:
         self.rng = np.random.default_rng(seed)
         
         # Checking for standard or user-specified NPZ
-        self.filepaths = ['dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz', 
-                          'dsprites_ndarray_co1sh3sc6or40x32y32.npz']
+        self.filepaths = ['dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz']
         
         self._load_and_split(subset_size)
         
@@ -100,12 +99,12 @@ class DSpritesDataHandler:
         if filepath is None:
             print("Downloading dSprites dataset (~25MB)...")
             url = "https://github.com/google-deepmind/dsprites-dataset/blob/master/dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz"
-            filepath = self.filepaths[1]
+            filepath = self.filepaths[0]
             urllib.request.urlretrieve(url, filepath)
             print("Download complete.")
 
         print(f"Loading dSprites data from {filepath}...")
-        data = np.load(filepath, allow_pickle=True)
+        data = np.load(filepath, allow_pickle=False)
         
         # Extract full data
         imgs = data['imgs']
@@ -320,8 +319,11 @@ print(f"\n⏱ Training completed in {time.strftime('%H:%M:%S', time.gmtime(time.
 final_models = {n: eqx.combine(t["diff"], t["static"]) for n, t in trainers.items()}
 plot_step_loss_curves(history, run_dir, title="dSprites Training Loss (Per Step)")
 
+
+
+
 # ==========================================
-# 7. ANALYSIS & PLOTTING LATENTS (2x4 Grid)
+# 7.5 ANALYSIS & PLOTTING LATENTS (2x4 Grid)
 # ==========================================
 #%%
 print("\n--- Extracting Functional Representations ---")
@@ -341,15 +343,33 @@ _, z_explicit = batched_bot(X_full, dm.coords)
 z_explicit = np.array(z_explicit)
 
 print("Running PCA, t-SNE, and UMAP on Ambient Pixels (4096D) & Weight Spaces...")
-pca_ambient = PCA(n_components=2).fit_transform(X_flat)
-tsne_ambient = TSNE(n_components=2, perplexity=30, random_state=42).fit_transform(X_flat)
-umap_ambient = umap.UMAP(n_components=2, random_state=42).fit_transform(X_flat)
+# Fit Ambient PCA to 6 dimensions to allow flexible slicing
+pca_ambient = PCA(n_components=6).fit_transform(X_flat)
+tsne_ambient = TSNE(n_components=3, perplexity=30, random_state=42, method='barnes_hut').fit_transform(X_flat)
+umap_ambient = umap.UMAP(n_components=6, random_state=42).fit_transform(X_flat)
 
-pca_weights = PCA(n_components=2).fit_transform(theta_nD)
-tsne_weights = TSNE(n_components=2, perplexity=30, random_state=42).fit_transform(theta_nD)
+# Option A: rigorously extract 6 dimensions from the Target Weights first
+pca_model_6d = PCA(n_components=6).fit(theta_nD)
+pca_weights_6d = pca_model_6d.transform(theta_nD)
 
-pca_z_abs = PCA(n_components=2).fit_transform(z_abs)
-pca_z_explicit = PCA(n_components=2).fit_transform(z_explicit)
+# Extract standard t-SNE in 2D
+tsne_weights = TSNE(n_components=3, perplexity=30, random_state=42, method='barnes_hut').fit_transform(theta_nD)
+
+# -------------------------------------------------------------------------
+# CONFIGURATION: Select which two dimensions to plot for each representation
+# For 6D arrays (true, ambient_pca, z_abs, pca_weights, z_explicit): pick any 0-5
+# For 2D arrays (t-SNE, UMAP): leave as (0, 1)
+# -------------------------------------------------------------------------
+plot_dims = {
+    "true": (4, 5),          # dSprites factors (4=PosX, 5=PosY)
+    "ambient_pca": (4, 5),
+    "ambient_tsne": (1, 2),
+    "ambient_umap": (4, 5),
+    "z_abs": (4, 5),
+    "pca_weights": (4, 5),
+    "tsne_weights": (1, 2),
+    "z_explicit": (4, 5)
+}
 
 print("Generating the Functional Latent Analysis Grid...")
 fig, axes = plt.subplots(2, 4, figsize=(24, 12))
@@ -360,16 +380,16 @@ color_metric = true_latents_full[:, 4]
 
 plots = [
     # Top Row: Ambient & Ground Truth
-    (true_latents_full[:, 4:6], "True Physical Latents (PosX vs PosY)", axes[0, 0]),
-    (pca_ambient, "Ambient PCA (4096D Pixels $\to$ 2D)", axes[0, 1]),
-    (tsne_ambient, "Ambient t-SNE (4096D Pixels $\to$ 2D)", axes[0, 2]),
-    (umap_ambient, "Ambient UMAP (4096D Pixels $\to$ 2D)", axes[0, 3]),
+    (true_latents_full[:, list(plot_dims["true"])], f"True Physical Latents (Dims {plot_dims['true'][0]}, {plot_dims['true'][1]})", axes[0, 0]),
+    (pca_ambient[:, list(plot_dims["ambient_pca"])], f"Ambient PCA (Dims {plot_dims['ambient_pca'][0]}, {plot_dims['ambient_pca'][1]})", axes[0, 1]),
+    (tsne_ambient[:, list(plot_dims["ambient_tsne"])], f"Ambient t-SNE (Dims {plot_dims['ambient_tsne'][0]}, {plot_dims['ambient_tsne'][1]})", axes[0, 2]),
+    (umap_ambient[:, list(plot_dims["ambient_umap"])], f"Ambient UMAP (Dims {plot_dims['ambient_umap'][0]}, {plot_dims['ambient_umap'][1]})", axes[0, 3]),
     
-    # Bottom Row: Model Latents
-    (pca_z_abs, "Baseline: Abstract AE (6D $\to$ PCA 2D)", axes[1, 0]),
-    (pca_weights, f"Option A: PCA on {TARGET_PARAM_COUNT}D Target Weights", axes[1, 1]),
-    (tsne_weights, f"Option A: t-SNE on {TARGET_PARAM_COUNT}D Target Weights", axes[1, 2]),
-    (pca_z_explicit, "Option B: Explicit 6D Bottleneck ($\to$ PCA 2D)", axes[1, 3]),
+    # Bottom Row: Model Latents explicitly sliced
+    (z_abs[:, list(plot_dims["z_abs"])], f"Baseline: Abstract AE (Dims {plot_dims['z_abs'][0]}, {plot_dims['z_abs'][1]})", axes[1, 0]),
+    (pca_weights_6d[:, list(plot_dims["pca_weights"])], f"Option A: PCA Weights (Dims {plot_dims['pca_weights'][0]}, {plot_dims['pca_weights'][1]})", axes[1, 1]),
+    (tsne_weights[:, list(plot_dims["tsne_weights"])], f"Option A: t-SNE Target Weights (Dims {plot_dims['tsne_weights'][0]}, {plot_dims['tsne_weights'][1]})", axes[1, 2]),
+    (z_explicit[:, list(plot_dims["z_explicit"])], f"Option B: Explicit 6D Bottleneck (Dims {plot_dims['z_explicit'][0]}, {plot_dims['z_explicit'][1]})", axes[1, 3]),
 ]
 
 for data, title, ax in plots:
@@ -382,6 +402,9 @@ plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.savefig(run_dir / "plots" / "dsprites_latent_analysis.png", dpi=150)
 plt.show()
 
+
+
+
 # ==========================================
 # 8. ID GENERALIZATION TESTING
 # ==========================================
@@ -391,21 +414,28 @@ X_test_full, test_latents_full = dm.get_full_data('test', max_samples=1000)
 
 _, z_abs_test = batched_abs(X_test_full, dm.coords)
 _, z_explicit_test = batched_bot(X_test_full, dm.coords)
-
-# Project test data using the PCA models fitted strictly on the training structures
-pca_z_abs_test = PCA(n_components=2).fit(z_abs).transform(np.array(z_abs_test))
-pca_z_explicit_test = PCA(n_components=2).fit(z_explicit).transform(np.array(z_explicit_test))
-
 _, theta_nD_test = batched_dir(X_test_full, dm.coords)
-pca_weights_test = PCA(n_components=2).fit(theta_nD).transform(np.array(theta_nD_test))
+
+# Project test weights using the strictly fitted 6D PCA model
+pca_weights_test_6d = pca_model_6d.transform(np.array(theta_nD_test))
+
+# Slice out the chosen dimensions uniformly for test data based on the config
+sliced_z_abs = z_abs[:, list(plot_dims["z_abs"])]
+sliced_z_abs_test = np.array(z_abs_test)[:, list(plot_dims["z_abs"])]
+
+sliced_pca_weights = pca_weights_6d[:, list(plot_dims["pca_weights"])]
+sliced_pca_weights_test = pca_weights_test_6d[:, list(plot_dims["pca_weights"])]
+
+sliced_z_explicit = z_explicit[:, list(plot_dims["z_explicit"])]
+sliced_z_explicit_test = np.array(z_explicit_test)[:, list(plot_dims["z_explicit"])]
 
 fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 fig.suptitle('ID Generalization: Safely Bridging the PosX Gap', fontsize=16)
 
 id_plots = [
-    (pca_z_abs, pca_z_abs_test, "Abstract AE Interpolation", axes[0]),
-    (pca_weights, pca_weights_test, "Option A (PCA Weights) Interpolation", axes[1]),
-    (pca_z_explicit, pca_z_explicit_test, "Option B (Bottleneck) Interpolation", axes[2]),
+    (sliced_z_abs, sliced_z_abs_test, f"Abstract AE Interpolation (Dims {plot_dims['z_abs'][0]}, {plot_dims['z_abs'][1]})", axes[0]),
+    (sliced_pca_weights, sliced_pca_weights_test, f"Option A (PCA Weights) Interpolation (Dims {plot_dims['pca_weights'][0]}, {plot_dims['pca_weights'][1]})", axes[1]),
+    (sliced_z_explicit, sliced_z_explicit_test, f"Option B (Bottleneck) Interpolation (Dims {plot_dims['z_explicit'][0]}, {plot_dims['z_explicit'][1]})", axes[2]),
 ]
 
 for train_z, test_z, title, ax in id_plots:
@@ -424,3 +454,4 @@ plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.savefig(run_dir / "plots" / "id_generalization_test.png", dpi=150)
 plt.show()
 print("✅ ID Generalization complete.")
+# %%
