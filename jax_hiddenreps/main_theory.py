@@ -28,7 +28,7 @@ config = {
     "dataset_name": "s_curve", # Options: 'linear_functional', 'swiss_roll', 's_curve'
     
     # Dataset parameters
-    "num_train": 2000,
+    "num_train": 500,
     "num_val": 500,
     "num_test": 500,
     "k_dim": 2,          # Intrinsic latent dimensionality
@@ -39,10 +39,11 @@ config = {
     "num_epochs": 1000,
     "batch_size": 32,
     "learning_rate": 1e-4,
-    "weight_decay": 1e-4,
+    # "weight_decay": 1e-4,
+    "weight_decay": 0,
     
     # Model architecture parameters
-    "hidden_dim": 64,
+    "hidden_dim": 128,
     "num_layers": 3,
     
     # JE-VICReg specific parameters
@@ -159,10 +160,11 @@ class FBAE(eqx.Module):
     unravel_fn: callable = eqx.field(static=True)
     tau: jax.Array
 
-    def __init__(self, key, n_dim, k_dim, hidden_dim, num_layers, inr_hidden=12, inr_layers=5):
+    def __init__(self, key, n_dim, k_dim, hidden_dim, num_layers, inr_hidden=10, inr_layers=4):
         k1, k2, k3 = jrandom.split(key, 3)
         
-        self.encoder = eqx.nn.MLP(n_dim, k_dim, hidden_dim, num_layers, key=k1)
+        # self.encoder = eqx.nn.MLP(n_dim, k_dim, hidden_dim, num_layers, key=k1)
+        self.encoder = eqx.nn.MLP(n_dim, k_dim, hidden_dim//2, num_layers, key=k1)
         
         # INR takes scalar coordinate (1) and outputs full signal (n_dim)
         inr_template = eqx.nn.MLP(1, n_dim, inr_hidden, inr_layers, key=k2)
@@ -172,7 +174,8 @@ class FBAE(eqx.Module):
         num_inr_params = flat_params.size
         
         self.theta_base = flat_params 
-        self.hypernet = eqx.nn.MLP(k_dim, num_inr_params, hidden_dim, num_layers, key=k3)
+        # self.hypernet = eqx.nn.MLP(k_dim, num_inr_params, hidden_dim, num_layers, key=k3)
+        self.hypernet = eqx.nn.MLP(k_dim, num_inr_params, 64, 1, key=k3)
         self.tau = jnp.array([1.0])
 
     def __call__(self, x):
@@ -465,6 +468,12 @@ models = {
     "JE-VICReg": JEVICReg(k_je, config["n_dim"], config["k_dim"], config["hidden_dim"], config["num_layers"]),
     "JEPA": JEPA(k_jepa, config["n_dim"], config["k_dim"], config["hidden_dim"], config["num_layers"])
 }
+
+## Print model parameter counts for sanity check
+print("\nModel Parameter Counts:")
+for name, model in models.items():
+    num_params = sum(jax.tree_util.tree_leaves(jax.tree_util.tree_map(lambda x: x.size if isinstance(x, jnp.ndarray) else 0, model)))
+    print(f"  {name:15s}: {num_params:,} parameters")
 
 loss_fns = {
     "Abstract-AE": ae_loss_fn, "FB-AE": ae_loss_fn,
