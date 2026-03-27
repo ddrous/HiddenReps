@@ -109,6 +109,7 @@ class DSpritesDataHandler:
         # Extract full data
         imgs = data['imgs']
         latents = data['latents_values']
+        print(f"Full dataset loaded. Total samples: {len(imgs)}")
         
         # Subsample to keep memory reasonable
         idx = self.rng.choice(len(latents), subset_size, replace=False)
@@ -267,11 +268,11 @@ def create_trainer(model_instance, lr):
 # ==========================================
 #%%
 config = {
-    "lr": 5e-4,
-    "batch_size": 128,
-    "epochs": 2,
-    "val_every": 2,
-    "subset_size": 20000, 
+    "lr": 1e-5,
+    "batch_size": 16,
+    "epochs": 100,
+    "val_every": 10,
+    "subset_size": 737280, 
     "seed": 2026
 }
 
@@ -355,6 +356,7 @@ pca_weights_6d = pca_model_6d.transform(theta_nD)
 # Extract standard t-SNE in 2D
 tsne_weights = TSNE(n_components=3, perplexity=30, random_state=42, method='barnes_hut').fit_transform(theta_nD)
 
+#%%
 # -------------------------------------------------------------------------
 # CONFIGURATION: Select which two dimensions to plot for each representation
 # For 6D arrays (true, ambient_pca, z_abs, pca_weights, z_explicit): pick any 0-5
@@ -368,7 +370,7 @@ plot_dims = {
     "z_abs": (4, 5),
     "pca_weights": (4, 5),
     "tsne_weights": (1, 2),
-    "z_explicit": (4, 5)
+    "z_explicit": (0, 1)
 }
 
 print("Generating the Functional Latent Analysis Grid...")
