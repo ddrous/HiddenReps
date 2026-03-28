@@ -269,10 +269,11 @@ def create_trainer(model_instance, lr):
 #%%
 config = {
     "lr": 1e-5,
-    "batch_size": 16,
-    "epochs": 100,
+    "batch_size": 512,
+    "epochs": 50,
     "val_every": 10,
-    "subset_size": 737280, 
+    # "subset_size": 737280, 
+    "subset_size": 50000, 
     "seed": 2026
 }
 
@@ -286,6 +287,14 @@ models = {
     "Direct_HyperNet": DirectHyperNet(k2, learn_base=True),
     "Bottleneck_HyperNet": BottleneckHyperNet(k3, learn_base=True)
 }
+
+## Print model parameter counts for sanity check
+print("\nModel Parameter Counts:")
+for name, model in models.items():
+    num_params = sum(jax.tree_util.tree_leaves(jax.tree_util.tree_map(lambda x: x.size if isinstance(x, jnp.ndarray) else 0, model)))
+    print(f"  {name:15s}: {num_params:,} parameters")
+
+#%%
 
 history = {m: {'train_step': [], 'epoch_avg': []} for m in models.keys()}
 run_dir = get_run_path()
@@ -370,7 +379,7 @@ plot_dims = {
     "z_abs": (4, 5),
     "pca_weights": (4, 5),
     "tsne_weights": (1, 2),
-    "z_explicit": (0, 1)
+    "z_explicit": (2, 3)
 }
 
 print("Generating the Functional Latent Analysis Grid...")
