@@ -30,3 +30,6 @@ latent_action_models/nohup.log
 
 jax_hiddenreps/dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz
 limit_weight_space/src/engression
+
+jax_hiddenreps/data/*
+jax_hiddenreps/runs/*
