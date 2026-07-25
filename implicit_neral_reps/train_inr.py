@@ -14,9 +14,9 @@ Pipeline:
 
 import os
 
-os.environ.setdefault(
-    "JAX_PLATFORMS", "cpu"
-)  # safe default; CPU is plenty for a 224x224 INR
+# os.environ.setdefault(
+#     "JAX_PLATFORMS", "cpu"
+# )  # safe default; CPU is plenty for a 224x224 INR
 
 import jax
 import jax.numpy as jnp
@@ -36,17 +36,19 @@ USE_FOURIER_FEATURES = False  # <-- flip this to False to feed raw (x, y) coords
 NUM_FOURIER_FREQS = 1  # only used when USE_FOURIER_FEATURES = True
 INR_WIDTH = 12
 INR_DEPTH = 6
-NUM_STEPS = 5000
+NUM_STEPS = 25000
 LR = 1e-3
-SEED = 0
+SEED = 2030
 DTYPE = (
     jnp.float32
 )  # float32 throughout; bf16 causes needless precision headaches for a demo
 
 # INPUT_IMAGE_PATH = "pusht.webp"
-INPUT_IMAGE_PATH = "ogbench.png"
+# INPUT_IMAGE_PATH = "ogbench.png"
 # INPUT_IMAGE_PATH = "tworoom.png"
 # INPUT_IMAGE_PATH = "reacher.png"
+# INPUT_IMAGE_PATH = "craftax.jpg"
+INPUT_IMAGE_PATH = "quadruped.jpg"
 OUT_DIR = "./"
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -107,36 +109,95 @@ def compute_in_dim(use_fourier, num_freqs):
     return 2 * 2 * num_freqs if use_fourier else 2
 
 
+# class INR(eqx.Module):
+#     layers: list
+#     raw_omega: jnp.ndarray  # shape (depth-1,), unconstrained/trainable
+#     omega_min: float = eqx.field(static=True)
+#     omega_max: float = eqx.field(static=True)
+
+#     def __init__(
+#         self, in_dim, out_dim, width, depth, key, omega_min=50.0, omega_max=60.0
+#     ):
+#         keys = jax.random.split(key, depth)
+#         dims = [in_dim] + [width] * (depth - 1) + [out_dim]
+#         self.layers = [
+#             eqx.nn.Linear(dims[i], dims[i + 1], key=keys[i]) for i in range(depth)
+#         ]
+#         self.omega_min = omega_min
+#         self.omega_max = omega_max
+#         # placeholder; siren_init_learnable_omega overwrites this with a sensible starting point
+#         self.raw_omega = jnp.zeros((depth - 1,))
+
+#     def get_omega(self, i):
+#         # sigmoid squashes the trainable scalar into (0, 1), then rescale into [omega_min, omega_max]
+
+#         # frac = self.raw_omega[i]
+#         # frac = jax.nn.sigmoid(self.raw_omega[i])
+#         # frac = jnp.clip(self.raw_omega[i], 0.0, 1.0)
+#         frac = jnp.sin(self.raw_omega[i]) ** 2
+
+#         return self.omega_min + frac * (self.omega_max - self.omega_min)
+
+#     def __call__(self, x):
+#         for i, layer in enumerate(self.layers):
+#             x = layer(x)
+#             if i < len(self.layers) - 1:
+#                 omega = self.get_omega(i)
+#                 x = jnp.sin(omega * x)
+#         return x
+
+
+# def siren_init(model, key, init_omega=30.0):
+#     """
+#     Initialize weights with SIREN's principled uniform scheme (using init_omega
+#     as the effective frequency for the bound calculation), and initialize the
+#     learnable raw_omega scalars so every layer STARTS at init_omega exactly
+#     (it's then free to drift within [omega_min, omega_max] during training).
+#     """
+#     layers = model.layers
+#     keys = jax.random.split(key, len(layers))
+#     new_layers = []
+#     for i, (layer, k) in enumerate(zip(layers, keys)):
+#         fan_in = layer.weight.shape[1]
+#         bound = 1.0 / fan_in if i == 0 else np.sqrt(6.0 / fan_in) / init_omega
+#         new_weight = jax.random.uniform(
+#             k, layer.weight.shape, minval=-bound, maxval=bound
+#         )
+#         layer = eqx.tree_at(lambda l: l.weight, layer, new_weight)
+#         new_layers.append(layer)
+#     model = eqx.tree_at(lambda m: m.layers, model, new_layers)
+
+#     # Solve for the raw (pre-sigmoid) value that maps to init_omega exactly:
+#     # init_omega = omega_min + sigmoid(raw) * (omega_max - omega_min)
+#     frac = (init_omega - model.omega_min) / (model.omega_max - model.omega_min)
+#     frac = float(np.clip(frac, 1e-4, 1 - 1e-4))  # avoid inf at the logit boundaries
+#     raw_init_value = float(np.log(frac / (1 - frac)))  # inverse sigmoid (logit)
+#     raw_omega = jnp.full((len(layers) - 1,), raw_init_value)
+#     model = eqx.tree_at(lambda m: m.raw_omega, model, raw_omega)
+
+#     return model
+
+
 class INR(eqx.Module):
     layers: list
-    raw_omega: jnp.ndarray  # shape (depth-1,), unconstrained/trainable
-    omega_min: float = eqx.field(static=True)
-    omega_max: float = eqx.field(static=True)
+    raw_omega: jnp.ndarray  # shape (depth-1,), trainable, initialized to 0!
+    base_omega: float = eqx.field(static=True)
 
-    def __init__(
-        self, in_dim, out_dim, width, depth, key, omega_min=50.0, omega_max=60.0
-    ):
+    def __init__(self, in_dim, out_dim, width, depth, key, base_omega=20.0, **kwargs):
         keys = jax.random.split(key, depth)
         dims = [in_dim] + [width] * (depth - 1) + [out_dim]
         self.layers = [
             eqx.nn.Linear(dims[i], dims[i + 1], key=keys[i]) for i in range(depth)
         ]
-        self.omega_min = omega_min
-        self.omega_max = omega_max
-        # placeholder; siren_init_learnable_omega overwrites this with a sensible starting point
+        self.base_omega = base_omega
+
+        # raw_omega sits at 0.0, putting it perfectly on scale with network weights
         self.raw_omega = jnp.zeros((depth - 1,))
 
     def get_omega(self, i):
-        # sigmoid squashes the trainable scalar into (0, 1), then rescale into [omega_min, omega_max]
-        # frac = jax.nn.sigmoid(self.raw_omega[i])
-
-        # frac = jnp.clip(self.raw_omega[i], 0.0, 1.0)
-
-        frac = jnp.sin(self.raw_omega[i]) ** 2
-
-        # frac = self.raw_omega[i]
-
-        return self.omega_min + frac * (self.omega_max - self.omega_min)
+        # Exponential reparameterization naturally bounds omega > 0
+        # and normalizes the gradient scales!
+        return self.base_omega * jnp.exp(self.raw_omega[i])
 
     def __call__(self, x):
         for i, layer in enumerate(self.layers):
@@ -149,31 +210,27 @@ class INR(eqx.Module):
 
 def siren_init(model, key, init_omega=30.0):
     """
-    Initialize weights with SIREN's principled uniform scheme (using init_omega
-    as the effective frequency for the bound calculation), and initialize the
-    learnable raw_omega scalars so every layer STARTS at init_omega exactly
-    (it's then free to drift within [omega_min, omega_max] during training).
+    Initialize weights with SIREN's principled uniform scheme.
+    Because raw_omega is initialized to 0.0, the network starts exactly
+    at `base_omega` for every layer, meaning we don't need to overwrite it here.
     """
     layers = model.layers
     keys = jax.random.split(key, len(layers))
     new_layers = []
+
     for i, (layer, k) in enumerate(zip(layers, keys)):
         fan_in = layer.weight.shape[1]
-        bound = 1.0 / fan_in if i == 0 else np.sqrt(6.0 / fan_in) / init_omega
+
+        # We use the model's base_omega for the initialization bound
+        bound = 1.0 / fan_in if i == 0 else np.sqrt(6.0 / fan_in) / model.base_omega
+
         new_weight = jax.random.uniform(
             k, layer.weight.shape, minval=-bound, maxval=bound
         )
         layer = eqx.tree_at(lambda l: l.weight, layer, new_weight)
         new_layers.append(layer)
-    model = eqx.tree_at(lambda m: m.layers, model, new_layers)
 
-    # Solve for the raw (pre-sigmoid) value that maps to init_omega exactly:
-    # init_omega = omega_min + sigmoid(raw) * (omega_max - omega_min)
-    frac = (init_omega - model.omega_min) / (model.omega_max - model.omega_min)
-    frac = float(np.clip(frac, 1e-4, 1 - 1e-4))  # avoid inf at the logit boundaries
-    raw_init_value = float(np.log(frac / (1 - frac)))  # inverse sigmoid (logit)
-    raw_omega = jnp.full((len(layers) - 1,), raw_init_value)
-    model = eqx.tree_at(lambda m: m.raw_omega, model, raw_omega)
+    model = eqx.tree_at(lambda m: m.layers, model, new_layers)
 
     return model
 
@@ -297,7 +354,7 @@ def random_filter_normalized_direction(leaves, key):
     return direction
 
 
-def loss_landscape(model, coords, target, loss_fn, key, span=1.0, n=25):
+def loss_landscape(model, coords, target, loss_fn, key, span=1.0, n=50):
     params, static = eqx.partition(model, eqx.is_array)
     leaves, treedef = jax.tree_util.tree_flatten(params)
 
@@ -414,7 +471,7 @@ plt.show()
 print("Computing loss landscape (this takes a little while)...")
 loss_fn = make_loss_fn(forward_fn)
 alphas, betas, grid = loss_landscape(
-    model, coords, target, loss_fn, land_key, span=1.0, n=25
+    model, coords, target, loss_fn, land_key, span=1.0, n=50
 )
 
 fig = plt.figure(figsize=(11, 4.5))
@@ -446,3 +503,5 @@ print("Done. Saved:")
 print(" -", os.path.join(OUT_DIR, "reconstruction.png"))
 print(" -", os.path.join(OUT_DIR, "loss_curve.png"))
 print(" -", os.path.join(OUT_DIR, "loss_landscape.png"))
+
+# %%
