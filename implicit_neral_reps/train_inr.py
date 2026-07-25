@@ -36,7 +36,7 @@ USE_FOURIER_FEATURES = False  # <-- flip this to False to feed raw (x, y) coords
 NUM_FOURIER_FREQS = 1  # only used when USE_FOURIER_FEATURES = True
 INR_WIDTH = 12
 INR_DEPTH = 6
-NUM_STEPS = 1000
+NUM_STEPS = 5000
 LR = 1e-3
 SEED = 0
 DTYPE = (
@@ -44,9 +44,9 @@ DTYPE = (
 )  # float32 throughout; bf16 causes needless precision headaches for a demo
 
 # INPUT_IMAGE_PATH = "pusht.webp"
-# INPUT_IMAGE_PATH = "ogbench.png"
+INPUT_IMAGE_PATH = "ogbench.png"
 # INPUT_IMAGE_PATH = "tworoom.png"
-INPUT_IMAGE_PATH = "reacher.png"
+# INPUT_IMAGE_PATH = "reacher.png"
 OUT_DIR = "./"
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -129,7 +129,13 @@ class INR(eqx.Module):
     def get_omega(self, i):
         # sigmoid squashes the trainable scalar into (0, 1), then rescale into [omega_min, omega_max]
         # frac = jax.nn.sigmoid(self.raw_omega[i])
-        frac = self.raw_omega[i]
+
+        # frac = jnp.clip(self.raw_omega[i], 0.0, 1.0)
+
+        frac = jnp.sin(self.raw_omega[i]) ** 2
+
+        # frac = self.raw_omega[i]
+
         return self.omega_min + frac * (self.omega_max - self.omega_min)
 
     def __call__(self, x):
