@@ -36,15 +36,17 @@ USE_FOURIER_FEATURES = False  # <-- flip this to False to feed raw (x, y) coords
 NUM_FOURIER_FREQS = 1  # only used when USE_FOURIER_FEATURES = True
 INR_WIDTH = 12
 INR_DEPTH = 6
-NUM_STEPS = 5000
-LR = 3e-3
+NUM_STEPS = 1000
+LR = 1e-3
 SEED = 0
 DTYPE = (
     jnp.float32
 )  # float32 throughout; bf16 causes needless precision headaches for a demo
 
 # INPUT_IMAGE_PATH = "pusht.webp"
-INPUT_IMAGE_PATH = "ogbench.png"
+# INPUT_IMAGE_PATH = "ogbench.png"
+# INPUT_IMAGE_PATH = "tworoom.png"
+INPUT_IMAGE_PATH = "reacher.png"
 OUT_DIR = "./"
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -338,7 +340,7 @@ model = INR(
     width=INR_WIDTH,
     depth=INR_DEPTH,
     key=model_key,
-    omega_min=5.0,
+    omega_min=10.0,
     omega_max=60.0,
 )
 model = siren_init(model, model_key, init_omega=30.0)
