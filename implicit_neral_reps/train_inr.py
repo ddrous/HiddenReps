@@ -32,11 +32,12 @@ import matplotlib.pyplot as plt
 # --------------------------------------------------------------------------------------
 
 IMG_SIZE = 224
-USE_FOURIER_FEATURES = False  # <-- flip this to False to feed raw (x, y) coords instead
-NUM_FOURIER_FREQS = 1  # only used when USE_FOURIER_FEATURES = True
+USE_FOURIER_FEATURES = True
+NUM_FOURIER_FREQS = 5  # only used when USE_FOURIER_FEATURES = True
+PREDICT_ALPHA_CHANNEL = False  # if True, INR predicts RGBA instead of RGB
 INR_WIDTH = 12
 INR_DEPTH = 6
-NUM_STEPS = 25000
+NUM_STEPS = 30000
 LR = 1e-3
 SEED = 2030
 DTYPE = (
@@ -45,10 +46,10 @@ DTYPE = (
 
 # INPUT_IMAGE_PATH = "pusht.webp"
 # INPUT_IMAGE_PATH = "ogbench.png"
-# INPUT_IMAGE_PATH = "tworoom.png"
+INPUT_IMAGE_PATH = "tworoom.png"
 # INPUT_IMAGE_PATH = "reacher.png"
 # INPUT_IMAGE_PATH = "craftax.jpg"
-INPUT_IMAGE_PATH = "quadruped.jpg"
+# INPUT_IMAGE_PATH = "quadruped.jpg"
 OUT_DIR = "./"
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -178,35 +179,98 @@ def compute_in_dim(use_fourier, num_freqs):
 #     return model
 
 
+
+
+
+
+
+
+
+
+# class INR(eqx.Module):
+#     layers: list
+#     raw_omega: jnp.ndarray  # shape (depth-1,), trainable, initialized to 0!
+#     base_omega: float = eqx.field(static=True)
+
+#     def __init__(self, in_dim, out_dim, width, depth, key, base_omega=10.0, **kwargs):
+#         keys = jax.random.split(key, depth)
+#         dims = [in_dim] + [width] * (depth - 1) + [out_dim]
+#         self.layers = [
+#             eqx.nn.Linear(dims[i], dims[i + 1], key=keys[i]) for i in range(depth)
+#         ]
+#         self.base_omega = base_omega
+
+#         # raw_omega sits at 0.0, putting it perfectly on scale with network weights
+#         self.raw_omega = jnp.zeros((depth - 1,))
+
+#     def get_omega(self, i):
+#         # Exponential reparameterization naturally bounds omega > 0
+#         # and normalizes the gradient scales!
+#         return self.base_omega * jnp.exp(self.raw_omega[i])
+
+#     def __call__(self, x):
+#         for i, layer in enumerate(self.layers):
+#             x = layer(x)
+#             if i < len(self.layers) - 1:
+#                 omega = self.get_omega(i)
+#                 x = jnp.sin(omega * x)
+#         return x
+
 class INR(eqx.Module):
+    """Tiny coordinate-based INR. Its flattened weights ARE the world-model state z."""
     layers: list
-    raw_omega: jnp.ndarray  # shape (depth-1,), trainable, initialized to 0!
     base_omega: float = eqx.field(static=True)
 
-    def __init__(self, in_dim, out_dim, width, depth, key, base_omega=20.0, **kwargs):
+    def __init__(self, in_dim, out_dim, width, depth, key, **kwargs):
         keys = jax.random.split(key, depth)
+
+        ## print the in_dim that is used for the INR
+        print(f"INR input dimension: {in_dim}")
+
+        if "predict_alpha" in kwargs and kwargs['predict_alpha']:
+            out_dim = out_dim + 1  # add alpha channel to output dimension
+            print(f"INR output dimension: {out_dim} (predicting alpha channel)")
+
+        ## Fixed width
         dims = [in_dim] + [width] * (depth - 1) + [out_dim]
-        self.layers = [
-            eqx.nn.Linear(dims[i], dims[i + 1], key=keys[i]) for i in range(depth)
-        ]
-        self.base_omega = base_omega
 
-        # raw_omega sits at 0.0, putting it perfectly on scale with network weights
-        self.raw_omega = jnp.zeros((depth - 1,))
+        ## gradually decreasing width
+        # dims = [in_dim] + [width - i * (width // depth) for i in range(depth - 1)] + [out_dim]
 
-    def get_omega(self, i):
-        # Exponential reparameterization naturally bounds omega > 0
-        # and normalizes the gradient scales!
-        return self.base_omega * jnp.exp(self.raw_omega[i])
+        # ## widths increase up to max_width in the middle layer, then decrease back down to out_dim
+        # max_width = width*6
+        # dims = []
+        # for i in range(depth):
+        #     if i < (depth - 1) // 2:
+        #         new_dim = in_dim + (max_width - in_dim) * (i / ((depth - 1) // 2))
+        #     else:
+        #         new_dim = max_width - (max_width - width) * ((i - (depth - 1) // 2) / ((depth - 1) // 2))
+        #     dims.append(int(new_dim))
+        # dims.append(out_dim)
+
+
+
+
+        print(f"INR layer dimensions: {dims}")
+
+
+        self.layers = [eqx.nn.Linear(dims[i], dims[i + 1], key=keys[i], use_bias=True) for i in range(depth)]
+
+        self.base_omega = 1.0  # standard SIREN default
 
     def __call__(self, x):
         for i, layer in enumerate(self.layers):
             x = layer(x)
             if i < len(self.layers) - 1:
-                omega = self.get_omega(i)
-                x = jnp.sin(omega * x)
-        return x
+                x = jax.nn.gelu(x)
 
+        if x.shape[-1] == 4:
+            alpha = jax.nn.sigmoid(x[..., 3:4])  # alpha channel
+            rgb = jax.nn.sigmoid(x[..., :3])  # RGB channels
+
+            x = jax.nn.sigmoid(alpha) * rgb  # premultiply RGB by alpha
+
+        return x
 
 def siren_init(model, key, init_omega=30.0):
     """
@@ -315,7 +379,7 @@ def train(model, coords, target, num_steps, lr, use_fourier, num_freqs):
             model, opt_state, coords, target, optimizer, loss_fn
         )
         losses[step] = float(loss)
-        if step % 500 == 0 or step == num_steps - 1:
+        if step % 2500 == 0 or step == num_steps - 1:
             print(
                 f"step {step:5d}  mse {float(loss):.6f}  psnr {psnr(float(loss)):.2f} dB"
             )
@@ -405,6 +469,8 @@ model = INR(
     key=model_key,
     omega_min=10.0,
     omega_max=60.0,
+    num_freqs=NUM_FOURIER_FREQS,
+    predict_alpha=PREDICT_ALPHA_CHANNEL
 )
 model = siren_init(model, model_key, init_omega=30.0)
 
