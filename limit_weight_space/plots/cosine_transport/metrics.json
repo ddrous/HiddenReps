@@ -1,0 +1,99 @@
+{
+  "particle_transport": {
+    "train": {
+      "mse": 0.010691706964591556,
+      "mae": 0.07335986219814217,
+      "energy_score": 0.052209556248534066,
+      "coverage_95": 0.9741581832419733,
+      "mean_interval_width": 0.7123759388923645,
+      "mean_posterior_std": 0.18182753026485443,
+      "mean_prior_width": 4.0,
+      "min_prior_width": 4.0,
+      "max_prior_width": 4.0
+    },
+    "test": {
+      "mse": 1.1955370533784484,
+      "mae": 0.9546923900519582,
+      "energy_score": 0.8594567642512779,
+      "coverage_95": 0.06085753803596127,
+      "mean_interval_width": 0.563443660736084,
+      "mean_posterior_std": 0.17310932278633118,
+      "mean_prior_width": 2.0,
+      "min_prior_width": 1.9999998807907104,
+      "max_prior_width": 2.0
+    }
+  },
+  "mlp": {
+    "train_mse": 0.0006494074712038604,
+    "test_mse": 3.539785946276578
+  },
+  "gp": {
+    "train_mse": 2.278572278277134e-05,
+    "test_mse": 1.397362457866051,
+    "train_coverage_95": 0.9569303054032889,
+    "test_coverage_95": 0.9764868603042877
+  },
+  "scaling": {
+    "x_center": 0.00243215212006076,
+    "x_scale": 0.9516904933871595,
+    "y_center": 0.0,
+    "y_scale": 2.0,
+    "prior_low": -2.0,
+    "prior_high": 2.0
+  },
+  "config": {
+    "seed": 2028,
+    "data_samples": 2000,
+    "noise_std": 0.005,
+    "segments": 11,
+    "x_range": [
+      -1.5,
+      1.5
+    ],
+    "train_seg_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "num_particles": 16,
+    "eval_particles": 256,
+    "hidden_dim": 64,
+    "heads": 4,
+    "mlp_ratio": 4,
+    "posterior_depth": 3,
+    "posterior_conditioning": "adaln",
+    "cross_attention_tokens": 1,
+    "max_normalized_displacement": 5.0,
+    "epochs": 5000,
+    "batch_size": 256,
+    "learning_rate": 0.0001,
+    "weight_decay": 1e-05,
+    "grad_clip_norm": 5.0,
+    "log_every": 250,
+    "prior_min": -2.0,
+    "prior_max": 2.0,
+    "likelihood_x_noise_std": 0.01,
+    "evaluation_prior_mode": "cheating",
+    "cheating_prior_width_fraction": 0.5,
+    "eval_local_prior_k": 64,
+    "eval_local_prior_margin": 0.25,
+    "eval_local_prior_min_width": 1.0,
+    "eval_local_prior_clip_to_global": true,
+    "truth_anchor_probability": 1.0,
+    "historical_output_prior_probability": 0.5,
+    "historical_output_buffer_capacity": 2048,
+    "interval_low_q": 0.025,
+    "interval_high_q": 0.975,
+    "eval_batch_size": 256,
+    "nn_hidden_size": 64,
+    "nn_learning_rate": 0.001,
+    "nn_epochs": 3000,
+    "gp_restarts": 10,
+    "show_plots": true,
+    "output_dir": "plots/cosine_transport"
+  }
+}
