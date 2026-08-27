@@ -3,22 +3,24 @@
 
 A uniform cloud of candidate y values is transported by one particle Transformer.
 For each observed training pair (x, y*), x is treated as the centre of a configurable
-Gaussian empirical likelihood p(x_lik | y*) and the transport is conditioned on a fresh
-x_lik draw. The empirical energy score trains the full y cloud. Its mean is the point
-prediction; its empirical quantiles are uncertainty intervals.
+Gaussian empirical likelihood p(x_lik | y*). A configurable block of independent noisy
+x_lik observations is causally contextualised by a likelihood Transformer before conditioning
+the particle transport. The empirical energy score trains the full y cloud. Its mean is the
+point prediction; its empirical quantiles are uncertainty intervals.
 
 Retained from bayes-transport:
   * uniform base prior;
   * shared-tau interpolated training priors;
   * Gaussian-noisified x likelihood observations from the supplied data pairs;
+  * causal likelihood Transformer over variable observation prefixes;
   * historical-output replay buffer;
   * identity-initialised particle transport;
   * empirical energy score and cloud diagnostics.
 
 Removed:
   * simulator / synthetic (x,y) generation;
-  * dimension and likelihood embedders;
-  * observation prefixes / recurrent Bayes rollouts;
+  * dimension embedders;
+  * recurrent Bayes rollouts;
   * DEQ / fixed-point / drifting modes;
   * heterogeneous shapes and padding.
 
@@ -77,11 +79,11 @@ class Config:
     mlp_ratio: int = 4
     posterior_depth: int = 3
     posterior_conditioning: str = "cross_attention"  # {"adaln", "cross_attention"}
-    cross_attention_tokens: int = 1  # learned x-memory tokens when cross-attention is selected
+    cross_attention_tokens: int = 1  # retained compatibility field; likelihood contexts now supply memory
     max_normalized_displacement: float = 5.0
 
     # Training: one epoch = one observed-data minibatch / optimizer step.
-    epochs: int = 50000
+    epochs: int = 5000
     batch_size: int = 64*4
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
@@ -99,6 +101,19 @@ class Config:
     # The noisy draw x_lik, not the clean pair centre x_pair, conditions the transport.
     # Replay stores the exact realised x_lik so the same evidence can be reused later.
     likelihood_x_noise_std: float = 0.01
+
+    # Causal likelihood Transformer, adapted directly from the location-finding experiment.
+    # One observation means one INDEPENDENT Gaussian x_lik draw around the same clean x_pair.
+    # Every training step draws max_observations_per_step noisy observations and optimizes EVERY
+    # prefix o=min_observations_per_step,...,max_observations_per_step from the SAME prior cloud.
+    # Prefixes are direct prior->posterior maps; posterior(o-1) is never fed into posterior(o).
+    min_observations_per_step: int = 1
+    max_observations_per_step: int = 6
+    test_observations_per_step: int = 6
+    likelihood_hidden_dim: int = 64
+    likelihood_heads: int = 4
+    likelihood_mlp_ratio: int = 4
+    likelihood_depth: int = 4
 
     # Evaluation/deployment prior.
     #   "cheating" (DEFAULT): oracle/domain-expert mode. The true evaluation label y* is
@@ -161,6 +176,21 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("prior_min must be strictly smaller than prior_max.")
     if cfg.likelihood_x_noise_std <= 0.0:
         raise ValueError("likelihood_x_noise_std must be > 0 for a non-degenerate Gaussian likelihood.")
+    if cfg.min_observations_per_step < 1:
+        raise ValueError("min_observations_per_step must be >= 1.")
+    if cfg.max_observations_per_step < cfg.min_observations_per_step:
+        raise ValueError("max_observations_per_step must be >= min_observations_per_step.")
+    if not (cfg.min_observations_per_step <= cfg.test_observations_per_step <= cfg.max_observations_per_step):
+        raise ValueError(
+            "test_observations_per_step must lie in "
+            "[min_observations_per_step, max_observations_per_step]."
+        )
+    if cfg.likelihood_hidden_dim < 1:
+        raise ValueError("likelihood_hidden_dim must be >= 1.")
+    if cfg.likelihood_heads < 1 or cfg.likelihood_hidden_dim % cfg.likelihood_heads != 0:
+        raise ValueError("likelihood_hidden_dim must be divisible by likelihood_heads.")
+    if cfg.likelihood_mlp_ratio < 1 or cfg.likelihood_depth < 1:
+        raise ValueError("likelihood_mlp_ratio and likelihood_depth must both be >= 1.")
     if cfg.evaluation_prior_mode not in {"cheating", "widest", "nearest_training"}:
         raise ValueError(
             "evaluation_prior_mode must be 'cheating', 'widest', or 'nearest_training'."
@@ -276,9 +306,9 @@ scaling = make_scaling(X_train, Y_train, CFG)
 print("\n--- data / experiment setup: before training ---")
 print(f"Train samples: {len(X_train)} | Test/OOD samples: {len(X_test)}")
 conditioning_detail = (
-    f"{CFG.posterior_conditioning} ({CFG.cross_attention_tokens} learned x-memory tokens)"
+    f"{CFG.posterior_conditioning} (causal likelihood-prefix memory)"
     if CFG.posterior_conditioning == "cross_attention"
-    else CFG.posterior_conditioning
+    else f"{CFG.posterior_conditioning} (final causal likelihood-prefix token)"
 )
 print(f"Posterior conditioning: {conditioning_detail}")
 print(
@@ -288,6 +318,16 @@ print(
 print(
     f"Gaussian x-likelihood during training: x_lik ~ N(x_pair, {CFG.likelihood_x_noise_std:.4f}^2). "
     "Deployment/evaluation x is NOT noisified."
+)
+print(
+    "Likelihood observation prefixes: "
+    f"train o={CFG.min_observations_per_step}..{CFG.max_observations_per_step} "
+    f"(one independent noise draw per observation) | deployment o={CFG.test_observations_per_step}"
+)
+print(
+    "Likelihood Transformer: "
+    f"hidden={CFG.likelihood_hidden_dim}, heads={CFG.likelihood_heads}, "
+    f"depth={CFG.likelihood_depth}, mlp_ratio={CFG.likelihood_mlp_ratio}"
 )
 print(f"Configured evaluation prior mode: {CFG.evaluation_prior_mode}")
 train_inside = np.mean((Y_train >= scaling.prior_low) & (Y_train <= scaling.prior_high))
@@ -317,12 +357,21 @@ def sample_likelihood_x_np(
     rng: np.random.Generator,
     x_pair: np.ndarray,
     cfg: Config,
+    *,
+    num_observations: int | None = None,
 ) -> np.ndarray:
-    """Draw the realised likelihood observation x_lik ~ N(x_pair, sigma_x^2)."""
+    """Draw independent x_lik observations for every supplied clean x_pair.
+
+    Returns [B,O]. Observation j is one independent Gaussian noise sample around the same
+    clean x_pair. This is the cosine analogue of one independent likelihood observation token.
+    """
+    x_pair = np.asarray(x_pair, dtype=np.float32).reshape(-1)
+    o = cfg.max_observations_per_step if num_observations is None else int(num_observations)
+    if o < 1:
+        raise ValueError("num_observations must be >= 1.")
+    noise = rng.normal(size=(len(x_pair), o)).astype(np.float32)
     return (
-        np.asarray(x_pair, dtype=np.float32)
-        + np.float32(cfg.likelihood_x_noise_std)
-        * rng.normal(size=np.asarray(x_pair).shape).astype(np.float32)
+        x_pair[:, None] + np.float32(cfg.likelihood_x_noise_std) * noise
     ).astype(np.float32)
 
 
@@ -338,7 +387,7 @@ def gaussian_likelihood_logpdf_np(
 
 
 
-#%% 4) Training model: selectable AdaLN or x cross-attention conditioning
+#%% 4) Training model: causal likelihood Transformer + selectable posterior conditioning
 def _linear_tokens(layer: eqx.nn.Linear, x: Array) -> Array:
     return jax.vmap(layer)(x)
 
@@ -351,8 +400,93 @@ def _modulate(x: Array, shift: Array, scale: Array) -> Array:
     return x * (1.0 + scale[None, :]) + shift[None, :]
 
 
+class CausalObservationBlock(eqx.Module):
+    """Transformer block over one Omax x-likelihood sequence with a causal mask."""
+    norm1: eqx.nn.LayerNorm
+    norm2: eqx.nn.LayerNorm
+    attention: eqx.nn.MultiheadAttention
+    ff_in: eqx.nn.Linear
+    ff_out: eqx.nn.Linear
+
+    def __init__(self, dim: int, heads: int, mlp_dim: int, *, key: Array):
+        attn_key, ff1_key, ff2_key = jax.random.split(key, 3)
+        self.norm1 = eqx.nn.LayerNorm(dim)
+        self.norm2 = eqx.nn.LayerNorm(dim)
+        self.attention = eqx.nn.MultiheadAttention(
+            num_heads=heads, query_size=dim, key_size=dim, value_size=dim,
+            output_size=dim, dropout_p=0.0, key=attn_key,
+        )
+        self.ff_in = eqx.nn.Linear(dim, mlp_dim, key=ff1_key)
+        self.ff_out = eqx.nn.Linear(mlp_dim, dim, key=ff2_key)
+
+    def __call__(self, tokens: Array) -> Array:
+        length = tokens.shape[0]
+        index = jnp.arange(length)
+        causal_mask = index[:, None] >= index[None, :]
+        h = _layernorm_tokens(self.norm1, tokens)
+        tokens = tokens + self.attention(h, h, h, mask=causal_mask)
+        h = _layernorm_tokens(self.norm2, tokens)
+        h = jax.nn.gelu(_linear_tokens(self.ff_in, h))
+        return tokens + _linear_tokens(self.ff_out, h)
+
+
+class LikelihoodSequenceEmbedder(eqx.Module):
+    """Project and causally contextualise a variable prefix of noisy x observations.
+
+    Output token o can depend only on observations 0,...,o. One causal pass therefore provides
+    all prefix contexts used on the training step. If Omin=Omax=1, this is intentionally a
+    zero-parameter identity pass-through, matching the location-finding implementation.
+    """
+    input_projection: eqx.nn.Linear | None
+    blocks: tuple[CausalObservationBlock, ...]
+    final_norm: eqx.nn.LayerNorm | None
+    input_dim: int = eqx.field(static=True)
+    hidden_dim: int = eqx.field(static=True)
+    attention_heads: int = eqx.field(static=True)
+    bypass_single_observation: bool = eqx.field(static=True)
+
+    def __init__(self, cfg: Config, *, key: Array, input_dim: int = 1):
+        self.input_dim = int(input_dim)
+        self.bypass_single_observation = (
+            cfg.min_observations_per_step == 1 and cfg.max_observations_per_step == 1
+        )
+        if self.bypass_single_observation:
+            self.hidden_dim = self.input_dim
+            self.attention_heads = 0
+            self.input_projection = None
+            self.blocks = ()
+            self.final_norm = None
+            return
+        self.hidden_dim = int(cfg.likelihood_hidden_dim)
+        self.attention_heads = int(cfg.likelihood_heads)
+        keys = jax.random.split(key, cfg.likelihood_depth + 1)
+        self.input_projection = eqx.nn.Linear(self.input_dim, self.hidden_dim, key=keys[0])
+        self.blocks = tuple(
+            CausalObservationBlock(
+                self.hidden_dim,
+                self.attention_heads,
+                cfg.likelihood_mlp_ratio * self.hidden_dim,
+                key=keys[1 + i],
+            )
+            for i in range(cfg.likelihood_depth)
+        )
+        self.final_norm = eqx.nn.LayerNorm(self.hidden_dim)
+
+    def __call__(self, observation_tokens: Array) -> Array:
+        if self.bypass_single_observation:
+            if observation_tokens.shape[0] != 1:
+                raise ValueError("Single-observation likelihood bypass expects exactly one token.")
+            return observation_tokens
+        if self.input_projection is None or self.final_norm is None:
+            raise RuntimeError("Active likelihood Transformer is missing its learned layers.")
+        tokens = _linear_tokens(self.input_projection, observation_tokens)
+        for block in self.blocks:
+            tokens = block(tokens)
+        return _layernorm_tokens(self.final_norm, tokens)
+
+
 class AdaLNParticleBlock(eqx.Module):
-    """Permutation-equivariant particle self-attention conditioned by one x embedding."""
+    """Particle self-attention conditioned by the causal summary token for observations 1:o."""
     norm_attn: eqx.nn.LayerNorm
     norm_ff: eqx.nn.LayerNorm
     attention: eqx.nn.MultiheadAttention
@@ -360,22 +494,19 @@ class AdaLNParticleBlock(eqx.Module):
     ff_out: eqx.nn.Linear
     modulation: eqx.nn.Linear
 
-    def __init__(self, hidden: int, heads: int, mlp_dim: int, *, key: Array):
+    def __init__(
+        self, hidden: int, conditioning_dim: int, heads: int, mlp_dim: int, *, key: Array
+    ):
         k_attn, k_ff1, k_ff2, k_mod = jax.random.split(key, 4)
         self.norm_attn = eqx.nn.LayerNorm(hidden)
         self.norm_ff = eqx.nn.LayerNorm(hidden)
         self.attention = eqx.nn.MultiheadAttention(
-            num_heads=heads,
-            query_size=hidden,
-            key_size=hidden,
-            value_size=hidden,
-            output_size=hidden,
-            dropout_p=0.0,
-            key=k_attn,
+            num_heads=heads, query_size=hidden, key_size=hidden, value_size=hidden,
+            output_size=hidden, dropout_p=0.0, key=k_attn,
         )
         self.ff_in = eqx.nn.Linear(hidden, mlp_dim, key=k_ff1)
         self.ff_out = eqx.nn.Linear(mlp_dim, hidden, key=k_ff2)
-        modulation = eqx.nn.Linear(hidden, 6 * hidden, key=k_mod)
+        modulation = eqx.nn.Linear(conditioning_dim, 6 * hidden, key=k_mod)
         modulation = eqx.tree_at(lambda l: l.weight, modulation, jnp.zeros_like(modulation.weight))
         modulation = eqx.tree_at(lambda l: l.bias, modulation, jnp.zeros_like(modulation.bias))
         self.modulation = modulation
@@ -392,7 +523,7 @@ class AdaLNParticleBlock(eqx.Module):
 
 
 class CrossAttentionParticleBlock(eqx.Module):
-    """Particle self-attention followed by cross-attention to learned x-memory tokens."""
+    """Particle self-attention followed by cross-attention to the active causal prefix."""
     norm_self: eqx.nn.LayerNorm
     norm_cross: eqx.nn.LayerNorm
     memory_norm: eqx.nn.LayerNorm
@@ -402,28 +533,30 @@ class CrossAttentionParticleBlock(eqx.Module):
     ff_in: eqx.nn.Linear
     ff_out: eqx.nn.Linear
 
-    def __init__(self, hidden: int, heads: int, mlp_dim: int, *, key: Array):
+    def __init__(
+        self, hidden: int, memory_dim: int, heads: int, mlp_dim: int, *, key: Array
+    ):
         k_self, k_cross, k_ff1, k_ff2 = jax.random.split(key, 4)
         self.norm_self = eqx.nn.LayerNorm(hidden)
         self.norm_cross = eqx.nn.LayerNorm(hidden)
-        self.memory_norm = eqx.nn.LayerNorm(hidden)
+        self.memory_norm = eqx.nn.LayerNorm(memory_dim)
         self.norm_ff = eqx.nn.LayerNorm(hidden)
         self.self_attention = eqx.nn.MultiheadAttention(
             num_heads=heads, query_size=hidden, key_size=hidden, value_size=hidden,
             output_size=hidden, dropout_p=0.0, key=k_self,
         )
         self.cross_attention = eqx.nn.MultiheadAttention(
-            num_heads=heads, query_size=hidden, key_size=hidden, value_size=hidden,
+            num_heads=heads, query_size=hidden, key_size=memory_dim, value_size=memory_dim,
             output_size=hidden, dropout_p=0.0, key=k_cross,
         )
         self.ff_in = eqx.nn.Linear(hidden, mlp_dim, key=k_ff1)
         self.ff_out = eqx.nn.Linear(mlp_dim, hidden, key=k_ff2)
 
-    def __call__(self, particles: Array, conditioning: Array) -> Array:
+    def __call__(self, particles: Array, observation_memory: Array) -> Array:
         h = _layernorm_tokens(self.norm_self, particles)
         particles = particles + self.self_attention(h, h, h)
         q = _layernorm_tokens(self.norm_cross, particles)
-        memory = _layernorm_tokens(self.memory_norm, conditioning)
+        memory = _layernorm_tokens(self.memory_norm, observation_memory)
         particles = particles + self.cross_attention(q, memory, memory)
         h = _layernorm_tokens(self.norm_ff, particles)
         h = jax.nn.gelu(_linear_tokens(self.ff_in, h))
@@ -431,9 +564,9 @@ class CrossAttentionParticleBlock(eqx.Module):
 
 
 class ConditionalParticleTransport(eqx.Module):
+    """One direct prior->posterior map conditioned on a causal noisy-x likelihood sequence."""
     particle_in: eqx.nn.Linear
-    x_in: eqx.nn.Linear
-    x_out: eqx.nn.Linear
+    likelihood_embedder: LikelihoodSequenceEmbedder
     blocks: tuple[Any, ...]
     final_norm: eqx.nn.LayerNorm
     displacement_head: eqx.nn.Linear
@@ -444,25 +577,29 @@ class ConditionalParticleTransport(eqx.Module):
     y_scale: float = eqx.field(static=True)
     max_displacement: float = eqx.field(static=True)
     conditioning_type: str = eqx.field(static=True)
+    min_observations: int = eqx.field(static=True)
+    max_observations: int = eqx.field(static=True)
+    observation_context_dim: int = eqx.field(static=True)
 
     def __init__(self, cfg: Config, scaling: Scaling, *, key: Array):
-        keys = jax.random.split(key, cfg.posterior_depth + 5)
+        keys = jax.random.split(key, cfg.posterior_depth + 4)
         h = cfg.hidden_dim
-        self.particle_in = eqx.nn.Linear(1, h, key=keys[0])
-        self.x_in = eqx.nn.Linear(1, h, key=keys[1])
-        x_out_dim = h if cfg.posterior_conditioning == "adaln" else h * cfg.cross_attention_tokens
-        self.x_out = eqx.nn.Linear(h, x_out_dim, key=keys[2])
-        block_cls = (
-            AdaLNParticleBlock
-            if cfg.posterior_conditioning == "adaln"
-            else CrossAttentionParticleBlock
-        )
+        self.likelihood_embedder = LikelihoodSequenceEmbedder(cfg, input_dim=1, key=keys[0])
+        self.observation_context_dim = self.likelihood_embedder.hidden_dim
+        self.particle_in = eqx.nn.Linear(1, h, key=keys[1])
+        block_cls = AdaLNParticleBlock if cfg.posterior_conditioning == "adaln" else CrossAttentionParticleBlock
         self.blocks = tuple(
-            block_cls(h, cfg.heads, cfg.mlp_ratio * h, key=keys[3 + i])
+            block_cls(
+                h,
+                self.observation_context_dim,
+                cfg.heads,
+                cfg.mlp_ratio * h,
+                key=keys[2 + i],
+            )
             for i in range(cfg.posterior_depth)
         )
         self.final_norm = eqx.nn.LayerNorm(h)
-        head = eqx.nn.Linear(h, 1, key=keys[-2])
+        head = eqx.nn.Linear(h, 1, key=keys[-1])
         head = eqx.tree_at(lambda l: l.weight, head, jnp.zeros_like(head.weight))
         head = eqx.tree_at(lambda l: l.bias, head, jnp.zeros_like(head.bias))
         self.displacement_head = head
@@ -470,22 +607,68 @@ class ConditionalParticleTransport(eqx.Module):
         self.y_center, self.y_scale = scaling.y_center, scaling.y_scale
         self.max_displacement = cfg.max_normalized_displacement
         self.conditioning_type = cfg.posterior_conditioning
+        self.min_observations = int(cfg.min_observations_per_step)
+        self.max_observations = int(cfg.max_observations_per_step)
 
-    def __call__(self, prior_y: Array, x: Array) -> Array:
-        """prior_y [N], x [1] -> posterior_y [N], all in physical units."""
+    def encode_observations(self, x_observations: Array) -> Array:
+        """x_observations [O] physical units -> causal contexts [O,C]."""
+        xn = (x_observations - self.x_center) / self.x_scale
+        return self.likelihood_embedder(xn[:, None])
+
+    def transport_with_contexts(
+        self, prior_y: Array, observation_contexts: Array, observation_count: Array
+    ) -> Array:
+        """Direct prior -> posterior for one selected observation prefix."""
         yn = (prior_y - self.y_center) / self.y_scale
-        xn = (x - self.x_center) / self.x_scale
-        particles = _linear_tokens(self.particle_in, yn[:, None])
-        conditioning = self.x_out(jax.nn.silu(self.x_in(xn)))
+        count = jnp.clip(observation_count, 1, observation_contexts.shape[0]).astype(jnp.int32)
+
         if self.conditioning_type == "cross_attention":
-            conditioning = conditioning.reshape(-1, particles.shape[-1])
-        for block in self.blocks:
-            particles = block(particles, conditioning)
+            # Static branch shapes make memory[:o] legal inside JIT, exactly as in location finding.
+            def branch_for(prefix_length: int):
+                def transport(args):
+                    yn_local, full_memory = args
+                    particles = _linear_tokens(self.particle_in, yn_local[:, None])
+                    memory = full_memory[:prefix_length]
+                    for block in self.blocks:
+                        particles = block(particles, memory)
+                    return particles
+                return transport
+
+            branches = tuple(
+                branch_for(prefix_length)
+                for prefix_length in range(1, observation_contexts.shape[0] + 1)
+            )
+            particles = jax.lax.switch(count - 1, branches, (yn, observation_contexts))
+        else:
+            # Causal token o-1 summarizes exactly observations 1:o.
+            conditioning = observation_contexts[count - 1]
+            particles = _linear_tokens(self.particle_in, yn[:, None])
+            for block in self.blocks:
+                particles = block(particles, conditioning)
+
         particles = _layernorm_tokens(self.final_norm, particles)
         delta = self.max_displacement * jnp.tanh(
             _linear_tokens(self.displacement_head, particles)[:, 0]
         )
         return self.y_center + self.y_scale * (yn + delta)
+
+    def predict_prefixes(self, prior_y: Array, x_observations: Array) -> tuple[Array, Array]:
+        """Direct posterior for EVERY configured prefix from the SAME prior cloud.
+
+        This is not a posterior recurrence. The likelihood Transformer is run once over Omax
+        observations; then o=Omin,...,Omax independently conditions the same incoming prior.
+        """
+        contexts = self.encode_observations(x_observations)
+        prefix_counts = jnp.arange(self.min_observations, self.max_observations + 1, dtype=jnp.int32)
+        posterior_by_prefix = jax.vmap(
+            lambda count: self.transport_with_contexts(prior_y, contexts, count)
+        )(prefix_counts)
+        return posterior_by_prefix, prefix_counts
+
+    def __call__(self, prior_y: Array, x_observations: Array, observation_count: Array) -> Array:
+        """Evaluate one selected prefix. x_observations may have any supported static length."""
+        contexts = self.encode_observations(x_observations)
+        return self.transport_with_contexts(prior_y, contexts, observation_count)
 
 
 #%% 5) Training objective, interpolated priors, and historical-output replay
@@ -496,20 +679,38 @@ def empirical_energy_score_terms(posterior: Array, target: Array) -> tuple[Array
     return attraction - 0.5 * repulsion, attraction, repulsion
 
 
-def batch_metrics(posterior: Array, target: Array, cfg: Config = CFG) -> dict[str, Array]:
-    mean = jnp.mean(posterior, axis=1)
-    lo = jnp.quantile(posterior, cfg.interval_low_q, axis=1)
-    hi = jnp.quantile(posterior, cfg.interval_high_q, axis=1)
-    score, attraction, repulsion = jax.vmap(empirical_energy_score_terms)(posterior, target)
+def prefix_batch_metrics(
+    posterior_by_prefix: Array, target: Array, prefix_counts: Array, cfg: Config = CFG
+) -> dict[str, Array]:
+    """Metrics for [B,P,N] posterior clouds; scalar loss averages all rows and prefixes."""
+    mean = jnp.mean(posterior_by_prefix, axis=-1)  # [B,P]
+    lo = jnp.quantile(posterior_by_prefix, cfg.interval_low_q, axis=-1)
+    hi = jnp.quantile(posterior_by_prefix, cfg.interval_high_q, axis=-1)
+
+    def row_terms(prefix_clouds, yi):
+        return jax.vmap(lambda cloud: empirical_energy_score_terms(cloud, yi))(prefix_clouds)
+
+    score, attraction, repulsion = jax.vmap(row_terms)(posterior_by_prefix, target)
+    mse = (mean - target[:, None]) ** 2
+    coverage = (target[:, None] >= lo) & (target[:, None] <= hi)
+    width = hi - lo
+    spread = jnp.std(posterior_by_prefix, axis=-1)
     return {
         "loss": jnp.mean(score),
         "energy_score": jnp.mean(score),
+        "final_energy_score": jnp.mean(score[:, -1]),
         "attraction": jnp.mean(attraction),
         "repulsion": jnp.mean(repulsion),
-        "mean_mse": jnp.mean((mean - target) ** 2),
-        "coverage_95": jnp.mean((target >= lo) & (target <= hi)),
-        "interval_width": jnp.mean(hi - lo),
-        "posterior_std": jnp.mean(jnp.std(posterior, axis=1)),
+        "mean_mse": jnp.mean(mse),
+        "final_mean_mse": jnp.mean(mse[:, -1]),
+        "coverage_95": jnp.mean(coverage),
+        "final_coverage_95": jnp.mean(coverage[:, -1]),
+        "interval_width": jnp.mean(width),
+        "posterior_std": jnp.mean(spread),
+        "energy_by_o": jnp.mean(score, axis=0),
+        "mse_by_o": jnp.mean(mse, axis=0),
+        "coverage_by_o": jnp.mean(coverage, axis=0),
+        "prefix_counts": prefix_counts,
     }
 
 
@@ -534,7 +735,7 @@ def sample_interpolated_prior_np(
 
 
 class HistoricalOutputPriorBuffer:
-    """Detached posterior clouds plus the exact realised likelihood evidence that produced them."""
+    """Detached final-prefix clouds plus the exact full noisy-x evidence block."""
     def __init__(self, capacity: int):
         self.entries: deque[dict[str, Any]] = deque(maxlen=int(capacity))
 
@@ -552,7 +753,7 @@ class HistoricalOutputPriorBuffer:
             self.entries.append({
                 "prior": np.asarray(cloud, dtype=np.float32).copy(),
                 "x_pair": np.float32(xc),
-                "x_lik": np.float32(xo),
+                "x_lik": np.asarray(xo, dtype=np.float32).copy(),
                 "y": np.float32(yi),
             })
 
@@ -585,13 +786,17 @@ class HistoricalOutputPriorBuffer:
 def _transport_objective(
     model: ConditionalParticleTransport,
     prior: Array,
-    x: Array,
+    x_observations: Array,
     y: Array,
     cfg: Config,
 ) -> tuple[Array, tuple[dict[str, Array], Array]]:
-    posterior = jax.vmap(model)(prior, x[:, None])
-    metrics = batch_metrics(posterior, y, cfg)
-    return metrics["loss"], (metrics, posterior)
+    """Train every configured observation prefix from the same incoming prior cloud."""
+    posterior_by_prefix, prefix_counts = jax.vmap(
+        lambda p, obs: model.predict_prefixes(p, obs)
+    )(prior, x_observations)
+    metrics = prefix_batch_metrics(posterior_by_prefix, y, prefix_counts[0], cfg)
+    # Historical replay stores the final-prefix output, matching the location-finding design.
+    return metrics["loss"], (metrics, posterior_by_prefix[:, -1])
 
 
 _loss_and_grad = eqx.filter_value_and_grad(_transport_objective, has_aux=True)
@@ -599,13 +804,15 @@ _loss_and_grad = eqx.filter_value_and_grad(_transport_objective, has_aux=True)
 
 def make_train_step(optimizer: optax.GradientTransformation, cfg: Config):
     @eqx.filter_jit
-    def step(model, opt_state, prior, x, y):
-        (loss, (metrics, posterior)), grads = _loss_and_grad(model, prior, x, y, cfg)
+    def step(model, opt_state, prior, x_observations, y):
+        (loss, (metrics, final_posterior)), grads = _loss_and_grad(
+            model, prior, x_observations, y, cfg
+        )
         params = eqx.filter(model, eqx.is_array)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         model = eqx.apply_updates(model, updates)
         grad_norm = optax.global_norm(eqx.filter(grads, eqx.is_array))
-        return model, opt_state, loss, metrics, posterior, grad_norm
+        return model, opt_state, loss, metrics, final_posterior, grad_norm
     return step
 
 
@@ -629,7 +836,8 @@ def train_transport(
     replay_rng = np.random.default_rng(cfg.seed + 20_003)
     replay = HistoricalOutputPriorBuffer(cfg.historical_output_buffer_capacity)
     history = {name: [] for name in (
-        "step", "energy_score", "attraction", "repulsion", "mean_mse", "coverage_95",
+        "step", "energy_score", "final_energy_score", "attraction", "repulsion",
+        "mean_mse", "final_mean_mse", "coverage_95", "final_coverage_95",
         "interval_width", "posterior_std", "grad_norm", "replay_fraction", "buffer_size",
         "likelihood_noise_rms", "likelihood_mean_logpdf"
     )}
@@ -639,19 +847,23 @@ def train_transport(
         x_pair = x_train[ids].astype(np.float32)
         yb = y_train[ids].astype(np.float32)
         prior = sample_interpolated_prior_np(rng, yb, cfg, scaling)
-        x_lik = sample_likelihood_x_np(rng, x_pair, cfg)
+        # One observation == one independent Gaussian noise sample. Shape [B,Omax].
+        x_lik = sample_likelihood_x_np(
+            rng, x_pair, cfg, num_observations=cfg.max_observations_per_step
+        )
         prior, x_pair, x_lik, yb, n_replay = replay.mix_into_batch(
             prior, x_pair, x_lik, yb, replay_rng, cfg
         )
-        model, opt_state, loss, metrics, posterior, grad_norm = train_step(
+        model, opt_state, loss, metrics, final_posterior, grad_norm = train_step(
             model, opt_state, jnp.asarray(prior), jnp.asarray(x_lik), jnp.asarray(yb)
         )
         replay.add_batch(
-            np.asarray(jax.device_get(posterior)), x_pair, x_lik, yb
+            np.asarray(jax.device_get(final_posterior)), x_pair, x_lik, yb
         )
-        likelihood_noise = np.asarray(x_lik) - np.asarray(x_pair)
+
+        likelihood_noise = np.asarray(x_lik) - np.asarray(x_pair)[:, None]
         likelihood_logpdf = gaussian_likelihood_logpdf_np(
-            x_lik, x_pair, cfg.likelihood_x_noise_std
+            x_lik, np.asarray(x_pair)[:, None], cfg.likelihood_x_noise_std
         )
 
         # Collect EVERY optimizer step for dense training diagnostics. Printing can stay sparse.
@@ -659,10 +871,13 @@ def train_transport(
         values = {
             "step": float(step),
             "energy_score": float(host["energy_score"]),
+            "final_energy_score": float(host["final_energy_score"]),
             "attraction": float(host["attraction"]),
             "repulsion": float(host["repulsion"]),
             "mean_mse": float(host["mean_mse"]),
+            "final_mean_mse": float(host["final_mean_mse"]),
             "coverage_95": float(host["coverage_95"]),
+            "final_coverage_95": float(host["final_coverage_95"]),
             "interval_width": float(host["interval_width"]),
             "posterior_std": float(host["posterior_std"]),
             "grad_norm": float(jax.device_get(grad_norm)),
@@ -676,8 +891,9 @@ def train_transport(
 
         if step == 1 or step % cfg.log_every == 0 or step == cfg.epochs:
             print(
-                f"step {step:5d}/{cfg.epochs} | ES {values['energy_score']:.5f} | "
-                f"mean-MSE {values['mean_mse']:.5f} | cov95 {values['coverage_95']:.3f} | "
+                f"step {step:5d}/{cfg.epochs} | ES(all-o) {values['energy_score']:.5f} | "
+                f"ES(final-o) {values['final_energy_score']:.5f} | "
+                f"MSE(final-o) {values['final_mean_mse']:.5f} | "
                 f"replay {n_replay}/{cfg.batch_size} | x-noise-rms {values['likelihood_noise_rms']:.4f}"
             )
     return model, history
@@ -772,10 +988,14 @@ def print_model_parameter_counts(
 ) -> None:
     """Print all model sizes before the first optimizer/model-fit call."""
     print("\n--- model sizes: before any training ---")
+    transport_total = count_eqx_parameters(transport)
+    likelihood_params = count_eqx_parameters(transport.likelihood_embedder)
     print(
         f"Particle transport ({transport.conditioning_type}): "
-        f"{count_eqx_parameters(transport):,} trainable scalar parameters"
+        f"{transport_total:,} trainable scalar parameters"
     )
+    print(f"  Likelihood Transformer: {likelihood_params:,}")
+    print(f"  Posterior transport    : {transport_total - likelihood_params:,}")
     print(f"Standard MLP: {count_eqx_parameters(mlp):,} trainable scalar parameters")
     print(
         f"Gaussian Process: {int(gp.kernel.n_dims)} trainable kernel hyperparameters; "
@@ -791,16 +1011,20 @@ def plot_training(history: dict[str, list[float]], path: Path, cfg: Config = CFG
     s = np.asarray(history["step"])
     fig, axes = plt.subplots(2, 4, figsize=(22, 9.5))
 
-    axes[0, 0].plot(s, history["energy_score"], label="Energy score")
+    axes[0, 0].plot(s, history["energy_score"], label="Energy score (all prefixes)")
+    axes[0, 0].plot(s, history["final_energy_score"], label="Energy score (final prefix)", alpha=.75)
     axes[0, 0].plot(s, history["attraction"], label="Attraction", alpha=.7)
     axes[0, 0].plot(s, .5 * np.asarray(history["repulsion"]), label="0.5 repulsion", alpha=.7)
     axes[0, 0].set_title("Proper-score objective"); axes[0, 0].legend()
 
-    axes[0, 1].plot(s, history["mean_mse"])
+    axes[0, 1].plot(s, history["mean_mse"], label="all prefixes")
+    axes[0, 1].plot(s, history["final_mean_mse"], label="final prefix", alpha=.75)
+    axes[0, 1].legend()
     axes[0, 1].set_yscale("log")
     axes[0, 1].set_title("Posterior-mean MSE")
 
-    axes[0, 2].plot(s, history["coverage_95"], label="empirical coverage")
+    axes[0, 2].plot(s, history["coverage_95"], label="coverage (all prefixes)")
+    axes[0, 2].plot(s, history["final_coverage_95"], label="coverage (final prefix)", alpha=.75)
     axes[0, 2].axhline(.95, ls="--", lw=1, label="target 0.95")
     axes[0, 2].set_ylim(-.02, 1.02)
     axes[0, 2].set_title("95% interval coverage"); axes[0, 2].legend()
@@ -1346,9 +1570,36 @@ def _prior_bounds_summary(low: np.ndarray, high: np.ndarray) -> str:
     )
 
 
+def make_deployment_observation_block_np(
+    x: np.ndarray,
+    cfg: Config,
+    *,
+    num_observations: int | None = None,
+) -> np.ndarray:
+    """Build clean deployment likelihood observations; NO Gaussian noise is added here.
+
+    Multiple deployment observations are repeated clean measurements of the observed query x.
+    This preserves the earlier deployment rule while letting the trained likelihood Transformer
+    consume a configurable observation count.
+    """
+    n_obs = cfg.test_observations_per_step if num_observations is None else int(num_observations)
+    if not (cfg.min_observations_per_step <= n_obs <= cfg.max_observations_per_step):
+        raise ValueError(
+            "Deployment num_observations must lie in the trained prefix range "
+            f"[{cfg.min_observations_per_step}, {cfg.max_observations_per_step}]."
+        )
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    return np.repeat(x[:, None], n_obs, axis=1).astype(np.float32)
+
+
 @eqx.filter_jit
-def _predict_batch(model: ConditionalParticleTransport, prior: Array, x: Array) -> Array:
-    return jax.vmap(model)(prior, x[:, None])
+def _predict_batch(
+    model: ConditionalParticleTransport,
+    prior: Array,
+    x_observations: Array,
+    observation_count: Array,
+) -> Array:
+    return jax.vmap(lambda p, obs: model(p, obs, observation_count))(prior, x_observations)
 
 
 def predict_transport_from_bounds(
@@ -1360,12 +1611,13 @@ def predict_transport_from_bounds(
     *,
     seed: int,
     prior_mode: str,
+    num_observations: int | None = None,
 ) -> dict[str, np.ndarray]:
-    """Predict from already-built prior bounds.
+    """Predict from already-built prior bounds with clean deployment x observations.
 
-    Prior construction is intentionally separated from transport evaluation so the entire
-    prior range can be inspected and plotted BEFORE the model sees the test set. Evaluation
-    conditions on the actually observed query x; Gaussian perturbation is training-only.
+    Prior construction is intentionally separated from transport evaluation so the entire prior
+    range can be inspected BEFORE the model sees the test set. Deployment x is NOT noisified.
+    `num_observations` selects how many clean x tokens the likelihood Transformer receives.
     """
     x = np.asarray(x).reshape(-1)
     prior_low = np.asarray(prior_low, dtype=np.float32).reshape(-1)
@@ -1375,15 +1627,25 @@ def predict_transport_from_bounds(
     if np.any(prior_high <= prior_low):
         raise ValueError("Every evaluation prior interval must have positive width.")
 
+    n_obs = cfg.test_observations_per_step if num_observations is None else int(num_observations)
+    x_observations = make_deployment_observation_block_np(
+        x, cfg, num_observations=n_obs
+    )
+
     rng = np.random.default_rng(seed)
     clouds: list[np.ndarray] = []
     for start in range(0, len(x), cfg.eval_batch_size):
-        xb = x[start:start + cfg.eval_batch_size].astype(np.float32)
+        xb_obs = x_observations[start:start + cfg.eval_batch_size]
         lo = prior_low[start:start + cfg.eval_batch_size, None]
         hi = prior_high[start:start + cfg.eval_batch_size, None]
-        u = rng.uniform(0.0, 1.0, (len(xb), cfg.eval_particles)).astype(np.float32)
+        u = rng.uniform(0.0, 1.0, (len(xb_obs), cfg.eval_particles)).astype(np.float32)
         prior = (lo + (hi - lo) * u).astype(np.float32)
-        cloud = _predict_batch(model, jnp.asarray(prior), jnp.asarray(xb))
+        cloud = _predict_batch(
+            model,
+            jnp.asarray(prior),
+            jnp.asarray(xb_obs),
+            jnp.asarray(n_obs, dtype=jnp.int32),
+        )
         clouds.append(np.asarray(jax.device_get(cloud)))
     cloud = np.concatenate(clouds, axis=0)
     return {
@@ -1396,6 +1658,7 @@ def predict_transport_from_bounds(
         "prior_high": prior_high,
         "prior_width": prior_high - prior_low,
         "prior_mode": str(prior_mode),
+        "num_observations": int(n_obs),
     }
 
 
@@ -1576,7 +1839,8 @@ def plot_transport(
     )
 
     ax.set_title(
-        f"Conditional Particle Transport ({cfg.posterior_conditioning}; test prior={test_pred['prior_mode']})",
+        f"Conditional Particle Transport ({cfg.posterior_conditioning}; test prior={test_pred['prior_mode']}; "
+        f"o={test_pred.get('num_observations', '?')})",
         fontsize=21,
     )
     ax.set_ylabel("y")
@@ -1636,7 +1900,10 @@ def plot_comparison(
         axes[2], x_test, tr_test["mean"],
         label="Transport mean (test)", color="darkred", lw=2.5,
     )
-    axes[2].set_title(f"Particle Transport ({cfg.posterior_conditioning}; test prior={tr_test['prior_mode']})")
+    axes[2].set_title(
+        f"Particle Transport ({cfg.posterior_conditioning}; test prior={tr_test['prior_mode']}; "
+        f"o={tr_test.get('num_observations', '?')})"
+    )
     axes[2].legend(loc="lower right")
 
     fig.suptitle("Cosine regression: identical data split", fontsize=22)
@@ -1649,7 +1916,7 @@ def plot_comparison(
 # Change ONLY EVAL_MODE (and optionally EVAL_PRIOR_CFG fields), then rerun cells 10 and 11.
 # The transport, NN, and GP above are NOT retrained.
 EVAL_MODE = CFG.evaluation_prior_mode
-# EVAL_MODE = "nearest_training"
+EVAL_MODE = "cheating"
 
 # Examples -- all available immediately after training:
 # EVAL_MODE = "cheating"               # oracle upper benchmark
@@ -1706,12 +1973,20 @@ plot_evaluation_prior_ranges_from_bounds(
 
 
 #%% 11) Evaluate the already-trained models with the selected prior
+# Change this AFTER training to test a different number of likelihood observations.
+# No Gaussian noise is added at deployment: the clean x query is repeated this many times.
+DEPLOYMENT_OBSERVATIONS = CFG.test_observations_per_step
+# DEPLOYMENT_OBSERVATIONS = 1
+# DEPLOYMENT_OBSERVATIONS = 3
+# DEPLOYMENT_OBSERVATIONS = CFG.max_observations_per_step
+
 # Train-set diagnostics remain on the widest prior to avoid a self-informed local/oracle train prior.
 # Those bounds were already constructed and displayed in the prior-inspection cell above.
 tr_train = predict_transport_from_bounds(
     transport, X_train, train_prior_low, train_prior_high, CFG,
     seed=CFG.seed + 30_001,
     prior_mode="widest",
+    num_observations=DEPLOYMENT_OBSERVATIONS,
 )
 
 # The test prior bounds above have already been plotted and inspected before this model call.
@@ -1719,6 +1994,7 @@ tr_test = predict_transport_from_bounds(
     transport, X_test, test_prior_low, test_prior_high, CFG,
     seed=CFG.seed + 30_002,
     prior_mode=EVAL_MODE,
+    num_observations=DEPLOYMENT_OBSERVATIONS,
 )
 
 tr_train_metrics = evaluate_transport(tr_train, Y_train)
@@ -1728,6 +2004,7 @@ metrics = {
     "particle_transport": {"train": tr_train_metrics, "test": tr_test_metrics},
     **baseline_metrics,
     "evaluation_prior_mode": EVAL_MODE,
+    "deployment_observations": int(DEPLOYMENT_OBSERVATIONS),
     "scaling": asdict(scaling),
     "config": asdict(CFG),
 }
@@ -1738,7 +2015,8 @@ print(f"GP        train MSE={metrics['gp']['train_mse']:.6f} test MSE={metrics['
 print(
     f"Transport train MSE={tr_train_metrics['mse']:.6f} test MSE={tr_test_metrics['mse']:.6f} | "
     f"test ES={tr_test_metrics['energy_score']:.6f} cov95={tr_test_metrics['coverage_95']:.3f} | "
-    f"prior={EVAL_MODE} mean-width={tr_test_metrics['mean_prior_width']:.3f}"
+    f"prior={EVAL_MODE} mean-width={tr_test_metrics['mean_prior_width']:.3f} | "
+    f"likelihood observations={DEPLOYMENT_OBSERVATIONS}"
 )
 
 # Mode-specific filenames preserve previous evaluation experiments instead of overwriting them.
