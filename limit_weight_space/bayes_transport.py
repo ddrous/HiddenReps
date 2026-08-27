@@ -1,4 +1,4 @@
-#%% Minimal Bayes-transport-style supervised cosine regression
+#%% 0) Imports and experiment overview
 """Conditional empirical-posterior regression from observed (x, y) pairs only.
 
 A uniform cloud of candidate y values is transported by one particle Transformer.
@@ -59,7 +59,7 @@ plt.rcParams.update({
 Array = jax.Array
 
 
-#%% 1) Configuration and data: identical benchmark convention to nn.py / gp.py
+#%% 1) Configuration and data helpers: identical benchmark convention to nn.py / gp.py
 @dataclass
 class Config:
     seed: int = 2028
@@ -71,22 +71,22 @@ class Config:
 
     # Particle transport.
     num_particles: int = 16
-    eval_particles: int = 256
+    eval_particles: int = 64
     hidden_dim: int = 64
     heads: int = 4
     mlp_ratio: int = 4
     posterior_depth: int = 3
-    posterior_conditioning: str = "adaln"  # {"adaln", "cross_attention"}
+    posterior_conditioning: str = "cross_attention"  # {"adaln", "cross_attention"}
     cross_attention_tokens: int = 1  # learned x-memory tokens when cross-attention is selected
     max_normalized_displacement: float = 5.0
 
     # Training: one epoch = one observed-data minibatch / optimizer step.
-    epochs: int = 5000
+    epochs: int = 50000
     batch_size: int = 64*4
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     grad_clip_norm: float = 5.0
-    log_every: int = 250
+    log_every: int = 1250
 
     # ONE widest uniform y-prior support. Fresh training interpolation clouds always
     # come from this support. Evaluation may reuse it, use a nearest-training local prior,
@@ -107,8 +107,8 @@ class Config:
     #       With prior=[-2,2] and fraction=0.5, this gives U(y*-1, y*+1).
     #   "widest": reuse the full configured training support.
     #   "nearest_training": infer a local support only from nearby known training (x,y) pairs.
-    evaluation_prior_mode: str = "cheating"  # {"cheating", "widest", "nearest_training"}
-    cheating_prior_width_fraction: float = 0.50
+    evaluation_prior_mode: str = "widest"  # {"cheating", "widest", "nearest_training"}
+    cheating_prior_width_fraction: float = 0.90
     eval_local_prior_k: int = 64
     eval_local_prior_margin: float = 0.25
     eval_local_prior_min_width: float = 1.00
@@ -215,6 +215,104 @@ def make_scaling(x_train: np.ndarray, y_train: np.ndarray, cfg: Config = CFG) ->
     )
 
 
+
+
+# Larger notebook plotting defaults. These are presentation settings, not model hyperparameters.
+plt.rcParams.update({
+    "savefig.facecolor": "white",
+    "figure.facecolor": "white",
+    "axes.titlesize": 20,
+    "axes.labelsize": 18,
+    "xtick.labelsize": 15,
+    "ytick.labelsize": 15,
+    "legend.fontsize": 13,
+})
+
+
+def _save_and_show(fig, path: Path, cfg: Config) -> None:
+    """Persist a figure and also render it inline when requested."""
+    fig.savefig(path, bbox_inches="tight")
+    if cfg.show_plots:
+        if ipy_display is not None:
+            ipy_display(fig)
+        else:
+            plt.show()
+    plt.close(fig)
+
+
+def plot_data_split(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_test: np.ndarray,
+    y_test: np.ndarray,
+    path: Path,
+    cfg: Config = CFG,
+) -> None:
+    """Visualize the fixed train/test split before any model is defined or trained."""
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+    x_all = np.concatenate([x_train, x_test])
+    y_all = np.concatenate([y_train, y_test])
+    ix = np.argsort(x_all)
+    ax.plot(x_all[ix], y_all[ix], c="black", linewidth=2.5, alpha=.8, label="Observed cosine relation")
+    ax.scatter(x_train, y_train, s=26, alpha=.55, label="Training data")
+    ax.scatter(x_test, y_test, s=26, alpha=.55, label="Test/OOD data")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Cosine regression data and fixed segment split")
+    ax.grid(alpha=.15)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
+
+
+#%% 2) Load data, create output directory, and visualise the benchmark split
+validate_config(CFG)
+out = Path(CFG.output_dir)
+out.mkdir(parents=True, exist_ok=True)
+
+X_train, Y_train, X_test, Y_test = gen_data(CFG)
+scaling = make_scaling(X_train, Y_train, CFG)
+
+print("\n--- data / experiment setup: before training ---")
+print(f"Train samples: {len(X_train)} | Test/OOD samples: {len(X_test)}")
+conditioning_detail = (
+    f"{CFG.posterior_conditioning} ({CFG.cross_attention_tokens} learned x-memory tokens)"
+    if CFG.posterior_conditioning == "cross_attention"
+    else CFG.posterior_conditioning
+)
+print(f"Posterior conditioning: {conditioning_detail}")
+print(
+    f"WIDEST UNIFORM TRAINING PRIOR = U({scaling.prior_low:.3f}, {scaling.prior_high:.3f}) "
+    f"| width={scaling.prior_high - scaling.prior_low:.3f} | center={scaling.y_center:.3f}"
+)
+print(
+    f"Gaussian x-likelihood during training: x_lik ~ N(x_pair, {CFG.likelihood_x_noise_std:.4f}^2). "
+    "Deployment/evaluation x is NOT noisified."
+)
+print(f"Configured evaluation prior mode: {CFG.evaluation_prior_mode}")
+train_inside = np.mean((Y_train >= scaling.prior_low) & (Y_train <= scaling.prior_high))
+test_inside = np.mean((Y_test >= scaling.prior_low) & (Y_test <= scaling.prior_high))
+print(
+    f"Train y: min={Y_train.min():.3f} max={Y_train.max():.3f} "
+    f"mean={Y_train.mean():.3f} std={Y_train.std():.3f} | inside widest prior={train_inside:.3%}"
+)
+print(
+    f"Test  y: min={Y_test.min():.3f} max={Y_test.max():.3f} "
+    f"mean={Y_test.mean():.3f} std={Y_test.std():.3f} | inside widest prior={test_inside:.3%}"
+)
+print(
+    f"truth_anchor_probability={CFG.truth_anchor_probability:.3f} | "
+    f"historical_replay_probability={CFG.historical_output_prior_probability:.3f} | "
+    f"train/eval particles={CFG.num_particles}/{CFG.eval_particles}"
+)
+if train_inside < 1.0 or test_inside < 1.0:
+    print("WARNING: some observed y values lie outside the configured widest prior support.")
+plot_data_split(X_train, Y_train, X_test, Y_test, out / "data_split.pdf", CFG)
+
+
+
+#%% 3) Training utilities: Gaussian likelihood helpers
+
 def sample_likelihood_x_np(
     rng: np.random.Generator,
     x_pair: np.ndarray,
@@ -238,151 +336,9 @@ def gaussian_likelihood_logpdf_np(
     return -0.5 * z**2 - np.log(float(std) * np.sqrt(2.0 * np.pi))
 
 
-def evaluation_prior_bounds_np(
-    x_query: np.ndarray,
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    scaling: Scaling,
-    cfg: Config,
-    *,
-    mode: str | None = None,
-    y_query_oracle: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return one evaluation y-prior interval per query x.
-
-    ``cheating`` deliberately uses the true query label as oracle/domain-expert information.
-    ``widest`` and ``nearest_training`` remain deployable without query labels.
-    """
-    mode = cfg.evaluation_prior_mode if mode is None else str(mode)
-    x_query = np.asarray(x_query, dtype=np.float64).reshape(-1)
-    x_train = np.asarray(x_train, dtype=np.float64).reshape(-1)
-    y_train = np.asarray(y_train, dtype=np.float64).reshape(-1)
-    if mode == "cheating":
-        if y_query_oracle is None:
-            raise ValueError(
-                "cheating evaluation prior requires y_query_oracle (the known evaluation labels)."
-            )
-        y_oracle = np.asarray(y_query_oracle, dtype=np.float64).reshape(-1)
-        if len(y_oracle) != len(x_query):
-            raise ValueError("y_query_oracle must have the same length as x_query.")
-        widest_width = float(scaling.prior_high - scaling.prior_low)
-        cheating_width = float(cfg.cheating_prior_width_fraction) * widest_width
-        half = 0.5 * cheating_width
-        low = y_oracle - half
-        high = y_oracle + half
-        return low.astype(np.float32), high.astype(np.float32)
-    if mode == "widest":
-        low = np.full(len(x_query), scaling.prior_low, dtype=np.float32)
-        high = np.full(len(x_query), scaling.prior_high, dtype=np.float32)
-        return low, high
-    if mode != "nearest_training":
-        raise ValueError(f"Unknown evaluation prior mode: {mode!r}")
-    if len(x_train) < 1:
-        raise ValueError("nearest_training prior requires at least one training pair.")
-
-    k = min(int(cfg.eval_local_prior_k), len(x_train))
-    distances = np.abs(x_query[:, None] - x_train[None, :])
-    nearest = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
-    local_y = y_train[nearest]
-    raw_low = np.min(local_y, axis=1)
-    raw_high = np.max(local_y, axis=1)
-    center = 0.5 * (raw_low + raw_high)
-    half = 0.5 * (raw_high - raw_low) + float(cfg.eval_local_prior_margin)
-    half = np.maximum(half, 0.5 * float(cfg.eval_local_prior_min_width))
-
-    if cfg.eval_local_prior_clip_to_global:
-        global_width = float(scaling.prior_high - scaling.prior_low)
-        width = np.minimum(2.0 * half, global_width)
-        half = 0.5 * width
-        center = np.clip(
-            center,
-            float(scaling.prior_low) + half,
-            float(scaling.prior_high) - half,
-        )
-    low = center - half
-    high = center + half
-    return low.astype(np.float32), high.astype(np.float32)
 
 
-def _prior_bounds_summary(low: np.ndarray, high: np.ndarray) -> str:
-    width = np.asarray(high) - np.asarray(low)
-    center = 0.5 * (np.asarray(low) + np.asarray(high))
-    return (
-        f"width min/median/max={width.min():.3f}/{np.median(width):.3f}/{width.max():.3f} | "
-        f"center min/median/max={center.min():.3f}/{np.median(center):.3f}/{center.max():.3f}"
-    )
-
-
-def print_experiment_setup(
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    x_test: np.ndarray,
-    y_test: np.ndarray,
-    scaling: Scaling,
-    cfg: Config,
-) -> None:
-    """Print data/support diagnostics before any model is trained."""
-    prior_width = scaling.prior_high - scaling.prior_low
-    train_inside = np.mean((y_train >= scaling.prior_low) & (y_train <= scaling.prior_high))
-    test_inside = np.mean((y_test >= scaling.prior_low) & (y_test <= scaling.prior_high))
-    print("\n--- experiment setup: before training ---")
-    print(f"Train samples: {len(x_train)} | Test/OOD samples: {len(x_test)}")
-    conditioning_detail = (
-        f"{cfg.posterior_conditioning} ({cfg.cross_attention_tokens} learned x-memory tokens)"
-        if cfg.posterior_conditioning == "cross_attention"
-        else cfg.posterior_conditioning
-    )
-    print(f"Posterior conditioning: {conditioning_detail}")
-    print(
-        f"WIDEST UNIFORM PRIOR = U({scaling.prior_low:.3f}, {scaling.prior_high:.3f}) "
-        f"| width={prior_width:.3f} | center={scaling.y_center:.3f}"
-    )
-    print("The widest prior is ALWAYS used for fresh training interpolation clouds.")
-    print(
-        f"Gaussian x-likelihood: x_lik ~ N(x_pair, {cfg.likelihood_x_noise_std:.4f}^2); "
-        "the realised x_lik conditions the transport."
-    )
-    print(f"Evaluation/deployment prior mode: {cfg.evaluation_prior_mode}")
-    if cfg.evaluation_prior_mode == "cheating":
-        cheat_low, cheat_high = evaluation_prior_bounds_np(
-            x_test, x_train, y_train, scaling, cfg, mode="cheating",
-            y_query_oracle=y_test,
-        )
-        widest_width = scaling.prior_high - scaling.prior_low
-        print(
-            "CHEATING/ORACLE prior: centre = true test label y* | "
-            f"full width={cfg.cheating_prior_width_fraction:.3f} x widest training width "
-            f"({widest_width:.3f}) = {(cheat_high[0]-cheat_low[0]):.3f}"
-        )
-        print("Test/OOD cheating-prior statistics: " + _prior_bounds_summary(cheat_low, cheat_high))
-    elif cfg.evaluation_prior_mode == "nearest_training":
-        local_low, local_high = evaluation_prior_bounds_np(
-            x_test, x_train, y_train, scaling, cfg, mode="nearest_training"
-        )
-        print(
-            f"Local prior from k={min(cfg.eval_local_prior_k, len(x_train))} nearest training x's | "
-            f"margin={cfg.eval_local_prior_margin:.3f} | min width={cfg.eval_local_prior_min_width:.3f} | "
-            f"clip_to_global={cfg.eval_local_prior_clip_to_global}"
-        )
-        print("Test/OOD local-prior statistics: " + _prior_bounds_summary(local_low, local_high))
-    print(
-        f"Train y: min={y_train.min():.3f} max={y_train.max():.3f} "
-        f"mean={y_train.mean():.3f} std={y_train.std():.3f} | inside prior={train_inside:.3%}"
-    )
-    print(
-        f"Test  y: min={y_test.min():.3f} max={y_test.max():.3f} "
-        f"mean={y_test.mean():.3f} std={y_test.std():.3f} | inside prior={test_inside:.3%}"
-    )
-    print(
-        f"truth_anchor_probability={cfg.truth_anchor_probability:.3f} | "
-        f"historical_replay_probability={cfg.historical_output_prior_probability:.3f} | "
-        f"train/eval particles={cfg.num_particles}/{cfg.eval_particles}"
-    )
-    if train_inside < 1.0 or test_inside < 1.0:
-        print("WARNING: some observed y values lie outside the configured prior support.")
-
-
-#%% 2) The only learned transport: selectable AdaLN or x cross-attention conditioning
+#%% 4) Training model: selectable AdaLN or x cross-attention conditioning
 def _linear_tokens(layer: eqx.nn.Linear, x: Array) -> Array:
     return jax.vmap(layer)(x)
 
@@ -532,7 +488,7 @@ class ConditionalParticleTransport(eqx.Module):
         return self.y_center + self.y_scale * (yn + delta)
 
 
-#%% 3) Proper energy score, interpolated priors, and historical-output replay
+#%% 5) Training objective, interpolated priors, and historical-output replay
 def empirical_energy_score_terms(posterior: Array, target: Array) -> tuple[Array, Array, Array]:
     """1-D empirical ES: E|Y-y*| - 1/2 E|Y-Y'|."""
     attraction = jnp.mean(jnp.abs(posterior - target))
@@ -625,7 +581,7 @@ class HistoricalOutputPriorBuffer:
         return prior, x_pair, x_lik, y, int(len(selected))
 
 
-#%% 4) Train / evaluate particle transport
+#%% 6) Training loop for particle transport
 def _transport_objective(
     model: ConditionalParticleTransport,
     prior: Array,
@@ -727,83 +683,7 @@ def train_transport(
     return model, history
 
 
-@eqx.filter_jit
-def _predict_batch(model: ConditionalParticleTransport, prior: Array, x: Array) -> Array:
-    return jax.vmap(model)(prior, x[:, None])
-
-
-def predict_transport(
-    model: ConditionalParticleTransport,
-    x: np.ndarray,
-    scaling: Scaling,
-    cfg: Config,
-    *,
-    seed: int,
-    x_train_reference: np.ndarray,
-    y_train_reference: np.ndarray,
-    prior_mode: str | None = None,
-    y_query_oracle: np.ndarray | None = None,
-) -> dict[str, np.ndarray]:
-    """Predict using cheating, widest, or nearest-training prior support.
-
-    Evaluation conditions on the actually observed query x. Gaussian perturbation is a
-    training likelihood model; we do not randomly corrupt the deployment observation here.
-    In ``cheating`` mode, ``y_query_oracle`` is intentionally used to centre the prior.
-    """
-    prior_mode = cfg.evaluation_prior_mode if prior_mode is None else str(prior_mode)
-    prior_low, prior_high = evaluation_prior_bounds_np(
-        x, x_train_reference, y_train_reference, scaling, cfg, mode=prior_mode,
-        y_query_oracle=y_query_oracle,
-    )
-    rng = np.random.default_rng(seed)
-    clouds: list[np.ndarray] = []
-    for start in range(0, len(x), cfg.eval_batch_size):
-        xb = x[start:start + cfg.eval_batch_size].astype(np.float32)
-        lo = prior_low[start:start + cfg.eval_batch_size, None]
-        hi = prior_high[start:start + cfg.eval_batch_size, None]
-        u = rng.uniform(0.0, 1.0, (len(xb), cfg.eval_particles)).astype(np.float32)
-        prior = (lo + (hi - lo) * u).astype(np.float32)
-        cloud = _predict_batch(model, jnp.asarray(prior), jnp.asarray(xb))
-        clouds.append(np.asarray(jax.device_get(cloud)))
-    cloud = np.concatenate(clouds, axis=0)
-    return {
-        "cloud": cloud,
-        "mean": cloud.mean(axis=1),
-        "std": cloud.std(axis=1),
-        "low": np.quantile(cloud, cfg.interval_low_q, axis=1),
-        "high": np.quantile(cloud, cfg.interval_high_q, axis=1),
-        "prior_low": prior_low,
-        "prior_high": prior_high,
-        "prior_width": prior_high - prior_low,
-        "prior_mode": prior_mode,
-    }
-
-
-def _energy_score_np_1d(cloud: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Exact 1-D empirical ES without materialising an [B,N,N] array."""
-    attraction = np.mean(np.abs(cloud - y[:, None]), axis=1)
-    z = np.sort(cloud, axis=1)
-    n = z.shape[1]
-    coeff = (2.0 * np.arange(n) - n + 1.0)[None, :]
-    pairwise_mean = (2.0 / (n * n)) * np.sum(coeff * z, axis=1)
-    return attraction - 0.5 * pairwise_mean
-
-
-def evaluate_transport(pred: dict[str, np.ndarray], y: np.ndarray) -> dict[str, float]:
-    return {
-        "mse": float(np.mean((pred["mean"] - y) ** 2)),
-        "mae": float(np.mean(np.abs(pred["mean"] - y))),
-        "energy_score": float(np.mean(_energy_score_np_1d(pred["cloud"], y))),
-        "coverage_95": float(np.mean((y >= pred["low"]) & (y <= pred["high"]))),
-        "mean_interval_width": float(np.mean(pred["high"] - pred["low"])),
-        "mean_posterior_std": float(np.mean(pred["std"])),
-        "mean_prior_width": float(np.mean(pred["prior_width"])),
-        "min_prior_width": float(np.min(pred["prior_width"])),
-        "max_prior_width": float(np.max(pred["prior_width"])),
-    }
-
-
-#%% 5) Baselines, kept in the same experiment for a strict split comparison
+#%% 7) Baselines, kept in the same experiment for a strict split comparison
 class StandardMLP(eqx.Module):
     layers: tuple[Any, ...]
 
@@ -903,32 +783,13 @@ def print_model_parameter_counts(
     )
 
 
-#%% 6) Diagnostics and final comparison plots
-def _save_and_show(fig, path: Path, cfg: Config) -> None:
-    """Persist a figure and also render it inline when requested."""
-    fig.savefig(path, bbox_inches="tight")
-    if cfg.show_plots:
-        if ipy_display is not None:
-            ipy_display(fig)
-        else:
-            plt.show()
-    plt.close(fig)
 
-
-def _true_line(ax, x_train, y_train, x_test, y_test):
-    x = np.concatenate([x_train, x_test])
-    y = np.concatenate([y_train, y_test])
-    ix = np.argsort(x)
-    ax.plot(x[ix], y[ix], c="k", linewidth=3, label="True Func.")
-    ax.set_ylim(-2.5, 2.5)
-    ax.grid(alpha=0.1)
-    ax.set_xlabel("x")
 
 
 def plot_training(history: dict[str, list[float]], path: Path, cfg: Config = CFG) -> None:
     """Visualize every collected optimizer step; history is intentionally dense, not log-subsampled."""
     s = np.asarray(history["step"])
-    fig, axes = plt.subplots(2, 4, figsize=(20, 8.5))
+    fig, axes = plt.subplots(2, 4, figsize=(22, 9.5))
 
     axes[0, 0].plot(s, history["energy_score"], label="Energy score")
     axes[0, 0].plot(s, history["attraction"], label="Attraction", alpha=.7)
@@ -968,46 +829,760 @@ def plot_training(history: dict[str, list[float]], path: Path, cfg: Config = CFG
     for ax in axes.flat:
         ax.grid(alpha=.15)
         ax.set_xlabel("optimizer step")
-    fig.suptitle(f"Per-step transport diagnostics ({cfg.posterior_conditioning})")
-    fig.tight_layout(); _save_and_show(fig, path, cfg)
+        ax.tick_params(axis="both", labelsize=14)
+    fig.suptitle(f"Per-step transport diagnostics ({cfg.posterior_conditioning})", fontsize=22)
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
+
+
+
+#%% 8) Build and train all models ONCE
+# Build EVERY model before training so sizes are known before the first optimization/fit call.
+transport_init = ConditionalParticleTransport(CFG, scaling, key=jax.random.key(CFG.seed))
+nn_init = StandardMLP(CFG, key=jax.random.key(CFG.seed))
+gp_init = make_gp(CFG)
+print_model_parameter_counts(transport_init, nn_init, gp_init, len(X_train))
+
+print("\n--- training particle transport ---")
+transport, history = train_transport(
+    X_train, Y_train, scaling, CFG, model=transport_init
+)
+
+print("\n--- training standard MLP ONCE ---")
+nn_model = train_mlp(X_train, Y_train, CFG, model=nn_init)
+nn_train = predict_mlp(nn_model, X_train)
+nn_test = predict_mlp(nn_model, X_test)
+
+print("\n--- fitting Gaussian Process ONCE ---")
+gp = fit_gp(gp_init, X_train, Y_train)
+gp_train, gp_train_std = gp.predict(X_train[:, None], return_std=True)
+gp_test, gp_test_std = gp.predict(X_test[:, None], return_std=True)
+
+# Baseline metrics are cached here and reused by every later transport-prior evaluation.
+mse = lambda y, p: float(np.mean((y - p) ** 2))
+baseline_metrics = {
+    "mlp": {"train_mse": mse(Y_train, nn_train), "test_mse": mse(Y_test, nn_test)},
+    "gp": {
+        "train_mse": mse(Y_train, gp_train),
+        "test_mse": mse(Y_test, gp_test),
+        "train_coverage_95": float(np.mean(np.abs(Y_train - gp_train) <= 1.96 * gp_train_std)),
+        "test_coverage_95": float(np.mean(np.abs(Y_test - gp_test) <= 1.96 * gp_test_std)),
+    },
+}
+
+with (out / "training_history.json").open("w") as f:
+    json.dump(history, f, indent=2)
+eqx.tree_serialise_leaves(out / "particle_transport.eqx", transport)
+plot_training(history, out / "transport_training_diagnostics.pdf", CFG)
+
+print("\nTraining is complete. Re-run only the evaluation cells below to try new prior modes.")
+
+
+
+#%% 9) Functions useful for evaluation and test-time prior experiments
+
+# All settings below are EVALUATION-ONLY. They can be changed after the transport, NN, and GP
+# have been trained. Nothing in this dataclass enters transport/NN/GP training.
+@dataclass
+class EvaluationPriorConfig:
+    # GP-informed priors reuse the GP that was already fitted ONCE in cell 8.
+    gp_interval_z: float = 1.96
+
+    # Smooth kernel/locality calculations. This is NOT a learned hyperparameter.
+    kernel_length_scale: float = 0.15
+    kernel_eps: float = 1e-12
+
+    # GP-like kernel-support prior: narrow/local near support, widest/global far from support.
+    kernel_support_local_width_fraction: float = 0.50
+
+    # Extremely simple nearest-output prior.
+    nearest_fixed_width_fraction: float = 0.50
+
+    # Local-variance / local-linear bounds.
+    local_std_multiplier: float = 2.0
+    local_linear_k: int = 64
+
+    # Simple k-neighbour quantile/envelope rules.
+    knn_quantile_low: float = 0.05
+    knn_quantile_high: float = 0.95
+    simple_margin: float = 0.25
+    simple_min_width: float = 1.00
+
+    # Distance-expanded kNN envelope: add this fraction of the widest prior for each
+    # kernel-length-scale of distance from the nearest training x, capped at widest width.
+    distance_envelope_growth: float = 0.50
+
+    # Split-conformal-style calibration used only to choose a bound width. No model is trained.
+    conformal_alpha: float = 0.05
+    conformal_calibration_fraction: float = 0.20
+
+    # New evaluation modes may extend beyond the widest training support. Set True if you want
+    # every new mode forcibly clipped back to [CFG.prior_min, CFG.prior_max]. Existing
+    # nearest_training keeps using CFG.eval_local_prior_clip_to_global exactly as before.
+    clip_new_modes_to_global: bool = False
+
+
+EVAL_PRIOR_CFG = EvaluationPriorConfig()
+
+
+AVAILABLE_EVAL_PRIOR_MODES = {
+    # Existing modes.
+    "cheating": "oracle label centre; diagnostic upper benchmark only",
+    "widest": "the same fixed widest support used for fresh training clouds",
+    "nearest_training": "kNN min/max y envelope + fixed margin (existing method)",
+
+    # GP-informed modes: reuse the already fitted GP; NEVER refit it here.
+    "gp_variance_matched": "uniform with GP predictive mean and the same predictive variance",
+    "gp_95": "uniform whose bounds equal GP mean +/- configured z * GP predictive std",
+
+    # GP-like but no GP is used or fitted.
+    "kernel_support": "kernel local centre; width and centre revert toward the global prior OOD",
+    "nearest_distance": "nearest observed y centre; width grows smoothly with distance to support",
+    "kernel_local_variance": "kernel local mean/std plus support-dependent OOD widening",
+    "local_linear": "local weighted linear extrapolation plus residual/support-dependent width",
+    "conformal_kernel": "split-conformal-style constant residual bound around a kernel centre",
+    "kernel_conformal": "conformal in-domain width that widens toward the global prior OOD",
+
+    # Very simple, deliberately non-GP ideas: just construct a plausible interval.
+    "train_y_range": "same observed training-y min/max envelope everywhere, plus a margin",
+    "nearest_y_fixed": "nearest training y as centre with one fixed width everywhere",
+    "knn_quantile": "local kNN y quantiles + margin; robust to extreme neighbours",
+    "knn_range_distance": "local kNN min/max envelope that widens with distance from support",
+}
+
+
+def print_evaluation_prior_catalog() -> None:
+    print("\nAvailable post-training evaluation-prior modes:")
+    for name, description in AVAILABLE_EVAL_PRIOR_MODES.items():
+        print(f"  {name:22s} : {description}")
+
+
+def _as_1d_float(x: np.ndarray) -> np.ndarray:
+    return np.asarray(x, dtype=np.float64).reshape(-1)
+
+
+def _global_prior_geometry(scaling: Scaling) -> tuple[float, float, float]:
+    low = float(scaling.prior_low)
+    high = float(scaling.prior_high)
+    return 0.5 * (low + high), high - low, 0.5 * (high - low)
+
+
+def _ensure_min_width(
+    center: np.ndarray,
+    half: np.ndarray | float,
+    min_width: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    center = _as_1d_float(center)
+    half = np.broadcast_to(np.asarray(half, dtype=np.float64), center.shape).copy()
+    half = np.maximum(half, 0.5 * float(min_width))
+    return center - half, center + half
+
+
+def _clip_bounds_to_global_if_requested(
+    low: np.ndarray,
+    high: np.ndarray,
+    scaling: Scaling,
+    *,
+    clip: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    low = _as_1d_float(low)
+    high = _as_1d_float(high)
+    if not clip:
+        return low, high
+    width = high - low
+    global_width = float(scaling.prior_high - scaling.prior_low)
+    width = np.minimum(width, global_width)
+    half = 0.5 * width
+    center = 0.5 * (low + high)
+    center = np.clip(
+        center,
+        float(scaling.prior_low) + half,
+        float(scaling.prior_high) - half,
+    )
+    return center - half, center + half
+
+
+def _nearest_indices_and_distances(
+    x_query: np.ndarray,
+    x_train: np.ndarray,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    x_query = _as_1d_float(x_query)
+    x_train = _as_1d_float(x_train)
+    if len(x_train) == 0:
+        raise ValueError("At least one training pair is required to construct this prior.")
+    k = min(max(int(k), 1), len(x_train))
+    distances = np.abs(x_query[:, None] - x_train[None, :])
+    nearest = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
+    nearest_distance = np.min(distances, axis=1)
+    return nearest, nearest_distance
+
+
+def _support_score_from_distance(distance: np.ndarray, length_scale: float) -> np.ndarray:
+    """Simple support score in [0,1]: 1 near training x, ->0 away from support."""
+    ell = max(float(length_scale), 1e-12)
+    d = np.asarray(distance, dtype=np.float64)
+    return np.exp(-0.5 * (d / ell) ** 2)
+
+
+def _kernel_local_moments(
+    x_query: np.ndarray,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    length_scale: float,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Gaussian-kernel local mean/std plus absolute support score; no fitting/optimization."""
+    xq = _as_1d_float(x_query)
+    xt = _as_1d_float(x_train)
+    yt = _as_1d_float(y_train)
+    ell = max(float(length_scale), 1e-12)
+    dist = np.abs(xq[:, None] - xt[None, :])
+    w = np.exp(-0.5 * (dist / ell) ** 2)
+    support = np.max(w, axis=1)
+    wsum = np.sum(w, axis=1, keepdims=True)
+    normalized = w / np.maximum(wsum, float(eps))
+    mean = np.sum(normalized * yt[None, :], axis=1)
+    var = np.sum(normalized * (yt[None, :] - mean[:, None]) ** 2, axis=1)
+
+    # If every weight numerically vanishes, normalized weights carry no information.
+    dead = (wsum[:, 0] <= float(eps))
+    if np.any(dead):
+        mean[dead] = float(np.mean(yt))
+        var[dead] = float(np.var(yt))
+        support[dead] = 0.0
+    return mean, np.sqrt(np.maximum(var, 0.0)), support
+
+
+def _local_linear_center_residual_std(
+    x_query: np.ndarray,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    *,
+    k: int,
+    length_scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Tiny weighted local linear fits, solved independently per query; no learned model."""
+    xq = _as_1d_float(x_query)
+    xt = _as_1d_float(x_train)
+    yt = _as_1d_float(y_train)
+    nearest, nearest_distance = _nearest_indices_and_distances(xq, xt, k)
+    ell = max(float(length_scale), 1e-12)
+    centers = np.empty(len(xq), dtype=np.float64)
+    residual_std = np.empty(len(xq), dtype=np.float64)
+
+    for i, (x0, ids) in enumerate(zip(xq, nearest)):
+        dx = xt[ids] - x0
+        yy = yt[ids]
+        w = np.exp(-0.5 * (dx / ell) ** 2)
+        # Fit y = a + b (x-x0), so a is the prediction exactly at x0.
+        A = np.column_stack([np.ones_like(dx), dx])
+        sw = np.sqrt(np.maximum(w, 1e-12))
+        coef, *_ = np.linalg.lstsq(A * sw[:, None], yy * sw, rcond=None)
+        pred_local = A @ coef
+        centers[i] = coef[0]
+        residual_std[i] = np.sqrt(
+            np.sum(w * (yy - pred_local) ** 2) / max(np.sum(w), 1e-12)
+        )
+
+    support = _support_score_from_distance(nearest_distance, ell)
+    return centers, residual_std, support
+
+
+def _split_conformal_kernel_components(
+    x_query: np.ndarray,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    eval_cfg: EvaluationPriorConfig,
+    *,
+    seed: int,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """Simple deterministic split-conformal-style kernel bound; no fitted regressor.
+
+    This is useful as an intuitive calibration rule. Its usual exchangeability coverage
+    interpretation should NOT be assumed for genuinely out-of-support queries.
+    """
+    xt = _as_1d_float(x_train)
+    yt = _as_1d_float(y_train)
+    n = len(xt)
+    if n < 5:
+        raise ValueError("conformal_kernel requires at least five training observations.")
+    frac = float(eval_cfg.conformal_calibration_fraction)
+    if not 0.0 < frac < 1.0:
+        raise ValueError("conformal_calibration_fraction must lie in (0,1).")
+    alpha = float(eval_cfg.conformal_alpha)
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("conformal_alpha must lie in (0,1).")
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    n_cal = min(max(int(round(frac * n)), 1), n - 2)
+    cal_ids = perm[:n_cal]
+    ref_ids = perm[n_cal:]
+
+    cal_center, _, _ = _kernel_local_moments(
+        xt[cal_ids], xt[ref_ids], yt[ref_ids],
+        eval_cfg.kernel_length_scale, eval_cfg.kernel_eps,
+    )
+    residuals = np.abs(yt[cal_ids] - cal_center)
+    # Finite-sample split-conformal quantile, using the conservative 'higher' order statistic.
+    level = min(1.0, np.ceil((n_cal + 1) * (1.0 - alpha)) / n_cal)
+    try:
+        q = float(np.quantile(residuals, level, method="higher"))
+    except TypeError:  # NumPy < 1.22 compatibility.
+        q = float(np.quantile(residuals, level, interpolation="higher"))
+
+    query_center, _, support = _kernel_local_moments(
+        x_query, xt[ref_ids], yt[ref_ids],
+        eval_cfg.kernel_length_scale, eval_cfg.kernel_eps,
+    )
+    return query_center, q, support
+
+
+def evaluation_prior_bounds_np(
+    x_query: np.ndarray,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    scaling: Scaling,
+    cfg: Config,
+    *,
+    mode: str | None = None,
+    y_query_oracle: np.ndarray | None = None,
+    gp_model: GaussianProcessRegressor | None = None,
+    eval_cfg: EvaluationPriorConfig = EVAL_PRIOR_CFG,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return one post-training evaluation y-prior interval per query x.
+
+    No mode here retrains the transport, NN, or GP. ``cheating`` deliberately uses the true
+    query label. GP modes reuse the already-fitted ``gp_model``. Every other mode is built
+    directly from the closed training set with simple deterministic NumPy calculations.
+    """
+    mode = cfg.evaluation_prior_mode if mode is None else str(mode)
+    if mode not in AVAILABLE_EVAL_PRIOR_MODES:
+        raise ValueError(
+            f"Unknown evaluation prior mode {mode!r}. Available: {sorted(AVAILABLE_EVAL_PRIOR_MODES)}"
+        )
+
+    xq = _as_1d_float(x_query)
+    xt = _as_1d_float(x_train)
+    yt = _as_1d_float(y_train)
+    if len(xt) < 1:
+        raise ValueError("At least one training pair is required for evaluation-prior construction.")
+
+    global_center, global_width, global_half = _global_prior_geometry(scaling)
+    min_width = float(eval_cfg.simple_min_width)
+
+    # ---- Existing modes: preserved exactly. ----
+    if mode == "cheating":
+        if y_query_oracle is None:
+            raise ValueError(
+                "cheating evaluation prior requires y_query_oracle (the known evaluation labels)."
+            )
+        y_oracle = _as_1d_float(y_query_oracle)
+        if len(y_oracle) != len(xq):
+            raise ValueError("y_query_oracle must have the same length as x_query.")
+        cheating_width = float(cfg.cheating_prior_width_fraction) * global_width
+        half = 0.5 * cheating_width
+        return (y_oracle - half).astype(np.float32), (y_oracle + half).astype(np.float32)
+
+    if mode == "widest":
+        low = np.full(len(xq), scaling.prior_low, dtype=np.float32)
+        high = np.full(len(xq), scaling.prior_high, dtype=np.float32)
+        return low, high
+
+    if mode == "nearest_training":
+        nearest, _ = _nearest_indices_and_distances(xq, xt, cfg.eval_local_prior_k)
+        local_y = yt[nearest]
+        raw_low = np.min(local_y, axis=1)
+        raw_high = np.max(local_y, axis=1)
+        center = 0.5 * (raw_low + raw_high)
+        half = 0.5 * (raw_high - raw_low) + float(cfg.eval_local_prior_margin)
+        half = np.maximum(half, 0.5 * float(cfg.eval_local_prior_min_width))
+        low, high = center - half, center + half
+        low, high = _clip_bounds_to_global_if_requested(
+            low, high, scaling, clip=bool(cfg.eval_local_prior_clip_to_global)
+        )
+        return low.astype(np.float32), high.astype(np.float32)
+
+    # ---- GP-informed priors: reuse the GP fitted once in cell 8. ----
+    if mode in {"gp_variance_matched", "gp_95"}:
+        if gp_model is None:
+            raise ValueError(f"{mode} requires the already-fitted gp_model; it is not refit here.")
+        gp_mean, gp_std = gp_model.predict(xq[:, None], return_std=True)
+        if mode == "gp_variance_matched":
+            # Uniform(mu-h,mu+h) has variance h^2/3, so h=sqrt(3)*sigma matches GP variance.
+            half = np.sqrt(3.0) * gp_std
+        else:
+            half = float(eval_cfg.gp_interval_z) * gp_std
+        low, high = _ensure_min_width(gp_mean, half, min_width)
+        low, high = _clip_bounds_to_global_if_requested(
+            low, high, scaling, clip=eval_cfg.clip_new_modes_to_global
+        )
+        return low.astype(np.float32), high.astype(np.float32)
+
+    # Shared locality ingredients for several no-fit modes.
+    kernel_mean, kernel_std, support = _kernel_local_moments(
+        xq, xt, yt, eval_cfg.kernel_length_scale, eval_cfg.kernel_eps
+    )
+    _, nearest_distance = _nearest_indices_and_distances(xq, xt, 1)
+
+    if mode == "kernel_support":
+        # GP-like qualitative behavior without a GP: locally informed near support, then both
+        # centre and width continuously revert to the configured global prior as support vanishes.
+        local_width = max(
+            float(eval_cfg.kernel_support_local_width_fraction) * global_width,
+            min_width,
+        )
+        center = support * kernel_mean + (1.0 - support) * global_center
+        width = support * local_width + (1.0 - support) * global_width
+        low, high = center - 0.5 * width, center + 0.5 * width
+
+    elif mode == "nearest_distance":
+        # Extremely simple: nearest y gives the centre; only nearest-x distance controls width.
+        nearest, nearest_distance = _nearest_indices_and_distances(xq, xt, 1)
+        center = yt[nearest[:, 0]]
+        s = _support_score_from_distance(nearest_distance, eval_cfg.kernel_length_scale)
+        local_width = max(float(eval_cfg.nearest_fixed_width_fraction) * global_width, min_width)
+        width = s * local_width + (1.0 - s) * global_width
+        low, high = center - 0.5 * width, center + 0.5 * width
+
+    elif mode == "kernel_local_variance":
+        # Local disagreement sets the ID width; lack of support smoothly restores global width.
+        local_half = np.maximum(
+            float(eval_cfg.local_std_multiplier) * kernel_std,
+            0.5 * min_width,
+        )
+        half = support * local_half + (1.0 - support) * global_half
+        center = support * kernel_mean + (1.0 - support) * global_center
+        low, high = center - half, center + half
+
+    elif mode == "local_linear":
+        center_local, residual_std, s = _local_linear_center_residual_std(
+            xq, xt, yt,
+            k=eval_cfg.local_linear_k,
+            length_scale=eval_cfg.kernel_length_scale,
+        )
+        local_half = np.maximum(
+            float(eval_cfg.local_std_multiplier) * residual_std + float(eval_cfg.simple_margin),
+            0.5 * min_width,
+        )
+        # Retain extrapolative center while supported; revert toward global center far OOD.
+        center = s * center_local + (1.0 - s) * global_center
+        half = s * local_half + (1.0 - s) * global_half
+        low, high = center - half, center + half
+
+    elif mode in {"conformal_kernel", "kernel_conformal"}:
+        center, conformal_half, s = _split_conformal_kernel_components(
+            xq, xt, yt, eval_cfg, seed=cfg.seed + 71_001
+        )
+        conformal_half = max(float(conformal_half), 0.5 * min_width)
+        if mode == "conformal_kernel":
+            half = np.full(len(xq), conformal_half, dtype=np.float64)
+        else:
+            # Same conformal-calibrated ID width, but admit ignorance OOD by widening globally.
+            half = s * conformal_half + (1.0 - s) * global_half
+            center = s * center + (1.0 - s) * global_center
+        low, high = center - half, center + half
+
+    # ---- Deliberately simple non-GP bounds. ----
+    elif mode == "train_y_range":
+        low0 = float(np.min(yt)) - float(eval_cfg.simple_margin)
+        high0 = float(np.max(yt)) + float(eval_cfg.simple_margin)
+        center0 = 0.5 * (low0 + high0)
+        half0 = max(0.5 * (high0 - low0), 0.5 * min_width)
+        low = np.full(len(xq), center0 - half0)
+        high = np.full(len(xq), center0 + half0)
+
+    elif mode == "nearest_y_fixed":
+        nearest, _ = _nearest_indices_and_distances(xq, xt, 1)
+        center = yt[nearest[:, 0]]
+        width = max(float(eval_cfg.nearest_fixed_width_fraction) * global_width, min_width)
+        low, high = center - 0.5 * width, center + 0.5 * width
+
+    elif mode == "knn_quantile":
+        nearest, _ = _nearest_indices_and_distances(xq, xt, cfg.eval_local_prior_k)
+        local_y = yt[nearest]
+        qlo = float(eval_cfg.knn_quantile_low)
+        qhi = float(eval_cfg.knn_quantile_high)
+        if not 0.0 <= qlo < qhi <= 1.0:
+            raise ValueError("knn quantiles must satisfy 0 <= low < high <= 1.")
+        raw_low = np.quantile(local_y, qlo, axis=1) - float(eval_cfg.simple_margin)
+        raw_high = np.quantile(local_y, qhi, axis=1) + float(eval_cfg.simple_margin)
+        center = 0.5 * (raw_low + raw_high)
+        half = np.maximum(0.5 * (raw_high - raw_low), 0.5 * min_width)
+        low, high = center - half, center + half
+
+    elif mode == "knn_range_distance":
+        nearest, nearest_distance = _nearest_indices_and_distances(xq, xt, cfg.eval_local_prior_k)
+        local_y = yt[nearest]
+        raw_low = np.min(local_y, axis=1) - float(eval_cfg.simple_margin)
+        raw_high = np.max(local_y, axis=1) + float(eval_cfg.simple_margin)
+        center = 0.5 * (raw_low + raw_high)
+        base_width = np.maximum(raw_high - raw_low, min_width)
+        ell = max(float(eval_cfg.kernel_length_scale), 1e-12)
+        extra = (
+            float(eval_cfg.distance_envelope_growth)
+            * global_width
+            * (nearest_distance / ell)
+        )
+        width = np.minimum(base_width + extra, global_width)
+        low, high = center - 0.5 * width, center + 0.5 * width
+
+    else:  # Defensive; AVAILABLE_EVAL_PRIOR_MODES already checked above.
+        raise RuntimeError(f"Unhandled evaluation prior mode: {mode}")
+
+    low, high = _clip_bounds_to_global_if_requested(
+        low, high, scaling, clip=eval_cfg.clip_new_modes_to_global
+    )
+    return np.asarray(low, dtype=np.float32), np.asarray(high, dtype=np.float32)
+
+
+def _prior_bounds_summary(low: np.ndarray, high: np.ndarray) -> str:
+    width = np.asarray(high) - np.asarray(low)
+    center = 0.5 * (np.asarray(low) + np.asarray(high))
+    return (
+        f"width min/median/max={width.min():.3f}/{np.median(width):.3f}/{width.max():.3f} | "
+        f"center min/median/max={center.min():.3f}/{np.median(center):.3f}/{center.max():.3f}"
+    )
+
+
+@eqx.filter_jit
+def _predict_batch(model: ConditionalParticleTransport, prior: Array, x: Array) -> Array:
+    return jax.vmap(model)(prior, x[:, None])
+
+
+def predict_transport_from_bounds(
+    model: ConditionalParticleTransport,
+    x: np.ndarray,
+    prior_low: np.ndarray,
+    prior_high: np.ndarray,
+    cfg: Config,
+    *,
+    seed: int,
+    prior_mode: str,
+) -> dict[str, np.ndarray]:
+    """Predict from already-built prior bounds.
+
+    Prior construction is intentionally separated from transport evaluation so the entire
+    prior range can be inspected and plotted BEFORE the model sees the test set. Evaluation
+    conditions on the actually observed query x; Gaussian perturbation is training-only.
+    """
+    x = np.asarray(x).reshape(-1)
+    prior_low = np.asarray(prior_low, dtype=np.float32).reshape(-1)
+    prior_high = np.asarray(prior_high, dtype=np.float32).reshape(-1)
+    if len(prior_low) != len(x) or len(prior_high) != len(x):
+        raise ValueError("prior_low/prior_high must have one bound per query x.")
+    if np.any(prior_high <= prior_low):
+        raise ValueError("Every evaluation prior interval must have positive width.")
+
+    rng = np.random.default_rng(seed)
+    clouds: list[np.ndarray] = []
+    for start in range(0, len(x), cfg.eval_batch_size):
+        xb = x[start:start + cfg.eval_batch_size].astype(np.float32)
+        lo = prior_low[start:start + cfg.eval_batch_size, None]
+        hi = prior_high[start:start + cfg.eval_batch_size, None]
+        u = rng.uniform(0.0, 1.0, (len(xb), cfg.eval_particles)).astype(np.float32)
+        prior = (lo + (hi - lo) * u).astype(np.float32)
+        cloud = _predict_batch(model, jnp.asarray(prior), jnp.asarray(xb))
+        clouds.append(np.asarray(jax.device_get(cloud)))
+    cloud = np.concatenate(clouds, axis=0)
+    return {
+        "cloud": cloud,
+        "mean": cloud.mean(axis=1),
+        "std": cloud.std(axis=1),
+        "low": np.quantile(cloud, cfg.interval_low_q, axis=1),
+        "high": np.quantile(cloud, cfg.interval_high_q, axis=1),
+        "prior_low": prior_low,
+        "prior_high": prior_high,
+        "prior_width": prior_high - prior_low,
+        "prior_mode": str(prior_mode),
+    }
+
+
+def _energy_score_np_1d(cloud: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Exact 1-D empirical ES without materialising an [B,N,N] array."""
+    attraction = np.mean(np.abs(cloud - y[:, None]), axis=1)
+    z = np.sort(cloud, axis=1)
+    n = z.shape[1]
+    coeff = (2.0 * np.arange(n) - n + 1.0)[None, :]
+    pairwise_mean = (2.0 / (n * n)) * np.sum(coeff * z, axis=1)
+    return attraction - 0.5 * pairwise_mean
+
+
+def evaluate_transport(pred: dict[str, np.ndarray], y: np.ndarray) -> dict[str, float]:
+    return {
+        "mse": float(np.mean((pred["mean"] - y) ** 2)),
+        "mae": float(np.mean(np.abs(pred["mean"] - y))),
+        "energy_score": float(np.mean(_energy_score_np_1d(pred["cloud"], y))),
+        "coverage_95": float(np.mean((y >= pred["low"]) & (y <= pred["high"]))),
+        "mean_interval_width": float(np.mean(pred["high"] - pred["low"])),
+        "mean_posterior_std": float(np.mean(pred["std"])),
+        "mean_prior_width": float(np.mean(pred["prior_width"])),
+        "min_prior_width": float(np.min(pred["prior_width"])),
+        "max_prior_width": float(np.max(pred["prior_width"])),
+    }
+
+
+def _true_line(ax, x_train, y_train, x_test, y_test):
+    x = np.concatenate([x_train, x_test])
+    y = np.concatenate([y_train, y_test])
+    ix = np.argsort(x)
+    ax.plot(x[ix], y[ix], c="black", linewidth=3, label="True Func.")
+    ax.set_ylim(-2.5, 2.5)
+    ax.grid(alpha=0.1)
+    ax.set_xlabel("x")
+    ax.tick_params(axis="both", labelsize=15)
+
+
+def _sorted_contiguous_groups(x: np.ndarray) -> list[np.ndarray]:
+    """Split sorted x values across large support gaps so shaded bands do not bridge them."""
+    x = np.asarray(x).reshape(-1)
+    order = np.argsort(x)
+    if len(order) <= 1:
+        return [order]
+    xs = x[order]
+    dx = np.diff(xs)
+    positive = dx[dx > 0]
+    if len(positive) == 0:
+        return [order]
+    threshold = max(8.0 * float(np.median(positive)), 0.04 * float(xs.max() - xs.min()))
+    split_at = np.flatnonzero(dx > threshold) + 1
+    return [g for g in np.split(order, split_at) if len(g)]
+
+
+def _plot_shaded_interval(
+    ax,
+    x: np.ndarray,
+    low: np.ndarray,
+    high: np.ndarray,
+    *,
+    label: str,
+    color: str,
+    alpha: float = 0.28,
+) -> None:
+    """Draw non-overlapping uncertainty regions instead of dense vertical error bars."""
+    first = True
+    for group in _sorted_contiguous_groups(x):
+        order = group[np.argsort(np.asarray(x)[group])]
+        ax.fill_between(
+            np.asarray(x)[order], np.asarray(low)[order], np.asarray(high)[order],
+            color=color, alpha=alpha, linewidth=0,
+            label=label if first else None,
+        )
+        first = False
+
+
+def _plot_mean(
+    ax,
+    x: np.ndarray,
+    mean: np.ndarray,
+    *,
+    label: str,
+    color: str,
+    lw: float = 2.2,
+) -> None:
+    """Plot predictive means, split across large x gaps so OOD regions are never bridged."""
+    first = True
+    for group in _sorted_contiguous_groups(x):
+        order = group[np.argsort(np.asarray(x)[group])]
+        ax.plot(
+            np.asarray(x)[order], np.asarray(mean)[order],
+            color=color, linewidth=lw,
+            label=label if first else None,
+        )
+        first = False
+
+
+def plot_evaluation_prior_ranges_from_bounds(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    train_prior_low: np.ndarray,
+    train_prior_high: np.ndarray,
+    x_query: np.ndarray,
+    prior_low: np.ndarray,
+    prior_high: np.ndarray,
+    prior_mode: str,
+    path: Path,
+    cfg: Config = CFG,
+) -> None:
+    """Show COMPLETE in-domain and OOD prior intervals before test-model evaluation."""
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+
+    # In-domain/train prior support: dark-green known points and a light-green shared region.
+    ax.scatter(
+        x_train, y_train, s=22, color="darkgreen", alpha=.55,
+        label="known in-domain training pairs", zorder=4,
+    )
+    _plot_shaded_interval(
+        ax, x_train, train_prior_low, train_prior_high,
+        label="in-domain prior support", color="lightgreen", alpha=.30,
+    )
+    _plot_mean(
+        ax, x_train, train_prior_low,
+        label="in-domain prior lower bound", color="darkgreen", lw=1.15,
+    )
+    _plot_mean(
+        ax, x_train, train_prior_high,
+        label="in-domain prior upper bound", color="darkgreen", lw=1.15,
+    )
+
+    # OOD/test support: both the left and right OOD regions use the SAME red/light-red colors.
+    _plot_shaded_interval(
+        ax, x_query, prior_low, prior_high,
+        label="OOD test prior support", color="lightcoral", alpha=.30,
+    )
+    _plot_mean(
+        ax, x_query, prior_low,
+        label="OOD test prior lower bound", color="darkred", lw=1.25,
+    )
+    _plot_mean(
+        ax, x_query, prior_high,
+        label="OOD test prior upper bound", color="darkred", lw=1.25,
+    )
+
+    ax.set_xlabel("x")
+    ax.set_ylabel("y prior support")
+    ax.set_title(f"PRIOR INSPECTION BEFORE TEST INFERENCE: {prior_mode}")
+    ax.grid(alpha=.15)
+    ax.legend(loc="best")
+    ax.tick_params(axis="both", labelsize=15)
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
 
 
 def plot_transport(
     x_train, y_train, x_test, y_test, train_pred, test_pred, path: Path, cfg: Config = CFG
 ) -> None:
-    fig, ax = plt.subplots(figsize=(10, 6)); _true_line(ax, x_train, y_train, x_test, y_test)
-    for x, pred, color, name in ((x_train, train_pred, "green", "Train"), (x_test, test_pred, "red", "Test")):
-        ix = np.argsort(x); xs = x[ix]
-        ax.scatter(xs, pred["mean"][ix], c=color, s=30, alpha=.55, marker="+", label=f"Mean {name} Pred.")
-        ax.vlines(xs, pred["low"][ix], pred["high"][ix], colors=color, alpha=.06)
+    fig, ax = plt.subplots(figsize=(12, 7))
+    _true_line(ax, x_train, y_train, x_test, y_test)
+
+    # Restore the original train/test color convention: train=green, OOD test=red.
+    # Shaded regions replace the old dense vertical error bars.
+    _plot_shaded_interval(
+        ax, x_train, train_pred["low"], train_pred["high"],
+        label="95% posterior interval (train)", color="lightgreen", alpha=.28,
+    )
+    _plot_shaded_interval(
+        ax, x_test, test_pred["low"], test_pred["high"],
+        label="95% posterior interval (test)", color="lightcoral", alpha=.32,
+    )
+    _plot_mean(
+        ax, x_train, train_pred["mean"],
+        label="Posterior mean (train)", color="darkgreen", lw=2.0,
+    )
+    _plot_mean(
+        ax, x_test, test_pred["mean"],
+        label="Posterior mean (test)", color="darkred", lw=2.6,
+    )
+
     ax.set_title(
         f"Conditional Particle Transport ({cfg.posterior_conditioning}; test prior={test_pred['prior_mode']})",
-        fontsize=19,
-    ); ax.set_ylabel("y")
-    ax.legend(loc="lower right"); fig.tight_layout(); _save_and_show(fig, path, cfg)
-
-
-def plot_evaluation_prior_ranges(
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    x_query: np.ndarray,
-    pred: dict[str, np.ndarray],
-    path: Path,
-    cfg: Config = CFG,
-) -> None:
-    """Show the actual per-query prior support used at evaluation/deployment."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ix = np.argsort(x_query)
-    xs = np.asarray(x_query)[ix]
-    ax.vlines(xs, pred["prior_low"][ix], pred["prior_high"][ix], alpha=.10, label="evaluation prior")
-    ax.scatter(x_train, y_train, s=14, alpha=.35, label="known training pairs")
-    ax.plot(xs, 0.5 * (pred["prior_low"][ix] + pred["prior_high"][ix]), lw=1.5, label="prior center")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y prior support")
-    ax.set_title(f"Evaluation prior support: {pred['prior_mode']}")
-    ax.grid(alpha=.15)
-    ax.legend(loc="best")
-    fig.tight_layout(); _save_and_show(fig, path, cfg)
+        fontsize=21,
+    )
+    ax.set_ylabel("y")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
 
 
 def plot_comparison(
@@ -1018,110 +1593,168 @@ def plot_comparison(
     path: Path,
     cfg: Config = CFG,
 ) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(20, 5.5), sharey=True)
-    for ax in axes: _true_line(ax, x_train, y_train, x_test, y_test)
+    fig, axes = plt.subplots(1, 3, figsize=(22, 6.5), sharey=True)
+    for ax in axes:
+        _true_line(ax, x_train, y_train, x_test, y_test)
     axes[0].set_ylabel("y")
-    for x, p, c, name in ((x_train, nn_train, "green", "Train"), (x_test, nn_test, "red", "Test")):
-        ix = np.argsort(x); axes[0].scatter(x[ix], p[ix], c=c, s=25, alpha=.55, marker="+", label=f"{name} Pred.")
-    axes[0].set_title("Standard MLP"); axes[0].legend(fontsize=9, loc="lower right")
-    for x, mu, sd, c, name in ((x_train, gp_train, gp_train_std, "green", "Train"), (x_test, gp_test, gp_test_std, "red", "Test")):
-        ix = np.argsort(x); xs, mu, sd = x[ix], mu[ix], sd[ix]
-        axes[1].scatter(xs, mu, c=c, s=25, alpha=.55, marker="+", label=f"Mean {name} Pred.")
-        axes[1].vlines(xs, mu - 1.96 * sd, mu + 1.96 * sd, colors=c, alpha=.06)
-    axes[1].set_title("Gaussian Process"); axes[1].legend(fontsize=9, loc="lower right")
-    for x, p, c, name in ((x_train, tr_train, "green", "Train"), (x_test, tr_test, "red", "Test")):
-        ix = np.argsort(x); xs = x[ix]
-        axes[2].scatter(xs, p["mean"][ix], c=c, s=25, alpha=.55, marker="+", label=f"Mean {name} Pred.")
-        axes[2].vlines(xs, p["low"][ix], p["high"][ix], colors=c, alpha=.06)
-    axes[2].set_title(f"Particle Transport ({cfg.posterior_conditioning}; test prior={tr_test['prior_mode']})"); axes[2].legend(fontsize=9, loc="lower right")
-    fig.suptitle("Cosine regression: identical data split", fontsize=16)
-    fig.tight_layout(); _save_and_show(fig, path, cfg)
 
+    # NN has no predictive uncertainty in this baseline; preserve green=train, red=OOD test.
+    _plot_mean(axes[0], x_train, nn_train, label="NN mean (train)", color="darkgreen", lw=2.0)
+    _plot_mean(axes[0], x_test, nn_test, label="NN mean (test)", color="darkred", lw=2.5)
+    axes[0].set_title("Standard MLP")
+    axes[0].legend(loc="lower right")
 
-#%% 7) Run the complete experiment
-if __name__ == "__main__":
-    validate_config(CFG)
-    plt.rcParams.update({"savefig.facecolor": "white", "figure.facecolor": "white"})
-    out = Path(CFG.output_dir); out.mkdir(parents=True, exist_ok=True)
-
-    X_train, Y_train, X_test, Y_test = gen_data(CFG)
-    scaling = make_scaling(X_train, Y_train, CFG)
-    print_experiment_setup(X_train, Y_train, X_test, Y_test, scaling, CFG)
-
-    # Build EVERY model before training so sizes are known before the first optimization/fit call.
-    transport_init = ConditionalParticleTransport(CFG, scaling, key=jax.random.key(CFG.seed))
-    nn_init = StandardMLP(CFG, key=jax.random.key(CFG.seed))
-    gp_init = make_gp(CFG)
-    print_model_parameter_counts(transport_init, nn_init, gp_init, len(X_train))
-
-    print("\n--- training particle transport ---")
-    transport, history = train_transport(
-        X_train, Y_train, scaling, CFG, model=transport_init
+    # GP uncertainty uses light-green train and light-red OOD regions instead of vertical bars.
+    _plot_shaded_interval(
+        axes[1], x_train,
+        gp_train - 1.96 * gp_train_std, gp_train + 1.96 * gp_train_std,
+        label="GP 95% interval (train)", color="lightgreen", alpha=.28,
     )
-
-    # Keep train diagnostics on the widest support to avoid self-informed train priors.
-    # Test evaluation uses the configured prior mode. The default cheating/oracle mode
-    # intentionally uses Y_test to centre each test-time prior.
-    tr_train = predict_transport(
-        transport, X_train, scaling, CFG, seed=CFG.seed + 30_001,
-        x_train_reference=X_train, y_train_reference=Y_train, prior_mode="widest",
+    _plot_shaded_interval(
+        axes[1], x_test,
+        gp_test - 1.96 * gp_test_std, gp_test + 1.96 * gp_test_std,
+        label="GP 95% interval (test)", color="lightcoral", alpha=.32,
     )
-    tr_test = predict_transport(
-        transport, X_test, scaling, CFG, seed=CFG.seed + 30_002,
-        x_train_reference=X_train, y_train_reference=Y_train,
-        prior_mode=CFG.evaluation_prior_mode,
-        y_query_oracle=Y_test if CFG.evaluation_prior_mode == "cheating" else None,
-    )
-    tr_train_metrics = evaluate_transport(tr_train, Y_train)
-    tr_test_metrics = evaluate_transport(tr_test, Y_test)
+    _plot_mean(axes[1], x_train, gp_train, label="GP mean (train)", color="darkgreen", lw=2.0)
+    _plot_mean(axes[1], x_test, gp_test, label="GP mean (test)", color="darkred", lw=2.5)
+    axes[1].set_title("Gaussian Process")
+    axes[1].legend(loc="lower right")
 
-    print("\n--- training standard MLP ---")
-    nn_model = train_mlp(X_train, Y_train, CFG, model=nn_init)
-    nn_train, nn_test = predict_mlp(nn_model, X_train), predict_mlp(nn_model, X_test)
-
-    print("\n--- fitting Gaussian Process ---")
-    gp = fit_gp(gp_init, X_train, Y_train)
-    gp_train, gp_train_std = gp.predict(X_train[:, None], return_std=True)
-    gp_test, gp_test_std = gp.predict(X_test[:, None], return_std=True)
-
-    mse = lambda y, p: float(np.mean((y - p) ** 2))
-    metrics = {
-        "particle_transport": {"train": tr_train_metrics, "test": tr_test_metrics},
-        "mlp": {"train_mse": mse(Y_train, nn_train), "test_mse": mse(Y_test, nn_test)},
-        "gp": {
-            "train_mse": mse(Y_train, gp_train), "test_mse": mse(Y_test, gp_test),
-            "train_coverage_95": float(np.mean(np.abs(Y_train - gp_train) <= 1.96 * gp_train_std)),
-            "test_coverage_95": float(np.mean(np.abs(Y_test - gp_test) <= 1.96 * gp_test_std)),
-        },
-        "scaling": asdict(scaling),
-        "config": asdict(CFG),
-    }
-    print("\n--- final same-split comparison ---")
-    print(f"MLP       train MSE={metrics['mlp']['train_mse']:.6f} test MSE={metrics['mlp']['test_mse']:.6f}")
-    print(f"GP        train MSE={metrics['gp']['train_mse']:.6f} test MSE={metrics['gp']['test_mse']:.6f}")
-    print(
-        f"Transport train MSE={tr_train_metrics['mse']:.6f} test MSE={tr_test_metrics['mse']:.6f} | "
-        f"test ES={tr_test_metrics['energy_score']:.6f} cov95={tr_test_metrics['coverage_95']:.3f} | "
-        f"prior={tr_test['prior_mode']} mean-width={tr_test_metrics['mean_prior_width']:.3f}"
+    _plot_shaded_interval(
+        axes[2], x_train, tr_train["low"], tr_train["high"],
+        label="Transport 95% interval (train)", color="lightgreen", alpha=.28,
     )
+    _plot_shaded_interval(
+        axes[2], x_test, tr_test["low"], tr_test["high"],
+        label="Transport 95% interval (test)", color="lightcoral", alpha=.32,
+    )
+    _plot_mean(
+        axes[2], x_train, tr_train["mean"],
+        label="Transport mean (train)", color="darkgreen", lw=2.0,
+    )
+    _plot_mean(
+        axes[2], x_test, tr_test["mean"],
+        label="Transport mean (test)", color="darkred", lw=2.5,
+    )
+    axes[2].set_title(f"Particle Transport ({cfg.posterior_conditioning}; test prior={tr_test['prior_mode']})")
+    axes[2].legend(loc="lower right")
 
-    with (out / "metrics.json").open("w") as f: json.dump(metrics, f, indent=2)
-    with (out / "training_history.json").open("w") as f: json.dump(history, f, indent=2)
-    eqx.tree_serialise_leaves(out / "particle_transport.eqx", transport)
+    fig.suptitle("Cosine regression: identical data split", fontsize=22)
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
 
-    # These now save AND display inline when CFG.show_plots=True.
-    plot_training(history, out / "transport_training_diagnostics.pdf", CFG)
-    plot_transport(
-        X_train, Y_train, X_test, Y_test, tr_train, tr_test,
-        out / "transport_predictions_uncertainty.pdf", CFG,
-    )
-    plot_evaluation_prior_ranges(
-        X_train, Y_train, X_test, tr_test,
-        out / "evaluation_prior_ranges.pdf", CFG,
-    )
-    plot_comparison(
-        X_train, Y_train, X_test, Y_test,
-        nn_train, nn_test, gp_train, gp_train_std, gp_test, gp_test_std,
-        tr_train, tr_test, out / "final_comparison.pdf", CFG,
-    )
-    print(f"Saved outputs to {out.resolve()}")
+
+
+#%% 10) Choose / inspect a test-time prior mode AFTER training
+# Change ONLY EVAL_MODE (and optionally EVAL_PRIOR_CFG fields), then rerun cells 10 and 11.
+# The transport, NN, and GP above are NOT retrained.
+EVAL_MODE = CFG.evaluation_prior_mode
+
+# Examples -- all available immediately after training:
+# EVAL_MODE = "cheating"               # oracle upper benchmark
+# EVAL_MODE = "widest"                 # fixed U(CFG.prior_min, CFG.prior_max)
+# EVAL_MODE = "nearest_training"        # existing kNN min/max envelope
+# EVAL_MODE = "gp_variance_matched"     # GP mean; uniform has same GP predictive variance
+# EVAL_MODE = "gp_95"                   # GP predictive 95%-style bounds
+# EVAL_MODE = "kernel_support"          # GP-like fallback without fitting/using a GP
+# EVAL_MODE = "nearest_distance"        # nearest y + width grows with x-distance
+# EVAL_MODE = "kernel_local_variance"   # local kernel mean/std + OOD widening
+# EVAL_MODE = "local_linear"            # local linear extrapolation + residual/OOD width
+# EVAL_MODE = "conformal_kernel"        # split-conformal-style fixed residual width
+# EVAL_MODE = "kernel_conformal"        # conformal width + support-aware OOD widening
+# EVAL_MODE = "train_y_range"           # simplest global observed-y envelope
+# EVAL_MODE = "nearest_y_fixed"         # nearest y + one fixed width
+# EVAL_MODE = "knn_quantile"            # robust local y quantile envelope
+# EVAL_MODE = "knn_range_distance"      # kNN range + explicit distance inflation
+
+print_evaluation_prior_catalog()
+
+_test_oracle = Y_test if EVAL_MODE == "cheating" else None
+test_prior_low, test_prior_high = evaluation_prior_bounds_np(
+    X_test, X_train, Y_train, scaling, CFG,
+    mode=EVAL_MODE,
+    y_query_oracle=_test_oracle,
+    gp_model=gp,                 # reused only by gp_* modes; NEVER refit here
+    eval_cfg=EVAL_PRIOR_CFG,
+)
+
+# In-domain/train diagnostics stay on the widest prior, exactly as in the evaluation cell below.
+# Compute these bounds here as well so BOTH in-domain and OOD prior supports are visible BEFORE
+# the trained transport is ever run on X_test.
+train_prior_low, train_prior_high = evaluation_prior_bounds_np(
+    X_train, X_train, Y_train, scaling, CFG,
+    mode="widest",
+    gp_model=gp,
+    eval_cfg=EVAL_PRIOR_CFG,
+)
+
+print(f"\nSelected evaluation prior mode: {EVAL_MODE}")
+print("In-domain/train prior statistics: " + _prior_bounds_summary(train_prior_low, train_prior_high))
+print("OOD test prior statistics: " + _prior_bounds_summary(test_prior_low, test_prior_high))
+
+# IMPORTANT: inspect the entire in-domain AND OOD prior support BEFORE running the trained
+# transport on X_test. Green is always in-domain; red is always OOD on both left and right.
+plot_evaluation_prior_ranges_from_bounds(
+    X_train, Y_train,
+    train_prior_low, train_prior_high,
+    X_test, test_prior_low, test_prior_high,
+    EVAL_MODE,
+    out / f"evaluation_prior_ranges_{EVAL_MODE}.pdf",
+    CFG,
+)
+
+
+#%% 11) Evaluate the already-trained models with the selected prior
+# Train-set diagnostics remain on the widest prior to avoid a self-informed local/oracle train prior.
+# Those bounds were already constructed and displayed in the prior-inspection cell above.
+tr_train = predict_transport_from_bounds(
+    transport, X_train, train_prior_low, train_prior_high, CFG,
+    seed=CFG.seed + 30_001,
+    prior_mode="widest",
+)
+
+# The test prior bounds above have already been plotted and inspected before this model call.
+tr_test = predict_transport_from_bounds(
+    transport, X_test, test_prior_low, test_prior_high, CFG,
+    seed=CFG.seed + 30_002,
+    prior_mode=EVAL_MODE,
+)
+
+tr_train_metrics = evaluate_transport(tr_train, Y_train)
+tr_test_metrics = evaluate_transport(tr_test, Y_test)
+
+metrics = {
+    "particle_transport": {"train": tr_train_metrics, "test": tr_test_metrics},
+    **baseline_metrics,
+    "evaluation_prior_mode": EVAL_MODE,
+    "scaling": asdict(scaling),
+    "config": asdict(CFG),
+}
+
+print("\n--- same-split comparison; baselines were trained only once ---")
+print(f"MLP       train MSE={metrics['mlp']['train_mse']:.6f} test MSE={metrics['mlp']['test_mse']:.6f}")
+print(f"GP        train MSE={metrics['gp']['train_mse']:.6f} test MSE={metrics['gp']['test_mse']:.6f}")
+print(
+    f"Transport train MSE={tr_train_metrics['mse']:.6f} test MSE={tr_test_metrics['mse']:.6f} | "
+    f"test ES={tr_test_metrics['energy_score']:.6f} cov95={tr_test_metrics['coverage_95']:.3f} | "
+    f"prior={EVAL_MODE} mean-width={tr_test_metrics['mean_prior_width']:.3f}"
+)
+
+# Mode-specific filenames preserve previous evaluation experiments instead of overwriting them.
+with (out / f"metrics_{EVAL_MODE}.json").open("w") as f:
+    json.dump(metrics, f, indent=2)
+
+plot_transport(
+    X_train, Y_train, X_test, Y_test, tr_train, tr_test,
+    out / f"transport_predictions_uncertainty_{EVAL_MODE}.pdf", CFG,
+)
+plot_comparison(
+    X_train, Y_train, X_test, Y_test,
+    nn_train, nn_test, gp_train, gp_train_std, gp_test, gp_test_std,
+    tr_train, tr_test,
+    out / f"final_comparison_{EVAL_MODE}.pdf", CFG,
+)
+print(f"Saved evaluation outputs to {out.resolve()}")
+
+
+# %%

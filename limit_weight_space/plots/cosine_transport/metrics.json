@@ -1,35 +1,35 @@
 {
   "particle_transport": {
     "train": {
-      "mse": 0.010691706964591556,
-      "mae": 0.07335986219814217,
-      "energy_score": 0.052209556248534066,
-      "coverage_95": 0.9741581832419733,
-      "mean_interval_width": 0.7123759388923645,
-      "mean_posterior_std": 0.18182753026485443,
+      "mse": 0.0008016780840596325,
+      "mae": 0.023569063280366002,
+      "energy_score": 0.0205895216848835,
+      "coverage_95": 1.0,
+      "mean_interval_width": 0.3226543068885803,
+      "mean_posterior_std": 0.08195380866527557,
       "mean_prior_width": 4.0,
       "min_prior_width": 4.0,
       "max_prior_width": 4.0
     },
     "test": {
-      "mse": 1.1955370533784484,
-      "mae": 0.9546923900519582,
-      "energy_score": 0.8594567642512779,
-      "coverage_95": 0.06085753803596127,
-      "mean_interval_width": 0.563443660736084,
-      "mean_posterior_std": 0.17310932278633118,
-      "mean_prior_width": 2.0,
-      "min_prior_width": 1.9999998807907104,
-      "max_prior_width": 2.0
+      "mse": 1.853963196038281,
+      "mae": 1.1822318583844649,
+      "energy_score": 1.1303921374690968,
+      "coverage_95": 0.024896265560165973,
+      "mean_interval_width": 0.2925158143043518,
+      "mean_posterior_std": 0.09068644791841507,
+      "mean_prior_width": 1.0,
+      "min_prior_width": 1.0,
+      "max_prior_width": 1.0
     }
   },
   "mlp": {
-    "train_mse": 0.0006494074712038604,
-    "test_mse": 3.539785946276578
+    "train_mse": 0.0002665261589563779,
+    "test_mse": 2.5128483979172
   },
   "gp": {
-    "train_mse": 2.278572278277134e-05,
-    "test_mse": 1.397362457866051,
+    "train_mse": 2.278572241902051e-05,
+    "test_mse": 1.3973721528209762,
     "train_coverage_95": 0.9569303054032889,
     "test_coverage_95": 0.9764868603042877
   },
@@ -68,7 +68,7 @@
     "posterior_conditioning": "adaln",
     "cross_attention_tokens": 1,
     "max_normalized_displacement": 5.0,
-    "epochs": 5000,
+    "epochs": 15000,
     "batch_size": 256,
     "learning_rate": 0.0001,
     "weight_decay": 1e-05,
@@ -77,7 +77,7 @@
     "prior_min": -2.0,
     "prior_max": 2.0,
     "likelihood_x_noise_std": 0.01,
-    "evaluation_prior_mode": "cheating",
+    "evaluation_prior_mode": "nearest_training",
     "cheating_prior_width_fraction": 0.5,
     "eval_local_prior_k": 64,
     "eval_local_prior_margin": 0.25,

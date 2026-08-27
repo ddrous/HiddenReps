@@ -33,3 +33,6 @@ limit_weight_space/src/engression
 
 jax_hiddenreps/data/*
 jax_hiddenreps/runs/*
+
+
+limit_weight_space/plots/cosine_transport
