@@ -1,7 +1,7 @@
 #%% 0) Imports and experiment overview
 """Conditional empirical-posterior regression from observed (x, y) pairs only.
 
-A uniform cloud of candidate y values is transported by one particle Transformer.
+A configurable Uniform or Gaussian cloud of candidate y values is transported by one particle Transformer.
 For each observed training pair (x, y*), x is treated as the centre of a configurable
 Gaussian empirical likelihood p(x_lik | y*). A configurable block of independent noisy
 x_lik observations is causally contextualised by a likelihood Transformer before conditioning
@@ -9,10 +9,10 @@ the particle transport. The empirical energy score trains the full y cloud. Its 
 point prediction; its empirical quantiles are uncertainty intervals.
 
 Retained from bayes-transport:
-  * uniform base prior;
+  * configurable uniform / Gaussian base prior with shared-tau contraction/interpolation;
   * shared-tau interpolated training priors;
   * Gaussian-noisified x likelihood observations from the supplied data pairs;
-  * causal likelihood Transformer over variable observation prefixes;
+  * configurable causal likelihood Transformer over variable observation prefixes, or direct-x bypass;
   * historical-output replay buffer;
   * identity-initialised particle transport;
   * empirical energy score and cloud diagnostics.
@@ -65,8 +65,8 @@ Array = jax.Array
 @dataclass
 class Config:
     seed: int = 2028
-    data_samples: int = 2000
-    noise_std: float = 0.005
+    data_samples: int = 20000
+    noise_std: float = 0.01
     segments: int = 11
     x_range: tuple[float, float] = (-1.5, 1.5)
     train_seg_ids: tuple[int, ...] = (2, 3, 4, 5, 6, 7, 8)
@@ -78,23 +78,35 @@ class Config:
     heads: int = 4
     mlp_ratio: int = 4
     posterior_depth: int = 3
-    posterior_conditioning: str = "cross_attention"  # {"adaln", "cross_attention"}
+    posterior_conditioning: str = "adaln"  # {"adaln", "cross_attention"}
     cross_attention_tokens: int = 1  # retained compatibility field; likelihood contexts now supply memory
     max_normalized_displacement: float = 5.0
 
     # Training: one epoch = one observed-data minibatch / optimizer step.
-    epochs: int = 5000
+    epochs: int = 25000
     batch_size: int = 64*4
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     grad_clip_norm: float = 5.0
     log_every: int = 1250
 
-    # ONE widest uniform y-prior support. Fresh training interpolation clouds always
-    # come from this support. Evaluation may reuse it, use a nearest-training local prior,
-    # or use the default cheating/oracle prior centred on the known test label.
+    # Base y-prior family. "uniform" preserves the historical hard support [prior_min, prior_max].
+    # "gaussian" instead uses N(gaussian_prior_mean, gaussian_prior_std^2). To let every existing
+    # evaluation-prior mode keep the same interval API, Gaussian priors use a configurable
+    # +/- gaussian_prior_visual_z * sigma EFFECTIVE span for inspection and for converting
+    # interval-style evaluation rules into Gaussian mean/std pairs. Gaussian tails are NOT clipped.
+    base_prior_distribution: str = "gaussian"  # {"uniform", "gaussian"}
     prior_min: float = -2.0
     prior_max: float = 2.0
+    gaussian_prior_mean: float = 0.0
+    gaussian_prior_std: float = 1.0
+    gaussian_prior_visual_z: float = 2.0
+
+    # Shared-tau contraction/interpolation range. Defaults reproduce the existing tau~U(0,1).
+    # For a Gaussian cloud and a fixed anchor, C_tau=(1-tau)Z+tau*anchor remains Gaussian and
+    # its within-cloud std contracts exactly to (1-tau)*gaussian_prior_std.
+    prior_interpolation_tau_min: float = 0.0
+    prior_interpolation_tau_max: float = 1.0
 
     # Empirical likelihood attached to each supplied training pair:
     #     x_lik ~ Normal(x_pair, likelihood_x_noise_std^2).
@@ -102,11 +114,22 @@ class Config:
     # Replay stores the exact realised x_lik so the same evidence can be reused later.
     likelihood_x_noise_std: float = 0.01
 
-    # Causal likelihood Transformer, adapted directly from the location-finding experiment.
+    # Observation-conditioning path.
+    #   "transformer": use the causal likelihood Transformer and the configurable observation
+    #       prefixes below. One observation == one independent Gaussian x_lik draw.
+    #   "direct": EXACT single-observation cosine ablation from the attached reference code.
+    #       Draw ONE noisy x_lik per training pair and feed that scalar directly through the
+    #       Bayes transporter's x_in -> SiLU -> x_out conditioning path. There is NO likelihood
+    #       Transformer, NO observation prefix, and NO aggregation of multiple x observations.
+    #       Deployment likewise uses exactly ONE clean observed x.
+    likelihood_conditioning_mode: str = "direct"  # {"transformer", "direct"}
+
+    # Causal likelihood Transformer settings. These apply ONLY when
+    # likelihood_conditioning_mode == "transformer". In direct mode they are intentionally ignored.
     # One observation means one INDEPENDENT Gaussian x_lik draw around the same clean x_pair.
-    # Every training step draws max_observations_per_step noisy observations and optimizes EVERY
-    # prefix o=min_observations_per_step,...,max_observations_per_step from the SAME prior cloud.
-    # Prefixes are direct prior->posterior maps; posterior(o-1) is never fed into posterior(o).
+    # Every Transformer-mode training step draws max_observations_per_step noisy observations and
+    # optimizes EVERY prefix o=min_observations_per_step,...,max_observations_per_step from the SAME
+    # prior cloud. Prefixes are direct prior->posterior maps; posterior(o-1) is never fed into posterior(o).
     min_observations_per_step: int = 1
     max_observations_per_step: int = 6
     test_observations_per_step: int = 6
@@ -172,10 +195,20 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("truth_anchor_probability must lie in [0,1].")
     if not 0.0 <= cfg.historical_output_prior_probability <= 1.0:
         raise ValueError("historical_output_prior_probability must lie in [0,1].")
+    if cfg.base_prior_distribution not in {"uniform", "gaussian"}:
+        raise ValueError("base_prior_distribution must be 'uniform' or 'gaussian'.")
     if not cfg.prior_min < cfg.prior_max:
         raise ValueError("prior_min must be strictly smaller than prior_max.")
+    if cfg.gaussian_prior_std <= 0.0:
+        raise ValueError("gaussian_prior_std must be > 0.")
+    if cfg.gaussian_prior_visual_z <= 0.0:
+        raise ValueError("gaussian_prior_visual_z must be > 0.")
+    if not (0.0 <= cfg.prior_interpolation_tau_min <= cfg.prior_interpolation_tau_max <= 1.0):
+        raise ValueError("prior_interpolation_tau_min/max must satisfy 0 <= min <= max <= 1.")
     if cfg.likelihood_x_noise_std <= 0.0:
         raise ValueError("likelihood_x_noise_std must be > 0 for a non-degenerate Gaussian likelihood.")
+    if cfg.likelihood_conditioning_mode not in {"transformer", "direct"}:
+        raise ValueError("likelihood_conditioning_mode must be 'transformer' or 'direct'.")
     if cfg.min_observations_per_step < 1:
         raise ValueError("min_observations_per_step must be >= 1.")
     if cfg.max_observations_per_step < cfg.min_observations_per_step:
@@ -228,11 +261,19 @@ class Scaling:
     prior_high: float
 
 
+def base_prior_effective_bounds(cfg: Config = CFG) -> tuple[float, float]:
+    """Hard Uniform bounds or the configured Gaussian +/-z-sigma inspection span."""
+    if cfg.base_prior_distribution == "uniform":
+        return float(cfg.prior_min), float(cfg.prior_max)
+    half = float(cfg.gaussian_prior_visual_z) * float(cfg.gaussian_prior_std)
+    return float(cfg.gaussian_prior_mean) - half, float(cfg.gaussian_prior_mean) + half
+
+
 def make_scaling(x_train: np.ndarray, y_train: np.ndarray, cfg: Config = CFG) -> Scaling:
-    """Normalization derived from x_train and the manually configured global y-prior support."""
-    del y_train  # y targets do not determine the prior support.
+    """Normalization derived from x_train and the configured base-prior effective span."""
+    del y_train  # y targets do not determine the base prior.
     x_lo, x_hi = float(x_train.min()), float(x_train.max())
-    prior_low, prior_high = float(cfg.prior_min), float(cfg.prior_max)
+    prior_low, prior_high = base_prior_effective_bounds(cfg)
     y_center = 0.5 * (prior_low + prior_high)
     y_half = max(0.5 * (prior_high - prior_low), 1e-6)
     return Scaling(
@@ -270,6 +311,67 @@ def _save_and_show(fig, path: Path, cfg: Config) -> None:
     plt.close(fig)
 
 
+def sample_base_prior_np(
+    rng: np.random.Generator,
+    shape: tuple[int, ...],
+    cfg: Config = CFG,
+    scaling: Scaling | None = None,
+) -> np.ndarray:
+    """Draw iid particles from the configured Uniform or Gaussian base prior."""
+    if cfg.base_prior_distribution == "uniform":
+        low, high = (
+            base_prior_effective_bounds(cfg) if scaling is None
+            else (float(scaling.prior_low), float(scaling.prior_high))
+        )
+        return rng.uniform(low, high, size=shape).astype(np.float32)
+    return rng.normal(
+        loc=float(cfg.gaussian_prior_mean),
+        scale=float(cfg.gaussian_prior_std),
+        size=shape,
+    ).astype(np.float32)
+
+
+def plot_prior_interpolation_demo(
+    path: Path,
+    cfg: Config = CFG,
+    *,
+    seed: int | None = None,
+) -> None:
+    """Visualise shared-tau contraction of the selected base prior before any predictions."""
+    rng = np.random.default_rng(cfg.seed + 707 if seed is None else int(seed))
+    n = 512
+    z = sample_base_prior_np(rng, (n,), cfg)
+    if cfg.base_prior_distribution == "uniform":
+        anchor = 0.5 * (float(cfg.prior_min) + float(cfg.prior_max))
+    else:
+        anchor = float(cfg.gaussian_prior_mean)
+    tau_lo = float(cfg.prior_interpolation_tau_min)
+    tau_hi = float(cfg.prior_interpolation_tau_max)
+    taus = (
+        np.linspace(tau_lo, tau_hi, 5, dtype=np.float64)
+        if tau_hi > tau_lo
+        else np.asarray([tau_lo], dtype=np.float64)
+    )
+    clouds = [(1.0 - tau) * z + tau * anchor for tau in taus]
+
+    fig, ax = plt.subplots(figsize=(11, 6.5))
+    violin_width = .16 if len(taus) > 1 else .08
+    parts = ax.violinplot(clouds, positions=taus, widths=violin_width, showmeans=True, showextrema=False)
+    for body in parts["bodies"]:
+        body.set_alpha(.35)
+    parts["cmeans"].set_linewidth(2.0)
+    ax.axhline(anchor, color="black", linestyle="--", linewidth=1.2, label="illustrative anchor")
+    ax.set_xlabel(r"shared contraction/interpolation $\tau$")
+    ax.set_ylabel("candidate y")
+    family = "Uniform" if cfg.base_prior_distribution == "uniform" else "Gaussian"
+    ax.set_title(f"{family} base-prior contraction before training/prediction")
+    ax.set_xticks(taus)
+    ax.grid(alpha=.15)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
+
+
 def plot_data_split(
     x_train: np.ndarray,
     y_train: np.ndarray,
@@ -305,40 +407,68 @@ scaling = make_scaling(X_train, Y_train, CFG)
 
 print("\n--- data / experiment setup: before training ---")
 print(f"Train samples: {len(X_train)} | Test/OOD samples: {len(X_test)}")
-conditioning_detail = (
-    f"{CFG.posterior_conditioning} (causal likelihood-prefix memory)"
-    if CFG.posterior_conditioning == "cross_attention"
-    else f"{CFG.posterior_conditioning} (final causal likelihood-prefix token)"
-)
+if CFG.likelihood_conditioning_mode == "direct":
+    conditioning_detail = (
+        f"{CFG.posterior_conditioning} (DIRECT SINGLE noisy x -> x_in -> SiLU -> x_out; "
+        "no likelihood Transformer)"
+    )
+else:
+    conditioning_detail = (
+        f"{CFG.posterior_conditioning} (causal likelihood-prefix memory)"
+        if CFG.posterior_conditioning == "cross_attention"
+        else f"{CFG.posterior_conditioning} (final causal likelihood-prefix token)"
+    )
 print(f"Posterior conditioning: {conditioning_detail}")
+if CFG.base_prior_distribution == "uniform":
+    print(
+        f"BASE TRAINING PRIOR = U({scaling.prior_low:.3f}, {scaling.prior_high:.3f}) "
+        f"| hard width={scaling.prior_high - scaling.prior_low:.3f} | center={scaling.y_center:.3f}"
+    )
+else:
+    print(
+        f"BASE TRAINING PRIOR = N({CFG.gaussian_prior_mean:.3f}, {CFG.gaussian_prior_std:.3f}^2) | "
+        f"inspection span=mean +/- {CFG.gaussian_prior_visual_z:.3f} sigma "
+        f"= [{scaling.prior_low:.3f}, {scaling.prior_high:.3f}]"
+    )
 print(
-    f"WIDEST UNIFORM TRAINING PRIOR = U({scaling.prior_low:.3f}, {scaling.prior_high:.3f}) "
-    f"| width={scaling.prior_high - scaling.prior_low:.3f} | center={scaling.y_center:.3f}"
+    "Shared-tau prior interpolation/contraction: "
+    f"tau ~ U({CFG.prior_interpolation_tau_min:.3f}, {CFG.prior_interpolation_tau_max:.3f})"
 )
 print(
     f"Gaussian x-likelihood during training: x_lik ~ N(x_pair, {CFG.likelihood_x_noise_std:.4f}^2). "
     "Deployment/evaluation x is NOT noisified."
 )
-print(
-    "Likelihood observation prefixes: "
-    f"train o={CFG.min_observations_per_step}..{CFG.max_observations_per_step} "
-    f"(one independent noise draw per observation) | deployment o={CFG.test_observations_per_step}"
-)
-print(
-    "Likelihood Transformer: "
-    f"hidden={CFG.likelihood_hidden_dim}, heads={CFG.likelihood_heads}, "
-    f"depth={CFG.likelihood_depth}, mlp_ratio={CFG.likelihood_mlp_ratio}"
-)
+if CFG.likelihood_conditioning_mode == "transformer":
+    print(
+        "Likelihood observation prefixes: "
+        f"train o={CFG.min_observations_per_step}..{CFG.max_observations_per_step} "
+        f"(one independent noise draw per observation) | deployment o={CFG.test_observations_per_step}"
+    )
+    print(
+        "Likelihood conditioning: causal Transformer | "
+        f"hidden={CFG.likelihood_hidden_dim}, heads={CFG.likelihood_heads}, "
+        f"depth={CFG.likelihood_depth}, mlp_ratio={CFG.likelihood_mlp_ratio}"
+    )
+else:
+    print(
+        "Likelihood conditioning: DIRECT SINGLE-OBSERVATION MODE | exactly one noisy x_lik per "
+        "training example; x_lik -> x_in -> SiLU -> x_out inside the Bayes transporter; "
+        "no likelihood Transformer and no prefixes. Deployment uses exactly one clean x."
+    )
+    print(
+        "NOTE: min/max/test_observations_per_step are Transformer-only settings and are ignored "
+        "in direct mode."
+    )
 print(f"Configured evaluation prior mode: {CFG.evaluation_prior_mode}")
 train_inside = np.mean((Y_train >= scaling.prior_low) & (Y_train <= scaling.prior_high))
 test_inside = np.mean((Y_test >= scaling.prior_low) & (Y_test <= scaling.prior_high))
 print(
     f"Train y: min={Y_train.min():.3f} max={Y_train.max():.3f} "
-    f"mean={Y_train.mean():.3f} std={Y_train.std():.3f} | inside widest prior={train_inside:.3%}"
+    f"mean={Y_train.mean():.3f} std={Y_train.std():.3f} | inside effective base-prior span={train_inside:.3%}"
 )
 print(
     f"Test  y: min={Y_test.min():.3f} max={Y_test.max():.3f} "
-    f"mean={Y_test.mean():.3f} std={Y_test.std():.3f} | inside widest prior={test_inside:.3%}"
+    f"mean={Y_test.mean():.3f} std={Y_test.std():.3f} | inside effective base-prior span={test_inside:.3%}"
 )
 print(
     f"truth_anchor_probability={CFG.truth_anchor_probability:.3f} | "
@@ -346,8 +476,9 @@ print(
     f"train/eval particles={CFG.num_particles}/{CFG.eval_particles}"
 )
 if train_inside < 1.0 or test_inside < 1.0:
-    print("WARNING: some observed y values lie outside the configured widest prior support.")
+    print("NOTE: some observed y values lie outside the configured base-prior inspection span.")
 plot_data_split(X_train, Y_train, X_test, Y_test, out / "data_split.pdf", CFG)
+plot_prior_interpolation_demo(out / "base_prior_contraction_demo.pdf", CFG)
 
 
 
@@ -431,11 +562,15 @@ class CausalObservationBlock(eqx.Module):
 
 
 class LikelihoodSequenceEmbedder(eqx.Module):
-    """Project and causally contextualise a variable prefix of noisy x observations.
+    """Project and causally contextualise noisy x observations in Transformer mode.
 
     Output token o can depend only on observations 0,...,o. One causal pass therefore provides
-    all prefix contexts used on the training step. If Omin=Omax=1, this is intentionally a
-    zero-parameter identity pass-through, matching the location-finding implementation.
+    all prefix contexts used on the training step. This module is NOT instantiated at all in
+    ``direct`` mode; direct mode instead uses the historical single-x x_in -> SiLU -> x_out path.
+
+    If Transformer mode itself is configured with Omin=Omax=1, the likelihood Transformer is
+    automatically bypassed, matching the location-finding implementation's zero-parameter
+    single-observation path.
     """
     input_projection: eqx.nn.Linear | None
     blocks: tuple[CausalObservationBlock, ...]
@@ -443,20 +578,22 @@ class LikelihoodSequenceEmbedder(eqx.Module):
     input_dim: int = eqx.field(static=True)
     hidden_dim: int = eqx.field(static=True)
     attention_heads: int = eqx.field(static=True)
-    bypass_single_observation: bool = eqx.field(static=True)
+    bypass_transformer: bool = eqx.field(static=True)
 
     def __init__(self, cfg: Config, *, key: Array, input_dim: int = 1):
         self.input_dim = int(input_dim)
-        self.bypass_single_observation = (
+        single_observation = (
             cfg.min_observations_per_step == 1 and cfg.max_observations_per_step == 1
         )
-        if self.bypass_single_observation:
+        self.bypass_transformer = single_observation
+        if self.bypass_transformer:
             self.hidden_dim = self.input_dim
             self.attention_heads = 0
             self.input_projection = None
             self.blocks = ()
             self.final_norm = None
             return
+
         self.hidden_dim = int(cfg.likelihood_hidden_dim)
         self.attention_heads = int(cfg.likelihood_heads)
         keys = jax.random.split(key, cfg.likelihood_depth + 1)
@@ -473,9 +610,7 @@ class LikelihoodSequenceEmbedder(eqx.Module):
         self.final_norm = eqx.nn.LayerNorm(self.hidden_dim)
 
     def __call__(self, observation_tokens: Array) -> Array:
-        if self.bypass_single_observation:
-            if observation_tokens.shape[0] != 1:
-                raise ValueError("Single-observation likelihood bypass expects exactly one token.")
+        if self.bypass_transformer:
             return observation_tokens
         if self.input_projection is None or self.final_norm is None:
             raise RuntimeError("Active likelihood Transformer is missing its learned layers.")
@@ -564,9 +699,17 @@ class CrossAttentionParticleBlock(eqx.Module):
 
 
 class ConditionalParticleTransport(eqx.Module):
-    """One direct prior->posterior map conditioned on a causal noisy-x likelihood sequence."""
+    """One prior->posterior map with either Transformer or direct single-x conditioning.
+
+    ``transformer`` mode is the multi-observation likelihood-Transformer architecture.
+    ``direct`` mode deliberately reproduces the attached historical cosine implementation:
+    exactly one scalar noisy x is mapped by x_in -> SiLU -> x_out and supplied directly to
+    the particle blocks. Direct mode has no likelihood Transformer and no observation prefix.
+    """
     particle_in: eqx.nn.Linear
-    likelihood_embedder: LikelihoodSequenceEmbedder
+    likelihood_embedder: LikelihoodSequenceEmbedder | None
+    x_in: eqx.nn.Linear | None
+    x_out: eqx.nn.Linear | None
     blocks: tuple[Any, ...]
     final_norm: eqx.nn.LayerNorm
     displacement_head: eqx.nn.Linear
@@ -577,29 +720,60 @@ class ConditionalParticleTransport(eqx.Module):
     y_scale: float = eqx.field(static=True)
     max_displacement: float = eqx.field(static=True)
     conditioning_type: str = eqx.field(static=True)
+    likelihood_conditioning_mode: str = eqx.field(static=True)
     min_observations: int = eqx.field(static=True)
     max_observations: int = eqx.field(static=True)
     observation_context_dim: int = eqx.field(static=True)
 
     def __init__(self, cfg: Config, scaling: Scaling, *, key: Array):
-        keys = jax.random.split(key, cfg.posterior_depth + 4)
         h = cfg.hidden_dim
-        self.likelihood_embedder = LikelihoodSequenceEmbedder(cfg, input_dim=1, key=keys[0])
-        self.observation_context_dim = self.likelihood_embedder.hidden_dim
-        self.particle_in = eqx.nn.Linear(1, h, key=keys[1])
-        block_cls = AdaLNParticleBlock if cfg.posterior_conditioning == "adaln" else CrossAttentionParticleBlock
-        self.blocks = tuple(
-            block_cls(
-                h,
-                self.observation_context_dim,
-                cfg.heads,
-                cfg.mlp_ratio * h,
-                key=keys[2 + i],
+        self.likelihood_conditioning_mode = cfg.likelihood_conditioning_mode
+
+        if cfg.likelihood_conditioning_mode == "direct":
+            # EXACT architecture of the attached single-observation cosine transport:
+            # particle_in plus x_in -> SiLU -> x_out, then AdaLN or cross-attention blocks.
+            keys = jax.random.split(key, cfg.posterior_depth + 5)
+            self.likelihood_embedder = None
+            self.particle_in = eqx.nn.Linear(1, h, key=keys[0])
+            self.x_in = eqx.nn.Linear(1, h, key=keys[1])
+            x_out_dim = h if cfg.posterior_conditioning == "adaln" else h * cfg.cross_attention_tokens
+            self.x_out = eqx.nn.Linear(h, x_out_dim, key=keys[2])
+            self.observation_context_dim = h
+            block_cls = AdaLNParticleBlock if cfg.posterior_conditioning == "adaln" else CrossAttentionParticleBlock
+            self.blocks = tuple(
+                block_cls(
+                    h,
+                    h,
+                    cfg.heads,
+                    cfg.mlp_ratio * h,
+                    key=keys[3 + i],
+                )
+                for i in range(cfg.posterior_depth)
             )
-            for i in range(cfg.posterior_depth)
-        )
-        self.final_norm = eqx.nn.LayerNorm(h)
-        head = eqx.nn.Linear(h, 1, key=keys[-1])
+            self.final_norm = eqx.nn.LayerNorm(h)
+            head = eqx.nn.Linear(h, 1, key=keys[-2])
+        else:
+            # Preserve the existing multi-observation likelihood-Transformer path unchanged.
+            keys = jax.random.split(key, cfg.posterior_depth + 4)
+            self.likelihood_embedder = LikelihoodSequenceEmbedder(cfg, input_dim=1, key=keys[0])
+            self.x_in = None
+            self.x_out = None
+            self.observation_context_dim = self.likelihood_embedder.hidden_dim
+            self.particle_in = eqx.nn.Linear(1, h, key=keys[1])
+            block_cls = AdaLNParticleBlock if cfg.posterior_conditioning == "adaln" else CrossAttentionParticleBlock
+            self.blocks = tuple(
+                block_cls(
+                    h,
+                    self.observation_context_dim,
+                    cfg.heads,
+                    cfg.mlp_ratio * h,
+                    key=keys[2 + i],
+                )
+                for i in range(cfg.posterior_depth)
+            )
+            self.final_norm = eqx.nn.LayerNorm(h)
+            head = eqx.nn.Linear(h, 1, key=keys[-1])
+
         head = eqx.tree_at(lambda l: l.weight, head, jnp.zeros_like(head.weight))
         head = eqx.tree_at(lambda l: l.bias, head, jnp.zeros_like(head.bias))
         self.displacement_head = head
@@ -610,20 +784,44 @@ class ConditionalParticleTransport(eqx.Module):
         self.min_observations = int(cfg.min_observations_per_step)
         self.max_observations = int(cfg.max_observations_per_step)
 
+    def direct_transport(self, prior_y: Array, x: Array) -> Array:
+        """Historical direct cosine path: prior_y [N], ONE x scalar -> posterior_y [N]."""
+        if self.likelihood_conditioning_mode != "direct":
+            raise RuntimeError("direct_transport is available only in direct likelihood mode.")
+        if self.x_in is None or self.x_out is None:
+            raise RuntimeError("Direct mode is missing x_in/x_out projections.")
+
+        yn = (prior_y - self.y_center) / self.y_scale
+        xn = (jnp.reshape(x, (1,)) - self.x_center) / self.x_scale
+        particles = _linear_tokens(self.particle_in, yn[:, None])
+        conditioning = self.x_out(jax.nn.silu(self.x_in(xn)))
+        if self.conditioning_type == "cross_attention":
+            conditioning = conditioning.reshape(-1, particles.shape[-1])
+        for block in self.blocks:
+            particles = block(particles, conditioning)
+        particles = _layernorm_tokens(self.final_norm, particles)
+        delta = self.max_displacement * jnp.tanh(
+            _linear_tokens(self.displacement_head, particles)[:, 0]
+        )
+        return self.y_center + self.y_scale * (yn + delta)
+
     def encode_observations(self, x_observations: Array) -> Array:
-        """x_observations [O] physical units -> causal contexts [O,C]."""
+        """Transformer mode only: x_observations [O] -> causal contexts [O,C]."""
+        if self.likelihood_conditioning_mode != "transformer" or self.likelihood_embedder is None:
+            raise RuntimeError("encode_observations is only used in likelihood Transformer mode.")
         xn = (x_observations - self.x_center) / self.x_scale
         return self.likelihood_embedder(xn[:, None])
 
     def transport_with_contexts(
         self, prior_y: Array, observation_contexts: Array, observation_count: Array
     ) -> Array:
-        """Direct prior -> posterior for one selected observation prefix."""
+        """Transformer mode only: direct prior -> posterior for one selected prefix."""
+        if self.likelihood_conditioning_mode != "transformer":
+            raise RuntimeError("Observation prefixes are not used in direct single-observation mode.")
         yn = (prior_y - self.y_center) / self.y_scale
         count = jnp.clip(observation_count, 1, observation_contexts.shape[0]).astype(jnp.int32)
 
         if self.conditioning_type == "cross_attention":
-            # Static branch shapes make memory[:o] legal inside JIT, exactly as in location finding.
             def branch_for(prefix_length: int):
                 def transport(args):
                     yn_local, full_memory = args
@@ -640,7 +838,7 @@ class ConditionalParticleTransport(eqx.Module):
             )
             particles = jax.lax.switch(count - 1, branches, (yn, observation_contexts))
         else:
-            # Causal token o-1 summarizes exactly observations 1:o.
+            # Causal Transformer token o-1 summarizes exactly observations 1:o.
             conditioning = observation_contexts[count - 1]
             particles = _linear_tokens(self.particle_in, yn[:, None])
             for block in self.blocks:
@@ -653,20 +851,34 @@ class ConditionalParticleTransport(eqx.Module):
         return self.y_center + self.y_scale * (yn + delta)
 
     def predict_prefixes(self, prior_y: Array, x_observations: Array) -> tuple[Array, Array]:
-        """Direct posterior for EVERY configured prefix from the SAME prior cloud.
-
-        This is not a posterior recurrence. The likelihood Transformer is run once over Omax
-        observations; then o=Omin,...,Omax independently conditions the same incoming prior.
-        """
+        """Transformer mode: posterior for EVERY configured prefix from the SAME prior cloud."""
+        if self.likelihood_conditioning_mode != "transformer":
+            raise RuntimeError(
+                "predict_prefixes is Transformer-only. Direct mode uses exactly one x observation."
+            )
         contexts = self.encode_observations(x_observations)
         prefix_counts = jnp.arange(self.min_observations, self.max_observations + 1, dtype=jnp.int32)
-        posterior_by_prefix = jax.vmap(
-            lambda count: self.transport_with_contexts(prior_y, contexts, count)
-        )(prefix_counts)
+        # Serialize only the tiny observation-prefix axis instead of vmapping it.
+        # This preserves the Mac/XLA compatibility fix from the previous revision.
+        posterior_by_prefix = jax.lax.map(
+            lambda count: self.transport_with_contexts(prior_y, contexts, count),
+            prefix_counts,
+        )
         return posterior_by_prefix, prefix_counts
 
     def __call__(self, prior_y: Array, x_observations: Array, observation_count: Array) -> Array:
-        """Evaluate one selected prefix. x_observations may have any supported static length."""
+        """Evaluate the configured likelihood path.
+
+        Direct mode requires x_observations.shape == [1] and observation_count == 1.
+        Transformer mode accepts any trained prefix length.
+        """
+        if self.likelihood_conditioning_mode == "direct":
+            # Main direct training/evaluation paths call direct_transport with a scalar. This branch
+            # is retained only as a convenience for callers that provide a length-one array.
+            x_flat = jnp.reshape(x_observations, (-1,))
+            if x_flat.shape[0] != 1:
+                raise ValueError("Direct likelihood mode requires exactly ONE x observation.")
+            return self.direct_transport(prior_y, x_flat[0])
         contexts = self.encode_observations(x_observations)
         return self.transport_with_contexts(prior_y, contexts, observation_count)
 
@@ -720,17 +932,22 @@ def sample_interpolated_prior_np(
     cfg: Config,
     scaling: Scaling,
 ) -> np.ndarray:
-    """Shared-tau C_tau=(1-tau)Z+tau*anchor; no synthetic (x,y) pairs are created."""
+    """Shared-tau contraction/interpolation for either Uniform or Gaussian base particles.
+
+    C_tau=(1-tau)Z+tau*anchor uses one shared tau per cloud. For Gaussian Z and a fixed anchor,
+    the resulting cloud is still Gaussian with std (1-tau)*sigma, so contraction is exact.
+    No synthetic (x,y) pairs are created.
+    """
     b = len(target_y)
-    z = rng.uniform(
-        scaling.prior_low, scaling.prior_high, size=(b, cfg.num_particles)
-    ).astype(np.float32)
-    independent_anchor = rng.uniform(
-        scaling.prior_low, scaling.prior_high, size=b
-    ).astype(np.float32)
+    z = sample_base_prior_np(rng, (b, cfg.num_particles), cfg, scaling)
+    independent_anchor = sample_base_prior_np(rng, (b,), cfg, scaling)
     use_truth = rng.random(b) < cfg.truth_anchor_probability
     anchor = np.where(use_truth, target_y, independent_anchor).astype(np.float32)
-    tau = rng.uniform(0.0, 1.0, size=(b, 1)).astype(np.float32)
+    tau = rng.uniform(
+        float(cfg.prior_interpolation_tau_min),
+        float(cfg.prior_interpolation_tau_max),
+        size=(b, 1),
+    ).astype(np.float32)
     return ((1.0 - tau) * z + tau * anchor[:, None]).astype(np.float32)
 
 
@@ -790,12 +1007,22 @@ def _transport_objective(
     y: Array,
     cfg: Config,
 ) -> tuple[Array, tuple[dict[str, Array], Array]]:
-    """Train every configured observation prefix from the same incoming prior cloud."""
-    posterior_by_prefix, prefix_counts = jax.vmap(
-        lambda p, obs: model.predict_prefixes(p, obs)
-    )(prior, x_observations)
-    metrics = prefix_batch_metrics(posterior_by_prefix, y, prefix_counts[0], cfg)
-    # Historical replay stores the final-prefix output, matching the location-finding design.
+    """Train the selected likelihood path.
+
+    Transformer mode optimizes every configured prefix. Direct mode deliberately has exactly
+    ONE noisy x observation and therefore exactly one posterior per training row.
+    """
+    if cfg.likelihood_conditioning_mode == "direct":
+        # x_observations is [B] here: exactly one scalar noisy x_lik per training example.
+        posterior = jax.vmap(model.direct_transport)(prior, x_observations)
+        posterior_by_prefix = posterior[:, None, :]  # [B,1,N], only to reuse metric bookkeeping.
+        prefix_counts = jnp.asarray([1], dtype=jnp.int32)
+    else:
+        posterior_by_prefix, prefix_counts = jax.vmap(
+            lambda p, obs: model.predict_prefixes(p, obs)
+        )(prior, x_observations)
+
+    metrics = prefix_batch_metrics(posterior_by_prefix, y, prefix_counts, cfg)
     return metrics["loss"], (metrics, posterior_by_prefix[:, -1])
 
 
@@ -847,10 +1074,17 @@ def train_transport(
         x_pair = x_train[ids].astype(np.float32)
         yb = y_train[ids].astype(np.float32)
         prior = sample_interpolated_prior_np(rng, yb, cfg, scaling)
-        # One observation == one independent Gaussian noise sample. Shape [B,Omax].
-        x_lik = sample_likelihood_x_np(
-            rng, x_pair, cfg, num_observations=cfg.max_observations_per_step
-        )
+        # DIRECT mode exactly matches the attached historical cosine path: ONE noisy x_lik.
+        # Transformer mode retains the configurable Omax independent likelihood observations.
+        if cfg.likelihood_conditioning_mode == "direct":
+            # Match the attached direct cosine code exactly at the evidence interface: [B] scalars.
+            x_lik = sample_likelihood_x_np(
+                rng, x_pair, cfg, num_observations=1
+            )[:, 0]
+        else:
+            x_lik = sample_likelihood_x_np(
+                rng, x_pair, cfg, num_observations=cfg.max_observations_per_step
+            )
         prior, x_pair, x_lik, yb, n_replay = replay.mix_into_batch(
             prior, x_pair, x_lik, yb, replay_rng, cfg
         )
@@ -861,10 +1095,16 @@ def train_transport(
             np.asarray(jax.device_get(final_posterior)), x_pair, x_lik, yb
         )
 
-        likelihood_noise = np.asarray(x_lik) - np.asarray(x_pair)[:, None]
-        likelihood_logpdf = gaussian_likelihood_logpdf_np(
-            x_lik, np.asarray(x_pair)[:, None], cfg.likelihood_x_noise_std
-        )
+        if cfg.likelihood_conditioning_mode == "direct":
+            likelihood_noise = np.asarray(x_lik) - np.asarray(x_pair)
+            likelihood_logpdf = gaussian_likelihood_logpdf_np(
+                x_lik, x_pair, cfg.likelihood_x_noise_std
+            )
+        else:
+            likelihood_noise = np.asarray(x_lik) - np.asarray(x_pair)[:, None]
+            likelihood_logpdf = gaussian_likelihood_logpdf_np(
+                x_lik, np.asarray(x_pair)[:, None], cfg.likelihood_x_noise_std
+            )
 
         # Collect EVERY optimizer step for dense training diagnostics. Printing can stay sparse.
         host = jax.device_get(metrics)
@@ -969,7 +1209,13 @@ def fit_gp(
     x_train: np.ndarray,
     y_train: np.ndarray,
 ) -> GaussianProcessRegressor:
-    print("Fitting Gaussian Process...")
+    print("Gaussian Process...")
+
+    ## Randomly subsample 1000 examples
+    indices = np.random.choice(len(x_train), size=min(1000, len(x_train)), replace=False)
+    x_train = x_train[indices]
+    y_train = y_train[indices]
+
     gp.fit(x_train[:, None], y_train)
     print(f"Learned kernel: {gp.kernel_}")
     return gp
@@ -989,13 +1235,22 @@ def print_model_parameter_counts(
     """Print all model sizes before the first optimizer/model-fit call."""
     print("\n--- model sizes: before any training ---")
     transport_total = count_eqx_parameters(transport)
-    likelihood_params = count_eqx_parameters(transport.likelihood_embedder)
+    likelihood_params = (
+        0 if transport.likelihood_embedder is None
+        else count_eqx_parameters(transport.likelihood_embedder)
+    )
+    direct_x_params = (
+        0 if transport.x_in is None or transport.x_out is None
+        else count_eqx_parameters(transport.x_in) + count_eqx_parameters(transport.x_out)
+    )
     print(
-        f"Particle transport ({transport.conditioning_type}): "
+        f"Particle transport ({transport.conditioning_type}; likelihood={transport.likelihood_conditioning_mode}): "
         f"{transport_total:,} trainable scalar parameters"
     )
     print(f"  Likelihood Transformer: {likelihood_params:,}")
-    print(f"  Posterior transport    : {transport_total - likelihood_params:,}")
+    if transport.likelihood_conditioning_mode == "direct":
+        print(f"  Direct x_in + x_out     : {direct_x_params:,} (ONE x observation only)")
+    print(f"  Remaining posterior transport: {transport_total - likelihood_params - direct_x_params:,}")
     print(f"Standard MLP: {count_eqx_parameters(mlp):,} trainable scalar parameters")
     print(
         f"Gaussian Process: {int(gp.kernel.n_dims)} trainable kernel hyperparameters; "
@@ -1077,7 +1332,7 @@ nn_model = train_mlp(X_train, Y_train, CFG, model=nn_init)
 nn_train = predict_mlp(nn_model, X_train)
 nn_test = predict_mlp(nn_model, X_test)
 
-print("\n--- fitting Gaussian Process ONCE ---")
+print("\n--- Gaussian Process ONCE ---")
 gp = fit_gp(gp_init, X_train, Y_train)
 gp_train, gp_train_std = gp.predict(X_train[:, None], return_std=True)
 gp_test, gp_test_std = gp.predict(X_test[:, None], return_std=True)
@@ -1152,12 +1407,12 @@ EVAL_PRIOR_CFG = EvaluationPriorConfig()
 AVAILABLE_EVAL_PRIOR_MODES = {
     # Existing modes.
     "cheating": "oracle label centre; diagnostic upper benchmark only",
-    "widest": "the same fixed widest support used for fresh training clouds",
+    "widest": "the base-prior effective span (hard support for Uniform; +/-z sigma for Gaussian)",
     "nearest_training": "kNN min/max y envelope + fixed margin (existing method)",
 
     # GP-informed modes: reuse the already fitted GP; NEVER refit it here.
-    "gp_variance_matched": "uniform with GP predictive mean and the same predictive variance",
-    "gp_95": "uniform whose bounds equal GP mean +/- configured z * GP predictive std",
+    "gp_variance_matched": "selected prior family with GP predictive mean and matched variance",
+    "gp_95": "selected prior family using GP mean +/- configured z * GP predictive std span",
 
     # GP-like but no GP is used or fitted.
     "kernel_support": "kernel local centre; width and centre revert toward the global prior OOD",
@@ -1434,8 +1689,12 @@ def evaluation_prior_bounds_np(
             raise ValueError(f"{mode} requires the already-fitted gp_model; it is not refit here.")
         gp_mean, gp_std = gp_model.predict(xq[:, None], return_std=True)
         if mode == "gp_variance_matched":
-            # Uniform(mu-h,mu+h) has variance h^2/3, so h=sqrt(3)*sigma matches GP variance.
-            half = np.sqrt(3.0) * gp_std
+            if cfg.base_prior_distribution == "uniform":
+                # Uniform(mu-h,mu+h) has variance h^2/3.
+                half = np.sqrt(3.0) * gp_std
+            else:
+                # Gaussian evaluation bounds represent +/- gaussian_prior_visual_z sigma.
+                half = float(cfg.gaussian_prior_visual_z) * gp_std
         else:
             half = float(eval_cfg.gp_interval_z) * gp_std
         low, high = _ensure_min_width(gp_mean, half, min_width)
@@ -1570,6 +1829,36 @@ def _prior_bounds_summary(low: np.ndarray, high: np.ndarray) -> str:
     )
 
 
+def sample_evaluation_prior_from_bounds_np(
+    rng: np.random.Generator,
+    prior_low: np.ndarray,
+    prior_high: np.ndarray,
+    n_particles: int,
+    cfg: Config = CFG,
+) -> np.ndarray:
+    """Sample the selected prior family from per-query effective interval geometry.
+
+    Uniform mode treats low/high as literal hard bounds. Gaussian mode interprets their midpoint
+    as mu and their half-width as gaussian_prior_visual_z*sigma. This lets every existing
+    post-training prior-selection rule work without a second Gaussian-specific catalog.
+    """
+    low = np.asarray(prior_low, dtype=np.float32).reshape(-1)
+    high = np.asarray(prior_high, dtype=np.float32).reshape(-1)
+    if np.any(high <= low):
+        raise ValueError("Every evaluation prior interval must have positive effective width.")
+    center = 0.5 * (low + high)
+    half = 0.5 * (high - low)
+    if cfg.base_prior_distribution == "uniform":
+        u = rng.uniform(0.0, 1.0, (len(low), int(n_particles))).astype(np.float32)
+        return (low[:, None] + (high - low)[:, None] * u).astype(np.float32)
+    sigma = half / float(cfg.gaussian_prior_visual_z)
+    return rng.normal(
+        loc=center[:, None],
+        scale=sigma[:, None],
+        size=(len(low), int(n_particles)),
+    ).astype(np.float32)
+
+
 def make_deployment_observation_block_np(
     x: np.ndarray,
     cfg: Config,
@@ -1578,17 +1867,27 @@ def make_deployment_observation_block_np(
 ) -> np.ndarray:
     """Build clean deployment likelihood observations; NO Gaussian noise is added here.
 
-    Multiple deployment observations are repeated clean measurements of the observed query x.
-    This preserves the earlier deployment rule while letting the trained likelihood Transformer
-    consume a configurable observation count.
+    DIRECT mode always returns exactly one clean observed x per query, matching the attached
+    historical cosine implementation. TRANSFORMER mode may repeat the clean observed query x
+    to the requested trained prefix length, preserving the previous deployment convention.
     """
-    n_obs = cfg.test_observations_per_step if num_observations is None else int(num_observations)
-    if not (cfg.min_observations_per_step <= n_obs <= cfg.max_observations_per_step):
-        raise ValueError(
-            "Deployment num_observations must lie in the trained prefix range "
-            f"[{cfg.min_observations_per_step}, {cfg.max_observations_per_step}]."
-        )
+    if cfg.likelihood_conditioning_mode == "direct":
+        n_obs = 1 if num_observations is None else int(num_observations)
+        if n_obs != 1:
+            raise ValueError(
+                "Direct likelihood mode uses exactly ONE deployment observation. "
+                "Set num_observations=1 (or leave it unset)."
+            )
+    else:
+        n_obs = cfg.test_observations_per_step if num_observations is None else int(num_observations)
+        if not (cfg.min_observations_per_step <= n_obs <= cfg.max_observations_per_step):
+            raise ValueError(
+                "Transformer deployment num_observations must lie in the trained prefix range "
+                f"[{cfg.min_observations_per_step}, {cfg.max_observations_per_step}]."
+            )
     x = np.asarray(x, dtype=np.float32).reshape(-1)
+    if cfg.likelihood_conditioning_mode == "direct":
+        return x  # [B]: one clean scalar x per query, exactly the historical direct interface.
     return np.repeat(x[:, None], n_obs, axis=1).astype(np.float32)
 
 
@@ -1599,6 +1898,8 @@ def _predict_batch(
     x_observations: Array,
     observation_count: Array,
 ) -> Array:
+    if model.likelihood_conditioning_mode == "direct":
+        return jax.vmap(model.direct_transport)(prior, x_observations)
     return jax.vmap(lambda p, obs: model(p, obs, observation_count))(prior, x_observations)
 
 
@@ -1617,7 +1918,8 @@ def predict_transport_from_bounds(
 
     Prior construction is intentionally separated from transport evaluation so the entire prior
     range can be inspected BEFORE the model sees the test set. Deployment x is NOT noisified.
-    `num_observations` selects how many clean x tokens the likelihood Transformer receives.
+    In direct mode exactly ONE clean x is supplied. In Transformer mode `num_observations`
+    selects the clean evidence-prefix length.
     """
     x = np.asarray(x).reshape(-1)
     prior_low = np.asarray(prior_low, dtype=np.float32).reshape(-1)
@@ -1627,7 +1929,10 @@ def predict_transport_from_bounds(
     if np.any(prior_high <= prior_low):
         raise ValueError("Every evaluation prior interval must have positive width.")
 
-    n_obs = cfg.test_observations_per_step if num_observations is None else int(num_observations)
+    if cfg.likelihood_conditioning_mode == "direct":
+        n_obs = 1 if num_observations is None else int(num_observations)
+    else:
+        n_obs = cfg.test_observations_per_step if num_observations is None else int(num_observations)
     x_observations = make_deployment_observation_block_np(
         x, cfg, num_observations=n_obs
     )
@@ -1636,10 +1941,11 @@ def predict_transport_from_bounds(
     clouds: list[np.ndarray] = []
     for start in range(0, len(x), cfg.eval_batch_size):
         xb_obs = x_observations[start:start + cfg.eval_batch_size]
-        lo = prior_low[start:start + cfg.eval_batch_size, None]
-        hi = prior_high[start:start + cfg.eval_batch_size, None]
-        u = rng.uniform(0.0, 1.0, (len(xb_obs), cfg.eval_particles)).astype(np.float32)
-        prior = (lo + (hi - lo) * u).astype(np.float32)
+        lo = prior_low[start:start + cfg.eval_batch_size]
+        hi = prior_high[start:start + cfg.eval_batch_size]
+        prior = sample_evaluation_prior_from_bounds_np(
+            rng, lo, hi, cfg.eval_particles, cfg
+        )
         cloud = _predict_batch(
             model,
             jnp.asarray(prior),
@@ -1658,6 +1964,7 @@ def predict_transport_from_bounds(
         "prior_high": prior_high,
         "prior_width": prior_high - prior_low,
         "prior_mode": str(prior_mode),
+        "prior_distribution": cfg.base_prior_distribution,
         "num_observations": int(n_obs),
     }
 
@@ -1768,44 +2075,62 @@ def plot_evaluation_prior_ranges_from_bounds(
     path: Path,
     cfg: Config = CFG,
 ) -> None:
-    """Show COMPLETE in-domain and OOD prior intervals before test-model evaluation."""
+    """Inspect complete Uniform supports or nested Gaussian probability bands before inference."""
     fig, ax = plt.subplots(figsize=(12, 6.5))
 
-    # In-domain/train prior support: dark-green known points and a light-green shared region.
     ax.scatter(
         x_train, y_train, s=22, color="darkgreen", alpha=.55,
         label="known in-domain training pairs", zorder=4,
     )
-    _plot_shaded_interval(
-        ax, x_train, train_prior_low, train_prior_high,
-        label="in-domain prior support", color="lightgreen", alpha=.30,
-    )
-    _plot_mean(
-        ax, x_train, train_prior_low,
-        label="in-domain prior lower bound", color="darkgreen", lw=1.15,
-    )
-    _plot_mean(
-        ax, x_train, train_prior_high,
-        label="in-domain prior upper bound", color="darkgreen", lw=1.15,
-    )
 
-    # OOD/test support: both the left and right OOD regions use the SAME red/light-red colors.
-    _plot_shaded_interval(
-        ax, x_query, prior_low, prior_high,
-        label="OOD test prior support", color="lightcoral", alpha=.30,
-    )
-    _plot_mean(
-        ax, x_query, prior_low,
-        label="OOD test prior lower bound", color="darkred", lw=1.25,
-    )
-    _plot_mean(
-        ax, x_query, prior_high,
-        label="OOD test prior upper bound", color="darkred", lw=1.25,
-    )
+    if cfg.base_prior_distribution == "uniform":
+        # Literal hard supports: green in-domain, red OOD, exactly as before.
+        _plot_shaded_interval(
+            ax, x_train, train_prior_low, train_prior_high,
+            label="in-domain prior support", color="lightgreen", alpha=.30,
+        )
+        _plot_mean(ax, x_train, train_prior_low, label="in-domain prior lower bound", color="darkgreen", lw=1.15)
+        _plot_mean(ax, x_train, train_prior_high, label="in-domain prior upper bound", color="darkgreen", lw=1.15)
+        _plot_shaded_interval(
+            ax, x_query, prior_low, prior_high,
+            label="OOD test prior support", color="lightcoral", alpha=.30,
+        )
+        _plot_mean(ax, x_query, prior_low, label="OOD test prior lower bound", color="darkred", lw=1.25)
+        _plot_mean(ax, x_query, prior_high, label="OOD test prior upper bound", color="darkred", lw=1.25)
+        subtitle = "Uniform hard support"
+    else:
+        # Gaussian distributions have no hard bounds. low/high are the configured +/-z-sigma
+        # inspection envelope. Draw a second nested +/-1 sigma band so concentration is visible.
+        z = float(cfg.gaussian_prior_visual_z)
+        train_center = 0.5 * (np.asarray(train_prior_low) + np.asarray(train_prior_high))
+        train_sigma = 0.5 * (np.asarray(train_prior_high) - np.asarray(train_prior_low)) / z
+        test_center = 0.5 * (np.asarray(prior_low) + np.asarray(prior_high))
+        test_sigma = 0.5 * (np.asarray(prior_high) - np.asarray(prior_low)) / z
+
+        _plot_shaded_interval(
+            ax, x_train, train_prior_low, train_prior_high,
+            label=f"in-domain Gaussian +/-{z:g} sigma", color="lightgreen", alpha=.18,
+        )
+        _plot_shaded_interval(
+            ax, x_train, train_center - train_sigma, train_center + train_sigma,
+            label="in-domain Gaussian +/-1 sigma", color="lightgreen", alpha=.40,
+        )
+        _plot_mean(ax, x_train, train_center, label="in-domain Gaussian mean", color="darkgreen", lw=1.8)
+
+        _plot_shaded_interval(
+            ax, x_query, prior_low, prior_high,
+            label=f"OOD Gaussian +/-{z:g} sigma", color="lightcoral", alpha=.18,
+        )
+        _plot_shaded_interval(
+            ax, x_query, test_center - test_sigma, test_center + test_sigma,
+            label="OOD Gaussian +/-1 sigma", color="lightcoral", alpha=.40,
+        )
+        _plot_mean(ax, x_query, test_center, label="OOD Gaussian mean", color="darkred", lw=2.0)
+        subtitle = f"Gaussian nested bands (outer = +/-{z:g} sigma; tails continue beyond)"
 
     ax.set_xlabel("x")
-    ax.set_ylabel("y prior support")
-    ax.set_title(f"PRIOR INSPECTION BEFORE TEST INFERENCE: {prior_mode}")
+    ax.set_ylabel("y prior geometry")
+    ax.set_title(f"PRIOR INSPECTION BEFORE TEST INFERENCE: {prior_mode} | {subtitle}")
     ax.grid(alpha=.15)
     ax.legend(loc="best")
     ax.tick_params(axis="both", labelsize=15)
@@ -1839,7 +2164,7 @@ def plot_transport(
     )
 
     ax.set_title(
-        f"Conditional Particle Transport ({cfg.posterior_conditioning}; test prior={test_pred['prior_mode']}; "
+        f"Conditional Particle Transport ({cfg.posterior_conditioning}; {cfg.base_prior_distribution} prior; test mode={test_pred['prior_mode']}; "
         f"o={test_pred.get('num_observations', '?')})",
         fontsize=21,
     )
@@ -1901,7 +2226,7 @@ def plot_comparison(
         label="Transport mean (test)", color="darkred", lw=2.5,
     )
     axes[2].set_title(
-        f"Particle Transport ({cfg.posterior_conditioning}; test prior={tr_test['prior_mode']}; "
+        f"Particle Transport ({cfg.posterior_conditioning}; {cfg.base_prior_distribution} prior; test mode={tr_test['prior_mode']}; "
         f"o={tr_test.get('num_observations', '?')})"
     )
     axes[2].legend(loc="lower right")
@@ -1913,10 +2238,11 @@ def plot_comparison(
 
 
 #%% 10) Choose / inspect a test-time prior mode AFTER training
-# Change ONLY EVAL_MODE (and optionally EVAL_PRIOR_CFG fields), then rerun cells 10 and 11.
+# Change EVAL_MODE (and optionally EVAL_PRIOR_CFG fields) after training, then rerun cells 10 and 11.
+# The prior FAMILY itself (Uniform/Gaussian) is a training-time CFG choice because the transport sees it during training.
 # The transport, NN, and GP above are NOT retrained.
 EVAL_MODE = CFG.evaluation_prior_mode
-EVAL_MODE = "cheating"
+# EVAL_MODE = "train_y_range"
 
 # Examples -- all available immediately after training:
 # EVAL_MODE = "cheating"               # oracle upper benchmark
@@ -1956,7 +2282,7 @@ train_prior_low, train_prior_high = evaluation_prior_bounds_np(
     eval_cfg=EVAL_PRIOR_CFG,
 )
 
-print(f"\nSelected evaluation prior mode: {EVAL_MODE}")
+print(f"\nSelected evaluation prior mode: {EVAL_MODE} | particle prior family: {CFG.base_prior_distribution}")
 print("In-domain/train prior statistics: " + _prior_bounds_summary(train_prior_low, train_prior_high))
 print("OOD test prior statistics: " + _prior_bounds_summary(test_prior_low, test_prior_high))
 
@@ -1973,12 +2299,17 @@ plot_evaluation_prior_ranges_from_bounds(
 
 
 #%% 11) Evaluate the already-trained models with the selected prior
-# Change this AFTER training to test a different number of likelihood observations.
-# No Gaussian noise is added at deployment: the clean x query is repeated this many times.
-DEPLOYMENT_OBSERVATIONS = CFG.test_observations_per_step
-# DEPLOYMENT_OBSERVATIONS = 1
-# DEPLOYMENT_OBSERVATIONS = 3
-# DEPLOYMENT_OBSERVATIONS = CFG.max_observations_per_step
+# DIRECT mode is intentionally fixed to ONE clean observed x, exactly like the attached
+# historical cosine code. There is no likelihood Transformer and no deployment prefix.
+# TRANSFORMER mode keeps the configurable deployment observation count.
+if CFG.likelihood_conditioning_mode == "direct":
+    DEPLOYMENT_OBSERVATIONS = 1
+    print("DIRECT likelihood mode: deployment uses exactly ONE clean x observation.")
+else:
+    DEPLOYMENT_OBSERVATIONS = CFG.test_observations_per_step
+    # DEPLOYMENT_OBSERVATIONS = 1
+    # DEPLOYMENT_OBSERVATIONS = 3
+    # DEPLOYMENT_OBSERVATIONS = CFG.max_observations_per_step
 
 # Train-set diagnostics remain on the widest prior to avoid a self-informed local/oracle train prior.
 # Those bounds were already constructed and displayed in the prior-inspection cell above.
@@ -2004,6 +2335,8 @@ metrics = {
     "particle_transport": {"train": tr_train_metrics, "test": tr_test_metrics},
     **baseline_metrics,
     "evaluation_prior_mode": EVAL_MODE,
+    "base_prior_distribution": CFG.base_prior_distribution,
+    "likelihood_conditioning_mode": CFG.likelihood_conditioning_mode,
     "deployment_observations": int(DEPLOYMENT_OBSERVATIONS),
     "scaling": asdict(scaling),
     "config": asdict(CFG),
