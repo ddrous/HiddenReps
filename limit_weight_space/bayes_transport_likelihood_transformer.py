@@ -65,7 +65,7 @@ Array = jax.Array
 @dataclass
 class Config:
     seed: int = 2028
-    data_samples: int = 20000
+    data_samples: int = 2000
     noise_std: float = 0.01
     segments: int = 11
     x_range: tuple[float, float] = (-1.5, 1.5)
@@ -78,24 +78,24 @@ class Config:
     heads: int = 4
     mlp_ratio: int = 4
     posterior_depth: int = 3
-    posterior_conditioning: str = "adaln"  # {"adaln", "cross_attention"}
+    posterior_conditioning: str = "cross_attention"  # {"adaln", "cross_attention"}
     cross_attention_tokens: int = 1  # retained compatibility field; likelihood contexts now supply memory
     max_normalized_displacement: float = 5.0
 
     # Training: one epoch = one observed-data minibatch / optimizer step.
-    epochs: int = 25000
+    epochs: int = 5000
     batch_size: int = 64*4
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     grad_clip_norm: float = 5.0
-    log_every: int = 1250
+    log_every: int = 250
 
     # Base y-prior family. "uniform" preserves the historical hard support [prior_min, prior_max].
     # "gaussian" instead uses N(gaussian_prior_mean, gaussian_prior_std^2). To let every existing
     # evaluation-prior mode keep the same interval API, Gaussian priors use a configurable
     # +/- gaussian_prior_visual_z * sigma EFFECTIVE span for inspection and for converting
     # interval-style evaluation rules into Gaussian mean/std pairs. Gaussian tails are NOT clipped.
-    base_prior_distribution: str = "gaussian"  # {"uniform", "gaussian"}
+    base_prior_distribution: str = "uniform"  # {"uniform", "gaussian"}
     prior_min: float = -2.0
     prior_max: float = 2.0
     gaussian_prior_mean: float = 0.0
@@ -145,7 +145,7 @@ class Config:
     #       With prior=[-2,2] and fraction=0.5, this gives U(y*-1, y*+1).
     #   "widest": reuse the full configured training support.
     #   "nearest_training": infer a local support only from nearby known training (x,y) pairs.
-    evaluation_prior_mode: str = "widest"  # {"cheating", "widest", "nearest_training"}
+    evaluation_prior_mode: str = "nearest_posterior"  # {"cheating", "widest", "nearest_training"}
     cheating_prior_width_fraction: float = 0.90
     eval_local_prior_k: int = 64
     eval_local_prior_margin: float = 0.25
@@ -156,7 +156,10 @@ class Config:
     # Set to 1 to reproduce the original truth-anchored Bayes-transport interpolation ablation.
     truth_anchor_probability: float = 0.0
 
-    # Historical model-output prior replay.
+    # Nearest-posterior replay prior. The fixed NumPy buffer stores only (x_pair, posterior cloud).
+    # With this probability a training row uses the posterior cloud previously achieved at the
+    # closest stored x instead of a fresh hand-designed Uniform/Gaussian interpolated prior.
+    # The CURRENT row keeps its own x, fresh likelihood-noise draw, and y* target.
     historical_output_prior_probability: float = 0.50
     historical_output_buffer_capacity: int = 2048
 
@@ -224,9 +227,10 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("likelihood_hidden_dim must be divisible by likelihood_heads.")
     if cfg.likelihood_mlp_ratio < 1 or cfg.likelihood_depth < 1:
         raise ValueError("likelihood_mlp_ratio and likelihood_depth must both be >= 1.")
-    if cfg.evaluation_prior_mode not in {"cheating", "widest", "nearest_training"}:
+    if cfg.evaluation_prior_mode not in {"cheating", "widest", "nearest_training", "nearest_posterior"}:
         raise ValueError(
-            "evaluation_prior_mode must be 'cheating', 'widest', or 'nearest_training'."
+            "evaluation_prior_mode must be 'cheating', 'widest', 'nearest_training', "
+            "or 'nearest_posterior'."
         )
     if not 0.0 < cfg.cheating_prior_width_fraction <= 1.0:
         raise ValueError("cheating_prior_width_fraction must lie in (0,1].")
@@ -952,27 +956,71 @@ def sample_interpolated_prior_np(
 
 
 class HistoricalOutputPriorBuffer:
-    """Detached final-prefix clouds plus the exact full noisy-x evidence block."""
-    def __init__(self, capacity: int):
-        self.entries: deque[dict[str, Any]] = deque(maxlen=int(capacity))
+    """Fixed-size NumPy nearest-posterior prior buffer.
+
+    Each slot stores only:
+      * the clean training coordinate x_pair;
+      * the detached posterior y cloud previously achieved there.
+
+    During training, replay means "use the posterior achieved at the closest stored x as the
+    CURRENT row's prior". It deliberately does NOT replay the stored target or likelihood evidence.
+    This makes nearby achieved posteriors part of the learned prior-crafting distribution.
+    """
+    def __init__(self, capacity: int, num_particles: int):
+        self.capacity = int(capacity)
+        self.num_particles = int(num_particles)
+        if self.capacity < 1:
+            raise ValueError("Historical-output buffer capacity must be >= 1.")
+        if self.num_particles < 2:
+            raise ValueError("Historical-output buffer requires at least two particles.")
+        self.x = np.empty(self.capacity, dtype=np.float32)
+        self.clouds = np.empty((self.capacity, self.num_particles), dtype=np.float32)
+        self.size = 0
+        self.next_index = 0
 
     def __len__(self) -> int:
-        return len(self.entries)
+        return int(self.size)
 
-    def add_batch(
+    @property
+    def active_x(self) -> np.ndarray:
+        return self.x[:self.size]
+
+    @property
+    def active_clouds(self) -> np.ndarray:
+        return self.clouds[:self.size]
+
+    def add_batch(self, posterior: np.ndarray, x_pair: np.ndarray) -> None:
+        """Insert detached (x, posterior-cloud) pairs into the ring buffer."""
+        posterior = np.asarray(posterior, dtype=np.float32)
+        x_pair = np.asarray(x_pair, dtype=np.float32).reshape(-1)
+        if posterior.ndim != 2 or posterior.shape[0] != len(x_pair):
+            raise ValueError("posterior must have shape [B,N] with one x_pair per row.")
+        if posterior.shape[1] != self.num_particles:
+            raise ValueError(
+                f"Buffer expects {self.num_particles} particles, got {posterior.shape[1]}."
+            )
+        for xc, cloud in zip(x_pair, posterior):
+            self.x[self.next_index] = xc
+            self.clouds[self.next_index] = cloud
+            self.next_index = (self.next_index + 1) % self.capacity
+            self.size = min(self.size + 1, self.capacity)
+
+    def nearest_clouds(
         self,
-        posterior: np.ndarray,
-        x_pair: np.ndarray,
-        x_lik: np.ndarray,
-        y: np.ndarray,
-    ) -> None:
-        for cloud, xc, xo, yi in zip(posterior, x_pair, x_lik, y):
-            self.entries.append({
-                "prior": np.asarray(cloud, dtype=np.float32).copy(),
-                "x_pair": np.float32(xc),
-                "x_lik": np.asarray(xo, dtype=np.float32).copy(),
-                "y": np.float32(yi),
-            })
+        x_query: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return closest stored cloud, its stored x, and |x_query-x_stored| for every query."""
+        if self.size == 0:
+            raise ValueError("Nearest-posterior replay buffer is empty.")
+        xq = np.asarray(x_query, dtype=np.float32).reshape(-1)
+        distances = np.abs(xq[:, None] - self.active_x[None, :])
+        nearest = np.argmin(distances, axis=1)
+        rows = np.arange(len(xq))
+        return (
+            self.active_clouds[nearest].copy(),
+            self.active_x[nearest].copy(),
+            distances[rows, nearest].astype(np.float32),
+        )
 
     def mix_into_batch(
         self,
@@ -983,20 +1031,40 @@ class HistoricalOutputPriorBuffer:
         rng: np.random.Generator,
         cfg: Config,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
-        if not self.entries or cfg.historical_output_prior_probability <= 0.0:
+        """Occasionally replace ONLY the hand-designed prior by the nearest achieved posterior."""
+        if self.size == 0 or cfg.historical_output_prior_probability <= 0.0:
             return prior, x_pair, x_lik, y, 0
-        prior = prior.copy()
-        x_pair, x_lik, y = x_pair.copy(), x_lik.copy(), y.copy()
+
+        prior = np.asarray(prior, dtype=np.float32).copy()
+        x_pair = np.asarray(x_pair, dtype=np.float32)
         selected = np.flatnonzero(
             rng.random(len(x_pair)) < cfg.historical_output_prior_probability
         )
-        for i in selected:
-            entry = self.entries[int(rng.integers(len(self.entries)))]
-            prior[i] = entry["prior"]
-            x_pair[i] = entry["x_pair"]
-            x_lik[i] = entry["x_lik"]
-            y[i] = entry["y"]
+        if len(selected):
+            replay_clouds, _, _ = self.nearest_clouds(x_pair[selected])
+            prior[selected] = replay_clouds
+
+        # x_pair, x_lik, and y deliberately remain the CURRENT row's evidence and target.
         return prior, x_pair, x_lik, y, int(len(selected))
+
+    def resampled_copy(
+        self,
+        num_particles: int,
+        rng: np.random.Generator,
+    ) -> "HistoricalOutputPriorBuffer":
+        """Copy the active buffer, bootstrap-resampling clouds if the particle count changes."""
+        if self.size == 0:
+            raise ValueError("Cannot copy an empty nearest-posterior replay buffer.")
+        num_particles = int(num_particles)
+        copied = HistoricalOutputPriorBuffer(self.capacity, num_particles)
+        source = self.active_clouds
+        if num_particles == self.num_particles:
+            clouds = source.copy()
+        else:
+            ids = rng.integers(0, self.num_particles, size=(self.size, num_particles))
+            clouds = np.take_along_axis(source, ids, axis=1).astype(np.float32)
+        copied.add_batch(clouds, self.active_x)
+        return copied
 
 
 #%% 6) Training loop for particle transport
@@ -1050,7 +1118,7 @@ def train_transport(
     cfg: Config = CFG,
     *,
     model: ConditionalParticleTransport | None = None,
-) -> tuple[ConditionalParticleTransport, dict[str, list[float]]]:
+) -> tuple[ConditionalParticleTransport, dict[str, list[float]], HistoricalOutputPriorBuffer]:
     if model is None:
         model = ConditionalParticleTransport(cfg, scaling, key=jax.random.key(cfg.seed))
     optimizer = optax.chain(
@@ -1061,7 +1129,9 @@ def train_transport(
     train_step = make_train_step(optimizer, cfg)
     rng = np.random.default_rng(cfg.seed + 10_001)
     replay_rng = np.random.default_rng(cfg.seed + 20_003)
-    replay = HistoricalOutputPriorBuffer(cfg.historical_output_buffer_capacity)
+    replay = HistoricalOutputPriorBuffer(
+        cfg.historical_output_buffer_capacity, cfg.num_particles
+    )
     history = {name: [] for name in (
         "step", "energy_score", "final_energy_score", "attraction", "repulsion",
         "mean_mse", "final_mean_mse", "coverage_95", "final_coverage_95",
@@ -1092,7 +1162,7 @@ def train_transport(
             model, opt_state, jnp.asarray(prior), jnp.asarray(x_lik), jnp.asarray(yb)
         )
         replay.add_batch(
-            np.asarray(jax.device_get(final_posterior)), x_pair, x_lik, yb
+            np.asarray(jax.device_get(final_posterior)), x_pair
         )
 
         if cfg.likelihood_conditioning_mode == "direct":
@@ -1136,7 +1206,7 @@ def train_transport(
                 f"MSE(final-o) {values['final_mean_mse']:.5f} | "
                 f"replay {n_replay}/{cfg.batch_size} | x-noise-rms {values['likelihood_noise_rms']:.4f}"
             )
-    return model, history
+    return model, history, replay
 
 
 #%% 7) Baselines, kept in the same experiment for a strict split comparison
@@ -1211,10 +1281,10 @@ def fit_gp(
 ) -> GaussianProcessRegressor:
     print("Gaussian Process...")
 
-    ## Randomly subsample 1000 examples
-    indices = np.random.choice(len(x_train), size=min(1000, len(x_train)), replace=False)
-    x_train = x_train[indices]
-    y_train = y_train[indices]
+    # ## Randomly subsample 1000 examples
+    # indices = np.random.choice(len(x_train), size=min(1000, len(x_train)), replace=False)
+    # x_train = x_train[indices]
+    # y_train = y_train[indices]
 
     gp.fit(x_train[:, None], y_train)
     print(f"Learned kernel: {gp.kernel_}")
@@ -1323,7 +1393,7 @@ gp_init = make_gp(CFG)
 print_model_parameter_counts(transport_init, nn_init, gp_init, len(X_train))
 
 print("\n--- training particle transport ---")
-transport, history = train_transport(
+transport, history, posterior_replay_buffer = train_transport(
     X_train, Y_train, scaling, CFG, model=transport_init
 )
 
@@ -1395,6 +1465,11 @@ class EvaluationPriorConfig:
     conformal_alpha: float = 0.05
     conformal_calibration_fraction: float = 0.20
 
+    # Sequential nearest-posterior deployment. batch_size=1 is exact point-by-point propagation.
+    # Larger values process equally "outward" groups together, then add the whole batch of newly
+    # predicted posterior clouds to the working buffer before moving farther out of support.
+    nearest_posterior_deployment_batch_size: int = 1
+
     # New evaluation modes may extend beyond the widest training support. Set True if you want
     # every new mode forcibly clipped back to [CFG.prior_min, CFG.prior_max]. Existing
     # nearest_training keeps using CFG.eval_local_prior_clip_to_global exactly as before.
@@ -1409,6 +1484,7 @@ AVAILABLE_EVAL_PRIOR_MODES = {
     "cheating": "oracle label centre; diagnostic upper benchmark only",
     "widest": "the base-prior effective span (hard support for Uniform; +/-z sigma for Gaussian)",
     "nearest_training": "kNN min/max y envelope + fixed margin (existing method)",
+    "nearest_posterior": "sequentially reuse the closest previously achieved posterior cloud",
 
     # GP-informed modes: reuse the already fitted GP; NEVER refit it here.
     "gp_variance_matched": "selected prior family with GP predictive mean and matched variance",
@@ -1640,6 +1716,11 @@ def evaluation_prior_bounds_np(
     if mode not in AVAILABLE_EVAL_PRIOR_MODES:
         raise ValueError(
             f"Unknown evaluation prior mode {mode!r}. Available: {sorted(AVAILABLE_EVAL_PRIOR_MODES)}"
+        )
+    if mode == "nearest_posterior":
+        raise ValueError(
+            "nearest_posterior is a dynamic empirical-cloud prior. Use the dedicated "
+            "nearest-posterior preview/prediction helpers instead of interval construction."
         )
 
     xq = _as_1d_float(x_query)
@@ -1969,6 +2050,136 @@ def predict_transport_from_bounds(
     }
 
 
+
+def _nearest_distance_to_reference_1d(
+    x_query: np.ndarray,
+    x_reference: np.ndarray,
+) -> np.ndarray:
+    """Memory-efficient nearest distance on a 1-D reference set."""
+    xq = np.asarray(x_query, dtype=np.float64).reshape(-1)
+    xr = np.sort(np.asarray(x_reference, dtype=np.float64).reshape(-1))
+    if len(xr) == 0:
+        raise ValueError("x_reference must contain at least one point.")
+    pos = np.searchsorted(xr, xq)
+    left = np.clip(pos - 1, 0, len(xr) - 1)
+    right = np.clip(pos, 0, len(xr) - 1)
+    return np.minimum(np.abs(xq - xr[left]), np.abs(xq - xr[right]))
+
+
+def nearest_posterior_prior_preview_np(
+    x_query: np.ndarray,
+    replay_buffer: HistoricalOutputPriorBuffer,
+    cfg: Config,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pre-inference preview using ONLY the nearest stored training-time posterior clouds.
+
+    Later sequential deployment priors can differ because newly predicted OOD clouds are inserted
+    after every propagation batch. This preview is therefore intentionally the t=0 buffer view.
+    """
+    clouds, source_x, _ = replay_buffer.nearest_clouds(x_query)
+    low = np.quantile(clouds, cfg.interval_low_q, axis=1)
+    high = np.quantile(clouds, cfg.interval_high_q, axis=1)
+    mean = np.mean(clouds, axis=1)
+    return low.astype(np.float32), high.astype(np.float32), mean.astype(np.float32), source_x
+
+
+def predict_transport_nearest_posterior(
+    model: ConditionalParticleTransport,
+    x: np.ndarray,
+    x_train_reference: np.ndarray,
+    replay_buffer: HistoricalOutputPriorBuffer,
+    cfg: Config,
+    *,
+    seed: int,
+    propagation_batch_size: int,
+    num_observations: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Sequential OOD prediction using the closest previously achieved posterior as the next prior.
+
+    Ordering is by distance from the ORIGINAL training support. The working replay buffer starts
+    from the fixed training-time (x, posterior-cloud) memory. For each outward propagation batch:
+
+      1. choose the nearest cloud currently in the working buffer for every query in that batch;
+      2. use those empirical clouds directly as priors;
+      3. predict the batch;
+      4. insert the newly achieved (x, posterior-cloud) pairs into the working buffer.
+
+    With propagation_batch_size=1 this is exact point-by-point continuation. Larger batches are
+    faster: every point in a batch sees the buffer state that existed before that batch.
+    """
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    if len(x) == 0:
+        raise ValueError("nearest_posterior evaluation requires at least one query point.")
+    propagation_batch_size = int(propagation_batch_size)
+    if propagation_batch_size < 1:
+        raise ValueError("nearest_posterior_deployment_batch_size must be >= 1.")
+    if len(replay_buffer) == 0:
+        raise ValueError("nearest_posterior evaluation requires a non-empty training replay buffer.")
+
+    if cfg.likelihood_conditioning_mode == "direct":
+        n_obs = 1 if num_observations is None else int(num_observations)
+    else:
+        n_obs = cfg.test_observations_per_step if num_observations is None else int(num_observations)
+
+    # Training clouds contain cfg.num_particles whereas evaluation may request cfg.eval_particles.
+    # Bootstrap resampling changes only the empirical particle count, not the stored distribution.
+    rng = np.random.default_rng(seed)
+    working = replay_buffer.resampled_copy(cfg.eval_particles, rng)
+
+    support_distance = _nearest_distance_to_reference_1d(x, x_train_reference)
+    order = np.argsort(support_distance, kind="stable")
+
+    cloud_out = np.empty((len(x), cfg.eval_particles), dtype=np.float32)
+    prior_low = np.empty(len(x), dtype=np.float32)
+    prior_high = np.empty(len(x), dtype=np.float32)
+    prior_source_x = np.empty(len(x), dtype=np.float32)
+    prior_source_distance = np.empty(len(x), dtype=np.float32)
+    propagation_rank = np.empty(len(x), dtype=np.int32)
+
+    for start in range(0, len(x), propagation_batch_size):
+        ids = order[start:start + propagation_batch_size]
+
+        prior_cloud, source_x, source_distance = working.nearest_clouds(x[ids])
+        xb_obs = make_deployment_observation_block_np(
+            x[ids], cfg, num_observations=n_obs
+        )
+        predicted = _predict_batch(
+            model,
+            jnp.asarray(prior_cloud),
+            jnp.asarray(xb_obs),
+            jnp.asarray(n_obs, dtype=jnp.int32),
+        )
+        predicted = np.asarray(jax.device_get(predicted), dtype=np.float32)
+
+        cloud_out[ids] = predicted
+        prior_low[ids] = np.quantile(prior_cloud, cfg.interval_low_q, axis=1)
+        prior_high[ids] = np.quantile(prior_cloud, cfg.interval_high_q, axis=1)
+        prior_source_x[ids] = source_x
+        prior_source_distance[ids] = source_distance
+        propagation_rank[ids] = np.arange(start, start + len(ids), dtype=np.int32)
+
+        # Newly achieved OOD posterior clouds become eligible priors only for FOLLOWING batches.
+        working.add_batch(predicted, x[ids])
+
+    return {
+        "cloud": cloud_out,
+        "mean": cloud_out.mean(axis=1),
+        "std": cloud_out.std(axis=1),
+        "low": np.quantile(cloud_out, cfg.interval_low_q, axis=1),
+        "high": np.quantile(cloud_out, cfg.interval_high_q, axis=1),
+        "prior_low": prior_low,
+        "prior_high": prior_high,
+        "prior_width": prior_high - prior_low,
+        "prior_mode": "nearest_posterior",
+        "prior_distribution": "empirical_posterior_cloud",
+        "num_observations": int(n_obs),
+        "prior_source_x": prior_source_x,
+        "prior_source_distance": prior_source_distance,
+        "support_distance": support_distance.astype(np.float32),
+        "propagation_rank": propagation_rank,
+        "propagation_batch_size": int(propagation_batch_size),
+    }
+
 def _energy_score_np_1d(cloud: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Exact 1-D empirical ES without materialising an [B,N,N] array."""
     attraction = np.mean(np.abs(cloud - y[:, None]), axis=1)
@@ -2138,6 +2349,64 @@ def plot_evaluation_prior_ranges_from_bounds(
     _save_and_show(fig, path, cfg)
 
 
+
+def plot_nearest_posterior_prior_preview(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_query: np.ndarray,
+    replay_buffer: HistoricalOutputPriorBuffer,
+    path: Path,
+    cfg: Config = CFG,
+) -> None:
+    """Visualise the empirical replay-cloud geometry available BEFORE sequential OOD prediction."""
+    if len(replay_buffer) == 0:
+        raise ValueError("Cannot preview nearest-posterior priors from an empty replay buffer.")
+
+    buffer_x = replay_buffer.active_x
+    buffer_clouds = replay_buffer.active_clouds
+    buffer_low = np.quantile(buffer_clouds, cfg.interval_low_q, axis=1)
+    buffer_high = np.quantile(buffer_clouds, cfg.interval_high_q, axis=1)
+    buffer_mean = np.mean(buffer_clouds, axis=1)
+
+    test_low, test_high, test_mean, _ = nearest_posterior_prior_preview_np(
+        x_query, replay_buffer, cfg
+    )
+
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+    ax.scatter(
+        x_train, y_train, s=22, color="darkgreen", alpha=.40,
+        label="known in-domain training pairs", zorder=4,
+    )
+    _plot_shaded_interval(
+        ax, buffer_x, buffer_low, buffer_high,
+        label="stored training posterior clouds (empirical interval)",
+        color="lightgreen", alpha=.28,
+    )
+    _plot_mean(
+        ax, buffer_x, buffer_mean,
+        label="stored training posterior means", color="darkgreen", lw=1.6,
+    )
+    _plot_shaded_interval(
+        ax, x_query, test_low, test_high,
+        label="initial nearest-buffer prior preview for OOD points",
+        color="lightcoral", alpha=.30,
+    )
+    _plot_mean(
+        ax, x_query, test_mean,
+        label="initial nearest-buffer prior mean", color="darkred", lw=2.0,
+    )
+    ax.set_xlabel("x")
+    ax.set_ylabel("empirical y cloud")
+    ax.set_title(
+        "PRIOR INSPECTION BEFORE TEST INFERENCE: nearest_posterior\n"
+        "Initial replay-buffer view only; later priors update after each OOD propagation batch"
+    )
+    ax.grid(alpha=.15)
+    ax.legend(loc="best")
+    ax.tick_params(axis="both", labelsize=15)
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
+
 def plot_transport(
     x_train, y_train, x_test, y_test, train_pred, test_pred, path: Path, cfg: Config = CFG
 ) -> None:
@@ -2260,17 +2529,26 @@ EVAL_MODE = CFG.evaluation_prior_mode
 # EVAL_MODE = "nearest_y_fixed"         # nearest y + one fixed width
 # EVAL_MODE = "knn_quantile"            # robust local y quantile envelope
 # EVAL_MODE = "knn_range_distance"      # kNN range + explicit distance inflation
+# EVAL_MODE = "nearest_posterior"       # closest achieved posterior; sequential OOD propagation
 
 print_evaluation_prior_catalog()
 
 _test_oracle = Y_test if EVAL_MODE == "cheating" else None
-test_prior_low, test_prior_high = evaluation_prior_bounds_np(
-    X_test, X_train, Y_train, scaling, CFG,
-    mode=EVAL_MODE,
-    y_query_oracle=_test_oracle,
-    gp_model=gp,                 # reused only by gp_* modes; NEVER refit here
-    eval_cfg=EVAL_PRIOR_CFG,
-)
+if EVAL_MODE == "nearest_posterior":
+    # Dynamic empirical-cloud mode: before any test prediction, preview what each OOD point would
+    # inherit from the FIXED training replay buffer. Later actual priors can change because newly
+    # predicted OOD posterior clouds are inserted after every propagation batch.
+    test_prior_low, test_prior_high, _preview_mean, _preview_source_x = (
+        nearest_posterior_prior_preview_np(X_test, posterior_replay_buffer, CFG)
+    )
+else:
+    test_prior_low, test_prior_high = evaluation_prior_bounds_np(
+        X_test, X_train, Y_train, scaling, CFG,
+        mode=EVAL_MODE,
+        y_query_oracle=_test_oracle,
+        gp_model=gp,                 # reused only by gp_* modes; NEVER refit here
+        eval_cfg=EVAL_PRIOR_CFG,
+    )
 
 # In-domain/train diagnostics stay on the widest prior, exactly as in the evaluation cell below.
 # Compute these bounds here as well so BOTH in-domain and OOD prior supports are visible BEFORE
@@ -2284,18 +2562,36 @@ train_prior_low, train_prior_high = evaluation_prior_bounds_np(
 
 print(f"\nSelected evaluation prior mode: {EVAL_MODE} | particle prior family: {CFG.base_prior_distribution}")
 print("In-domain/train prior statistics: " + _prior_bounds_summary(train_prior_low, train_prior_high))
-print("OOD test prior statistics: " + _prior_bounds_summary(test_prior_low, test_prior_high))
+if EVAL_MODE == "nearest_posterior":
+    print(
+        "OOD initial nearest-posterior preview: "
+        + _prior_bounds_summary(test_prior_low, test_prior_high)
+    )
+    print(
+        f"Training replay buffer: {len(posterior_replay_buffer)}/"
+        f"{posterior_replay_buffer.capacity} stored (x, posterior-cloud) pairs"
+    )
+    print(
+        "NOTE: these are the PRE-INFERENCE nearest training-buffer clouds. "
+        "Actual later OOD priors update sequentially after each propagation batch."
+    )
+    plot_nearest_posterior_prior_preview(
+        X_train, Y_train, X_test, posterior_replay_buffer,
+        out / f"evaluation_prior_ranges_{EVAL_MODE}.pdf", CFG,
+    )
+else:
+    print("OOD test prior statistics: " + _prior_bounds_summary(test_prior_low, test_prior_high))
 
-# IMPORTANT: inspect the entire in-domain AND OOD prior support BEFORE running the trained
-# transport on X_test. Green is always in-domain; red is always OOD on both left and right.
-plot_evaluation_prior_ranges_from_bounds(
-    X_train, Y_train,
-    train_prior_low, train_prior_high,
-    X_test, test_prior_low, test_prior_high,
-    EVAL_MODE,
-    out / f"evaluation_prior_ranges_{EVAL_MODE}.pdf",
-    CFG,
-)
+    # IMPORTANT: inspect the entire in-domain AND OOD prior support BEFORE running the trained
+    # transport on X_test. Green is always in-domain; red is always OOD on both left and right.
+    plot_evaluation_prior_ranges_from_bounds(
+        X_train, Y_train,
+        train_prior_low, train_prior_high,
+        X_test, test_prior_low, test_prior_high,
+        EVAL_MODE,
+        out / f"evaluation_prior_ranges_{EVAL_MODE}.pdf",
+        CFG,
+    )
 
 
 #%% 11) Evaluate the already-trained models with the selected prior
@@ -2320,13 +2616,25 @@ tr_train = predict_transport_from_bounds(
     num_observations=DEPLOYMENT_OBSERVATIONS,
 )
 
-# The test prior bounds above have already been plotted and inspected before this model call.
-tr_test = predict_transport_from_bounds(
-    transport, X_test, test_prior_low, test_prior_high, CFG,
-    seed=CFG.seed + 30_002,
-    prior_mode=EVAL_MODE,
-    num_observations=DEPLOYMENT_OBSERVATIONS,
-)
+# The test prior geometry above has already been plotted and inspected before this model call.
+if EVAL_MODE == "nearest_posterior":
+    tr_test = predict_transport_nearest_posterior(
+        transport,
+        X_test,
+        X_train,
+        posterior_replay_buffer,
+        CFG,
+        seed=CFG.seed + 30_002,
+        propagation_batch_size=EVAL_PRIOR_CFG.nearest_posterior_deployment_batch_size,
+        num_observations=DEPLOYMENT_OBSERVATIONS,
+    )
+else:
+    tr_test = predict_transport_from_bounds(
+        transport, X_test, test_prior_low, test_prior_high, CFG,
+        seed=CFG.seed + 30_002,
+        prior_mode=EVAL_MODE,
+        num_observations=DEPLOYMENT_OBSERVATIONS,
+    )
 
 tr_train_metrics = evaluate_transport(tr_train, Y_train)
 tr_test_metrics = evaluate_transport(tr_test, Y_test)
@@ -2338,6 +2646,10 @@ metrics = {
     "base_prior_distribution": CFG.base_prior_distribution,
     "likelihood_conditioning_mode": CFG.likelihood_conditioning_mode,
     "deployment_observations": int(DEPLOYMENT_OBSERVATIONS),
+    "nearest_posterior_deployment_batch_size": (
+        int(EVAL_PRIOR_CFG.nearest_posterior_deployment_batch_size)
+        if EVAL_MODE == "nearest_posterior" else None
+    ),
     "scaling": asdict(scaling),
     "config": asdict(CFG),
 }
@@ -2351,6 +2663,12 @@ print(
     f"prior={EVAL_MODE} mean-width={tr_test_metrics['mean_prior_width']:.3f} | "
     f"likelihood observations={DEPLOYMENT_OBSERVATIONS}"
 )
+if EVAL_MODE == "nearest_posterior":
+    print(
+        "Nearest-posterior propagation: "
+        f"batch_size={EVAL_PRIOR_CFG.nearest_posterior_deployment_batch_size} | "
+        "batch_size=1 is exact point-by-point outward continuation."
+    )
 
 # Mode-specific filenames preserve previous evaluation experiments instead of overwriting them.
 with (out / f"metrics_{EVAL_MODE}.json").open("w") as f:
