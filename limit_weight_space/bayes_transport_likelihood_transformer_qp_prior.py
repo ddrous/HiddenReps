@@ -2,12 +2,14 @@
 """Conditional empirical-posterior regression from observed (x, y) pairs only.
 
 A cloud of candidate y values is transported by one particle Transformer. By default, fresh
-training and evaluation priors come from coherent Gaussian-Process function samples. The GP
-covariance hyperparameters can be either the configured INITIAL values or the FITTED values
-learned by the same GP baseline. In both cases, prior functions are sampled from a fresh UNFITTED
-GP carrying those hyperparameters, so the transport prior is never a GP posterior conditioned on y.
-Draw f ~ GP(m, K) jointly over the experiment x values, then draw transport particles around f(x)
-with configurable Gaussian particle noise.
+training and evaluation priors are now a SINGLE covariance-aware particle ensemble built directly
+from the mean and kernel covariance of the SAME GP used later as the baseline. The GP covariance
+hyperparameters can be either the configured INITIAL values or the FITTED values learned by that
+baseline. A scalable pivoted-Cholesky factor compresses the joint prior covariance over all
+experiment x values, and deterministic centered particle directions turn that factor into one
+finite cloud whose empirical mean/covariance approximates the GP moments. No GP function bank,
+output noisification, or inference-time prior averaging is required. The historical sampled-
+function GP prior remains available as an option.
 For each observed training pair (x, y*), x is treated as the centre of a configurable Gaussian
 empirical likelihood p(x_lik | y*). A configurable block of independent noisy x_lik observations
 is causally contextualised by a likelihood Transformer before conditioning the particle transport.
@@ -80,17 +82,17 @@ class Config:
     # Particle transport.
     num_particles: int = 16
     eval_particles: int = 64
-    hidden_dim: int = 64
+    hidden_dim: int = 32
     heads: int = 4
     mlp_ratio: int = 4
-    posterior_depth: int = 5
+    posterior_depth: int = 3
     posterior_conditioning: str = "cross_attention"  # {"adaln", "cross_attention"}
     cross_attention_tokens: int = 1  # retained compatibility field; likelihood contexts now supply memory
     max_normalized_displacement: float = 5.0
 
     # Training: one epoch = one observed-data minibatch / optimizer step.
     epochs: int = 5000
-    batch_size: int = 64*4
+    batch_size: int = 64*1
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     grad_clip_norm: float = 5.0
@@ -121,7 +123,7 @@ class Config:
     # The noisy draw x_lik, not the clean pair centre x_pair, conditions the transport.
     # Replay stores the exact realised x_lik so the same evidence can be reused later.
     likelihood_x_noise_std: float = 0.01
-
+ 
     # Observation-conditioning path.
     #   "transformer": use the causal likelihood Transformer and the configurable observation
     #       prefixes below. One observation == one independent Gaussian x_lik draw.
@@ -130,7 +132,7 @@ class Config:
     #       Bayes transporter's x_in -> SiLU -> x_out conditioning path. There is NO likelihood
     #       Transformer, NO observation prefix, and NO aggregation of multiple x observations.
     #       Deployment likewise uses exactly ONE clean observed x.
-    likelihood_conditioning_mode: str = "direct"  # {"transformer", "direct"}
+    likelihood_conditioning_mode: str = "transformer"  # {"transformer", "direct"}
 
     # Causal likelihood Transformer settings. These apply ONLY when
     # likelihood_conditioning_mode == "transformer". In direct mode they are intentionally ignored.
@@ -141,13 +143,13 @@ class Config:
     min_observations_per_step: int = 1
     max_observations_per_step: int = 6
     test_observations_per_step: int = 6
-    likelihood_hidden_dim: int = 64
+    likelihood_hidden_dim: int = 16
     likelihood_heads: int = 4
     likelihood_mlp_ratio: int = 4
-    likelihood_depth: int = 4
+    likelihood_depth: int = 3
 
     # Historical interval-based evaluation/deployment prior catalog. This is used only when
-    # use_gp_function_priors=False; GP-function evaluation has its own path below.
+    # use_gp_function_priors=False; GP-derived evaluation has its own path below.
     #   "cheating" (DEFAULT): oracle/domain-expert mode. The true evaluation label y* is
     #       assumed known and defines the prior centre. The prior full width is
     #       cheating_prior_width_fraction times the widest pre-interpolation training width.
@@ -161,17 +163,17 @@ class Config:
     eval_local_prior_min_width: float = 1.00
     eval_local_prior_clip_to_global: bool = True
 
-    # Historical shared-tau interpolation. Inactive for fresh priors when GP-function priors are
+    # Historical shared-tau interpolation. Inactive for fresh priors when GP-derived priors are
     # enabled. Strict supervised default is 0: no y* enters the input cloud.
     # Set to 1 to reproduce the original truth-anchored Bayes-transport interpolation ablation.
     truth_anchor_probability: float = 0.0
 
     # Nearest-posterior replay prior. The fixed NumPy buffer stores only (x_pair, posterior cloud).
     # With this probability a training row uses the posterior cloud previously achieved at the
-    # closest stored x instead of the current fresh GP-function prior (or the historical
-    # Uniform/Gaussian interpolated prior when GP-function priors are disabled).
+    # closest stored x instead of the current fresh GP-derived prior (or the historical
+    # Uniform/Gaussian interpolated prior when GP-derived priors are disabled).
     # The CURRENT row keeps its own x, fresh likelihood-noise draw, and y* target.
-    historical_output_prior_probability: float = 0.00
+    historical_output_prior_probability: float = 0.50
     historical_output_buffer_capacity: int = 2048
 
     # Empirical interval extracted from the transported cloud.
@@ -187,23 +189,31 @@ class Config:
     # Attached gp.py baseline. The kernel family, optimizer settings, and restart count are unchanged.
     gp_restarts: int = 10
 
-    # GP-function priors for the particle transport. Existing historical interval-prior settings
+    # GP-derived priors for the particle transport. Existing historical interval-prior settings
     # above are preserved unchanged and remain available when use_gp_function_priors=False.
-    # gp_prior_hyperparameter_source controls WHICH covariance hyperparameters define the GP prior:
+    # gp_prior_hyperparameter_source controls WHICH kernel hyperparameters define the GP prior:
     #   "initial": use the kernel values configured in make_gp(), before marginal-likelihood fitting.
-    #   "fitted" : first fit the SAME baseline GP on (X_train,Y_train), then clone its learned kernel_
-    #              into a fresh UNFITTED GP and sample from that prior. This uses the fitted covariance
-    #              hyperparameters without conditioning the sampled prior functions on training y.
-    # In either case, a bank is sampled jointly over all train/test x values. Each transport prior
-    # cloud is N(f(x), gp_prior_particle_noise_std^2) around one sampled function value. Evaluation
-    # uses several full function samples in parallel; each gives one posterior cloud, and the final
-    # comparison averages them as an equally weighted mixture.
+    #   "fitted" : fit the SAME baseline GP once, then clone its learned kernel_ into a fresh
+    #              UNFITTED GP. This uses fitted covariance hyperparameters without conditioning
+    #              transport-prior moments on training y.
+    #
+    # gp_prior_representation controls HOW those GP moments become transport particles:
+    #   "covariance_cloud" (DEFAULT): build ONE deterministic low-rank joint particle cloud directly
+    #       from GP mean/covariance with pivoted Cholesky. Shared particle coordinates preserve the
+    #       covariance structure across nearby x. Training and inference therefore use one cloud;
+    #       there are no sampled prior functions, no added output noise, and no prior averaging.
+    #   "function_samples": historical v2 path. Sample coherent functions from the fresh unfitted GP,
+    #       add Gaussian particle noise around each f(x), and average prior-specific posteriors.
     use_gp_function_priors: bool = True
     gp_prior_hyperparameter_source: str = "initial"  # {"initial", "fitted"}
-    gp_prior_num_functions: int = 64
-    gp_prior_particle_noise_std: float = 0.05
-    gp_prior_eval_samples: int = 16
-    gp_prior_plot_samples: int = 6
+    gp_prior_representation: str = "function_samples"  # {"covariance_cloud", "function_samples"}
+    # Factor rank cap. 0 uses the largest rank the evaluation cloud can represent; training uses
+    # the first min(rank, num_particles-1) directions because a P-particle cloud has rank <= P-1.
+    gp_prior_covariance_rank: int = 0
+    gp_prior_num_functions: int = 64  # function_samples only
+    gp_prior_particle_noise_std: float = 0.05  # function_samples only
+    gp_prior_eval_samples: int = 16  # function_samples only
+    gp_prior_plot_samples: int = 6  # function_samples only
 
     # Plotting. Figures are always saved; when True they are also rendered inline in notebooks.
     show_plots: bool = True
@@ -243,6 +253,12 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("likelihood_conditioning_mode must be 'transformer' or 'direct'.")
     if cfg.gp_prior_hyperparameter_source not in {"initial", "fitted"}:
         raise ValueError("gp_prior_hyperparameter_source must be 'initial' or 'fitted'.")
+    if cfg.gp_prior_representation not in {"covariance_cloud", "function_samples"}:
+        raise ValueError(
+            "gp_prior_representation must be 'covariance_cloud' or 'function_samples'."
+        )
+    if cfg.gp_prior_covariance_rank < 0:
+        raise ValueError("gp_prior_covariance_rank must be >= 0 (0 means automatic rank).")
     if cfg.gp_prior_num_functions < 1:
         raise ValueError("gp_prior_num_functions must be >= 1.")
     if cfg.gp_prior_particle_noise_std <= 0.0:
@@ -464,15 +480,25 @@ else:
 print(f"Posterior conditioning: {conditioning_detail}")
 if CFG.use_gp_function_priors:
     print(
-        "FRESH TRAINING PRIORS = coherent functions from a fresh UNFITTED GP carrying "
-        f"the {CFG.gp_prior_hyperparameter_source.upper()} kernel hyperparameters, then "
-        f"particle noise N(0, {CFG.gp_prior_particle_noise_std:.4f}^2) around f(x)."
+        f"FRESH TRAINING PRIORS = GP-derived {CFG.gp_prior_representation} using "
+        f"the {CFG.gp_prior_hyperparameter_source.upper()} kernel hyperparameters."
     )
-    print(
-        f"GP prior hyperparameter source={CFG.gp_prior_hyperparameter_source} | "
-        f"function bank={CFG.gp_prior_num_functions} | evaluation functions={CFG.gp_prior_eval_samples} | "
-        f"plotted individually={CFG.gp_prior_plot_samples}"
-    )
+    if CFG.gp_prior_representation == "covariance_cloud":
+        rank_text = "auto" if CFG.gp_prior_covariance_rank == 0 else str(CFG.gp_prior_covariance_rank)
+        print(
+            "GP covariance cloud: ONE deterministic joint ensemble from mean/covariance | "
+            f"rank={rank_text} | train/eval particles={CFG.num_particles}/{CFG.eval_particles} | "
+            "no function sampling, no added prior-output noise, no inference-time averaging."
+        )
+    else:
+        print(
+            f"Historical GP function-sample path: particle noise "
+            f"N(0, {CFG.gp_prior_particle_noise_std:.4f}^2) around f(x)."
+        )
+        print(
+            f"function bank={CFG.gp_prior_num_functions} | evaluation functions={CFG.gp_prior_eval_samples} | "
+            f"plotted individually={CFG.gp_prior_plot_samples}"
+        )
     print(
         "Legacy Uniform/Gaussian base-prior and shared-tau hyperparameters are preserved unchanged "
         "but are inactive for fresh priors while use_gp_function_priors=True."
@@ -520,7 +546,7 @@ else:
     )
 print(
     "Configured evaluation prior mode: "
-    + ("gp_function_samples (default GP-function path)" if CFG.use_gp_function_priors else CFG.evaluation_prior_mode)
+    + (f"gp_{CFG.gp_prior_representation}" if CFG.use_gp_function_priors else CFG.evaluation_prior_mode)
 )
 train_inside = np.mean((Y_train >= scaling.prior_low) & (Y_train <= scaling.prior_high))
 test_inside = np.mean((Y_test >= scaling.prior_low) & (Y_test <= scaling.prior_high))
@@ -949,7 +975,7 @@ class ConditionalParticleTransport(eqx.Module):
         return self.transport_with_contexts(prior_y, contexts, observation_count)
 
 
-#%% 5) Training objective, GP-function priors, legacy interpolated priors, and replay
+#%% 5) Training objective, GP covariance/function priors, legacy interpolated priors, and replay
 def empirical_energy_score_terms(posterior: Array, target: Array) -> tuple[Array, Array, Array]:
     """1-D empirical ES: E|Y-y*| - 1/2 E|Y-Y'|."""
     attraction = jnp.mean(jnp.abs(posterior - target))
@@ -990,6 +1016,140 @@ def prefix_batch_metrics(
         "coverage_by_o": jnp.mean(coverage, axis=0),
         "prefix_counts": prefix_counts,
     }
+
+
+@dataclass(frozen=True)
+class GPCovariancePriorCloud:
+    """One finite particle ensemble approximating the joint GP prior mean/covariance.
+
+    The covariance factor is built once over train+test x with pivoted Cholesky. Columns are shared
+    latent particle coordinates, so nearby x values receive similar particle values according to
+    their kernel covariance. No random GP functions are sampled.
+    """
+    train_cloud: np.ndarray       # [N_train, num_particles]
+    train_eval_cloud: np.ndarray  # [N_train, eval_particles]
+    test_eval_cloud: np.ndarray   # [N_test, eval_particles]
+    train_mean: np.ndarray
+    test_mean: np.ndarray
+    rank: int
+    pivots: np.ndarray
+    trace_fraction_captured: float
+    max_relative_diag_residual: float
+
+
+def _centered_unit_covariance_directions(num_particles: int, rank: int) -> np.ndarray:
+    """Deterministic Z with row mean zero and ZZ^T/(P-1)=I.
+
+    Therefore particles ``mu + L @ Z`` have empirical covariance exactly ``L L^T`` over the
+    represented factor directions, without Monte-Carlo function sampling or output noise.
+    """
+    p = int(num_particles)
+    r = int(rank)
+    if p < 2:
+        raise ValueError("At least two particles are required for a covariance ensemble.")
+    if r < 0 or r > p - 1:
+        raise ValueError("Covariance-ensemble rank must lie in [0, num_particles-1].")
+    if r == 0:
+        return np.zeros((0, p), dtype=np.float64)
+    c = np.zeros((p, p - 1), dtype=np.float64)
+    c[: p - 1, :] = np.eye(p - 1, dtype=np.float64)
+    c[p - 1, :] = -1.0
+    q, _ = np.linalg.qr(c, mode="reduced")
+    return (np.sqrt(p - 1.0) * q[:, :r].T).astype(np.float64)
+
+
+def _pivoted_cholesky_kernel_factor(
+    kernel, x: np.ndarray, max_rank: int, *, relative_tol: float = 1e-10
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Return scalable L with K(X,X) ~= L L^T without materialising the dense NxN covariance.
+
+    Each factor column is a residualized kernel-covariance column to an adaptively chosen pivot.
+    With the RBF component, nearby x values therefore receive larger weights automatically. Cost is
+    O(N R^2) arithmetic and O(N R) memory for rank R, instead of dense O(N^2) storage/O(N^3) factorization.
+    """
+    x2 = np.asarray(x, dtype=np.float64).reshape(-1, 1)
+    n = len(x2)
+    rmax = min(int(max_rank), n)
+    original_diag = np.maximum(np.asarray(kernel.diag(x2), dtype=np.float64), 0.0)
+    residual_diag = original_diag.copy()
+    if rmax < 1 or n == 0:
+        return np.zeros((n, 0)), np.zeros((0,), dtype=np.int64), residual_diag, 0.0, 1.0
+
+    initial_trace = float(np.sum(original_diag))
+    initial_max = max(float(np.max(original_diag)), np.finfo(np.float64).eps)
+    factor = np.zeros((n, rmax), dtype=np.float64)
+    pivots: list[int] = []
+    used = 0
+    for j in range(rmax):
+        pivot = int(np.argmax(residual_diag))
+        pivot_var = float(residual_diag[pivot])
+        if pivot_var <= relative_tol * initial_max:
+            break
+        column = np.asarray(kernel(x2, x2[pivot : pivot + 1]), dtype=np.float64).reshape(-1)
+        # Some sklearn diagonal-only kernels (notably WhiteKernel) contribute to kernel.diag(X)
+        # but intentionally return zero when Y is supplied. Restore the true K[pivot,pivot] entry
+        # so pivoted Cholesky factors the same covariance whose diagonal we are tracking.
+        column[pivot] = original_diag[pivot]
+        if j:
+            column = column - factor[:, :j] @ factor[pivot, :j]
+        factor[:, j] = column / np.sqrt(max(pivot_var, np.finfo(np.float64).eps))
+        residual_diag = np.maximum(residual_diag - factor[:, j] ** 2, 0.0)
+        residual_diag[pivot] = 0.0
+        pivots.append(pivot)
+        used = j + 1
+
+    factor = factor[:, :used]
+    captured = 1.0 if initial_trace <= 0.0 else 1.0 - float(np.sum(residual_diag)) / initial_trace
+    denom = np.maximum(original_diag, np.finfo(np.float64).eps)
+    max_rel_resid = float(np.max(residual_diag / denom)) if len(denom) else 0.0
+    return factor, np.asarray(pivots, dtype=np.int64), residual_diag, captured, max_rel_resid
+
+
+def build_gp_covariance_prior_cloud(
+    gp_prior_sampler: GaussianProcessRegressor,
+    x_train: np.ndarray,
+    x_test: np.ndarray,
+    cfg: Config,
+) -> GPCovariancePriorCloud:
+    """Build one joint covariance-aware transport prior directly from GP prior moments.
+
+    The sampler stays unfitted, so these are prior moments under the selected initial/fitted kernel
+    hyperparameters, not GP posterior moments. Any P-particle empirical covariance has rank <= P-1;
+    the automatic rank therefore uses at most eval_particles-1 retained covariance directions.
+    """
+    if hasattr(gp_prior_sampler, "X_train_"):
+        raise ValueError("GP prior sampler must remain unfitted; covariance cloud uses prior moments.")
+    x_train = np.asarray(x_train, dtype=np.float64).reshape(-1)
+    x_test = np.asarray(x_test, dtype=np.float64).reshape(-1)
+    x_all = np.concatenate([x_train, x_test])
+    mean_all = np.asarray(gp_prior_sampler.predict(x_all[:, None]), dtype=np.float64).reshape(-1)
+
+    auto_rank = min(int(cfg.eval_particles) - 1, len(x_all))
+    requested = auto_rank if int(cfg.gp_prior_covariance_rank) == 0 else int(cfg.gp_prior_covariance_rank)
+    max_rank = min(requested, auto_rank, len(x_all))
+    factor, pivots, _resid, captured, max_rel_resid = _pivoted_cholesky_kernel_factor(
+        gp_prior_sampler.kernel, x_all, max_rank
+    )
+
+    def make_cloud(num_particles: int) -> np.ndarray:
+        represented_rank = min(factor.shape[1], int(num_particles) - 1)
+        z = _centered_unit_covariance_directions(int(num_particles), represented_rank)
+        return (mean_all[:, None] + factor[:, :represented_rank] @ z).astype(np.float32)
+
+    train_cloud_all = make_cloud(cfg.num_particles)
+    eval_cloud_all = make_cloud(cfg.eval_particles)
+    split = len(x_train)
+    return GPCovariancePriorCloud(
+        train_cloud=train_cloud_all[:split].copy(),
+        train_eval_cloud=eval_cloud_all[:split].copy(),
+        test_eval_cloud=eval_cloud_all[split:].copy(),
+        train_mean=mean_all[:split].astype(np.float32),
+        test_mean=mean_all[split:].astype(np.float32),
+        rank=int(factor.shape[1]),
+        pivots=pivots,
+        trace_fraction_captured=float(captured),
+        max_relative_diag_residual=float(max_rel_resid),
+    )
 
 
 def sample_gp_function_particle_prior_np(
@@ -1207,6 +1367,7 @@ def train_transport(
     *,
     model: ConditionalParticleTransport | None = None,
     gp_prior_train_values: np.ndarray | None = None,
+    gp_prior_train_cloud: np.ndarray | None = None,
 ) -> tuple[ConditionalParticleTransport, dict[str, list[float]], HistoricalOutputPriorBuffer]:
     if model is None:
         model = ConditionalParticleTransport(cfg, scaling, key=jax.random.key(cfg.seed))
@@ -1222,16 +1383,26 @@ def train_transport(
         cfg.historical_output_buffer_capacity, cfg.num_particles
     )
     if cfg.use_gp_function_priors:
-        if gp_prior_train_values is None:
-            raise ValueError(
-                "use_gp_function_priors=True requires gp_prior_train_values sampled from the "
-                "unfitted GP before transport training."
-            )
-        gp_prior_train_values = np.asarray(gp_prior_train_values, dtype=np.float32)
-        if gp_prior_train_values.ndim != 2 or gp_prior_train_values.shape[1] != len(x_train):
-            raise ValueError(
-                "gp_prior_train_values must have shape [num_functions, len(x_train)]."
-            )
+        if cfg.gp_prior_representation == "covariance_cloud":
+            if gp_prior_train_cloud is None:
+                raise ValueError(
+                    "gp_prior_representation='covariance_cloud' requires gp_prior_train_cloud."
+                )
+            gp_prior_train_cloud = np.asarray(gp_prior_train_cloud, dtype=np.float32)
+            if gp_prior_train_cloud.shape != (len(x_train), cfg.num_particles):
+                raise ValueError(
+                    "gp_prior_train_cloud must have shape [len(x_train), cfg.num_particles]."
+                )
+        else:
+            if gp_prior_train_values is None:
+                raise ValueError(
+                    "gp_prior_representation='function_samples' requires gp_prior_train_values."
+                )
+            gp_prior_train_values = np.asarray(gp_prior_train_values, dtype=np.float32)
+            if gp_prior_train_values.ndim != 2 or gp_prior_train_values.shape[1] != len(x_train):
+                raise ValueError(
+                    "gp_prior_train_values must have shape [num_functions, len(x_train)]."
+                )
     history = {name: [] for name in (
         "step", "energy_score", "final_energy_score", "attraction", "repulsion",
         "mean_mse", "final_mean_mse", "coverage_95", "final_coverage_95",
@@ -1244,15 +1415,16 @@ def train_transport(
         x_pair = x_train[ids].astype(np.float32)
         yb = y_train[ids].astype(np.float32)
         if cfg.use_gp_function_priors:
-            # Draw ONE coherent GP prior function for this optimizer step, then evaluate that same
-            # function at every selected training x. The particle dimension is independent Gaussian
-            # noise around f(x); no target y enters this fresh prior. Historical replay below is
-            # preserved exactly and may still replace some rows with achieved posterior clouds.
-            function_id = int(rng.integers(0, gp_prior_train_values.shape[0]))
-            function_mean = gp_prior_train_values[function_id, ids]
-            prior = sample_gp_function_particle_prior_np(
-                rng, function_mean, cfg.num_particles, cfg
-            )
+            if cfg.gp_prior_representation == "covariance_cloud":
+                # ONE precomputed GP moment cloud: no function draw and no output noisification.
+                prior = gp_prior_train_cloud[ids].copy()
+            else:
+                # Historical v2 path: one sampled GP function for this step, then noisy particles.
+                function_id = int(rng.integers(0, gp_prior_train_values.shape[0]))
+                function_mean = gp_prior_train_values[function_id, ids]
+                prior = sample_gp_function_particle_prior_np(
+                    rng, function_mean, cfg.num_particles, cfg
+                )
         else:
             # Exact historical fresh-prior path retained as an opt-out/reproducibility mode.
             prior = sample_interpolated_prior_np(rng, yb, cfg, scaling)
@@ -1405,12 +1577,12 @@ def make_gp_prior_sampler(
     baseline_gp: GaussianProcessRegressor,
     cfg: Config,
 ) -> GaussianProcessRegressor:
-    """Return a fresh UNFITTED GP whose kernel hyperparameters define transport prior functions.
+    """Return a fresh UNFITTED GP whose kernel hyperparameters define transport-prior moments.
 
     ``initial`` uses a fresh copy of the configured make_gp() kernel. ``fitted`` requires
-    ``baseline_gp`` to have already been fitted and clones its learned ``kernel_``. Crucially, the
-    returned object is always UNFITTED: calling sample_y() therefore samples p(f | theta), not the
-    fitted GP posterior p(f | X_train, y_train, theta).
+    ``baseline_gp`` to have already been fitted and clones its learned ``kernel_``. The returned
+    object itself stays UNFITTED, so covariance_cloud uses prior mean/kernel covariance and the
+    optional function_samples path uses sample_y() from p(f | theta), never the fitted posterior.
     """
     source = cfg.gp_prior_hyperparameter_source
     if source == "initial":
@@ -1601,24 +1773,45 @@ if CFG.use_gp_function_priors:
         print("\n--- using configured INITIAL GP kernel hyperparameters for transport priors ---")
 
     gp_prior_sampler = make_gp_prior_sampler(gp_init if gp is None else gp, CFG)
-    print(
-        "--- sampling coherent prior functions from a fresh UNFITTED GP "
-        f"with {CFG.gp_prior_hyperparameter_source.upper()} hyperparameters ---"
-    )
-    gp_prior_bank = sample_gp_function_prior_bank(gp_prior_sampler, X_train, X_test, CFG)
-    print(
-        f"Sampled {gp_prior_bank.num_functions} joint GP prior functions over "
-        f"{len(X_train)} train + {len(X_test)} test x values."
-    )
+    if CFG.gp_prior_representation == "covariance_cloud":
+        print(
+            "--- building ONE covariance-aware GP prior cloud directly from mean/covariance "
+            f"with {CFG.gp_prior_hyperparameter_source.upper()} hyperparameters ---"
+        )
+        gp_covariance_prior = build_gp_covariance_prior_cloud(
+            gp_prior_sampler, X_train, X_test, CFG
+        )
+        gp_prior_bank = None
+        print(
+            f"Covariance factor rank={gp_covariance_prior.rank} | "
+            f"training represented rank={min(gp_covariance_prior.rank, CFG.num_particles - 1)} | "
+            f"evaluation represented rank={min(gp_covariance_prior.rank, CFG.eval_particles - 1)} | "
+            f"captured kernel trace={gp_covariance_prior.trace_fraction_captured:.3%} | "
+            f"max relative diagonal residual={gp_covariance_prior.max_relative_diag_residual:.3%}"
+        )
+        print("One joint GP cloud supplies training and inference; no prior averaging is required.")
+    else:
+        print(
+            "--- sampling coherent prior functions from a fresh UNFITTED GP "
+            f"with {CFG.gp_prior_hyperparameter_source.upper()} hyperparameters ---"
+        )
+        gp_prior_bank = sample_gp_function_prior_bank(gp_prior_sampler, X_train, X_test, CFG)
+        gp_covariance_prior = None
+        print(
+            f"Sampled {gp_prior_bank.num_functions} joint GP prior functions over "
+            f"{len(X_train)} train + {len(X_test)} test x values."
+        )
     print(f"Transport-prior kernel: {gp_prior_sampler.kernel}")
 else:
     gp_prior_sampler = None
     gp_prior_bank = None
+    gp_covariance_prior = None
 
 print("\n--- training particle transport ---")
 transport, history, posterior_replay_buffer = train_transport(
     X_train, Y_train, scaling, CFG, model=transport_init,
     gp_prior_train_values=(None if gp_prior_bank is None else gp_prior_bank.train_values),
+    gp_prior_train_cloud=(None if gp_covariance_prior is None else gp_covariance_prior.train_cloud),
 )
 
 print("\n--- training standard MLP ONCE ---")
@@ -1652,8 +1845,8 @@ eqx.tree_serialise_leaves(out / "particle_transport.eqx", transport)
 plot_training(history, out / "transport_training_diagnostics.pdf", CFG)
 
 print(
-    "\nTraining is complete. Re-run only the evaluation cells below to inspect GP-function "
-    "prior samples or, with use_gp_function_priors=False, the preserved legacy prior modes."
+    "\nTraining is complete. Re-run only the evaluation cells below to inspect GP-derived "
+    "prior behavior or, with use_gp_function_priors=False, the preserved legacy prior modes."
 )
 
 
@@ -2281,6 +2474,53 @@ def predict_transport_from_bounds(
 
 
 
+def predict_transport_gp_covariance_cloud(
+    model: ConditionalParticleTransport,
+    x: np.ndarray,
+    prior_cloud: np.ndarray,
+    cfg: Config,
+    *,
+    num_observations: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Transport ONE covariance-aware GP prior cloud; no sampling and no model averaging."""
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    prior = np.asarray(prior_cloud, dtype=np.float32)
+    if prior.shape != (len(x), cfg.eval_particles):
+        raise ValueError("prior_cloud must have shape [len(x), cfg.eval_particles].")
+    if cfg.likelihood_conditioning_mode == "direct":
+        n_obs = 1 if num_observations is None else int(num_observations)
+    else:
+        n_obs = cfg.test_observations_per_step if num_observations is None else int(num_observations)
+    x_observations = make_deployment_observation_block_np(x, cfg, num_observations=n_obs)
+
+    clouds: list[np.ndarray] = []
+    for start in range(0, len(x), cfg.eval_batch_size):
+        stop = start + cfg.eval_batch_size
+        cloud = _predict_batch(
+            model, jnp.asarray(prior[start:stop]), jnp.asarray(x_observations[start:stop]),
+            jnp.asarray(n_obs, dtype=jnp.int32),
+        )
+        clouds.append(np.asarray(jax.device_get(cloud), dtype=np.float32))
+    posterior = np.concatenate(clouds, axis=0)
+    prior_low = np.quantile(prior, cfg.interval_low_q, axis=1)
+    prior_high = np.quantile(prior, cfg.interval_high_q, axis=1)
+    return {
+        "cloud": posterior,
+        "mean": posterior.mean(axis=1),
+        "std": posterior.std(axis=1),
+        "low": np.quantile(posterior, cfg.interval_low_q, axis=1),
+        "high": np.quantile(posterior, cfg.interval_high_q, axis=1),
+        "prior_low": prior_low,
+        "prior_high": prior_high,
+        "prior_width": prior_high - prior_low,
+        "prior_mode": "gp_covariance_cloud",
+        "prior_distribution": "deterministic_low_rank_gp_mean_covariance_ensemble",
+        "num_observations": int(n_obs),
+        "num_prior_samples": 1,
+        "prior_cloud": prior,
+    }
+
+
 def predict_transport_gp_function_priors(
     model: ConditionalParticleTransport,
     x: np.ndarray,
@@ -2666,6 +2906,55 @@ def plot_gp_function_prior_bank(
     _save_and_show(fig, path, cfg)
 
 
+def plot_gp_covariance_prior_cloud(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_test: np.ndarray,
+    prior_cloud: GPCovariancePriorCloud,
+    path: Path,
+    cfg: Config = CFG,
+) -> None:
+    """Inspect the one joint GP covariance ensemble before transport inference."""
+    x_all = np.concatenate([x_train, x_test])
+    cloud_all = np.concatenate([prior_cloud.train_eval_cloud, prior_cloud.test_eval_cloud], axis=0)
+    mean_all = np.concatenate([prior_cloud.train_mean, prior_cloud.test_mean])
+    order = np.argsort(x_all)
+    low = np.quantile(cloud_all, cfg.interval_low_q, axis=1)
+    high = np.quantile(cloud_all, cfg.interval_high_q, axis=1)
+
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+    ax.scatter(
+        x_train, y_train, s=22, color="darkgreen", alpha=.40,
+        label="known in-domain training pairs", zorder=4,
+    )
+    # A few columns are shown only to reveal the shared covariance coordinates. They are NOT
+    # independently sampled functions; together all columns are one deterministic moment cloud.
+    for particle_id in range(min(8, cloud_all.shape[1])):
+        ax.plot(
+            x_all[order], cloud_all[order, particle_id], linewidth=.9, alpha=.18,
+            label="shared covariance-cloud particle coordinates" if particle_id == 0 else None,
+        )
+    ax.fill_between(
+        x_all[order], low[order], high[order], alpha=.18, linewidth=0,
+        label="covariance-cloud empirical 95% interval",
+    )
+    ax.plot(
+        x_all[order], mean_all[order], color="black", linewidth=2.0,
+        label="GP prior mean",
+    )
+    ax.set_xlabel("x")
+    ax.set_ylabel("GP prior particle value")
+    ax.set_title(
+        "PRIOR INSPECTION BEFORE TEST INFERENCE: one GP covariance cloud\n"
+        f"pivoted-Cholesky rank={prior_cloud.rank}; captured kernel trace="
+        f"{prior_cloud.trace_fraction_captured:.2%}"
+    )
+    ax.grid(alpha=.15)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
+
+
 def plot_gp_function_prior_posterior(
     x_train: np.ndarray,
     y_train: np.ndarray,
@@ -2889,7 +3178,10 @@ def plot_transport(
         label="Posterior mean (test)", color="darkred", lw=2.6,
     )
 
-    if str(test_pred.get("prior_mode", "")).startswith("gp_function"):
+    prior_mode = str(test_pred.get("prior_mode", ""))
+    if prior_mode == "gp_covariance_cloud":
+        prior_title = "single GP covariance cloud; no prior averaging"
+    elif prior_mode.startswith("gp_function"):
         prior_title = (
             f"GP-function prior average over {test_pred.get('num_prior_samples', '?')} samples; "
             f"particle noise std={cfg.gp_prior_particle_noise_std:g}"
@@ -2958,7 +3250,13 @@ def plot_comparison(
         axes[2], x_test, tr_test["mean"],
         label="Transport mean (test)", color="darkred", lw=2.5,
     )
-    if str(tr_test.get("prior_mode", "")).startswith("gp_function"):
+    prior_mode = str(tr_test.get("prior_mode", ""))
+    if prior_mode == "gp_covariance_cloud":
+        transport_title = (
+            f"Particle Transport ({cfg.posterior_conditioning}; single GP covariance cloud; "
+            f"o={tr_test.get('num_observations', '?')})"
+        )
+    elif prior_mode.startswith("gp_function"):
         transport_title = (
             f"Particle Transport ({cfg.posterior_conditioning}; GP-function prior average; "
             f"K={tr_test.get('num_prior_samples', '?')}; o={tr_test.get('num_observations', '?')})"
@@ -2978,28 +3276,45 @@ def plot_comparison(
 
 
 #%% 10) Choose / inspect a test-time prior AFTER training
-# With GP-function priors enabled, evaluation uses the SAME sampled functions that were drawn from
+# With GP-derived priors enabled, evaluation uses the SAME sampled functions that were drawn from
 # the unfitted GP before transport training. Each function row was evaluated jointly on both train
 # and test x, so train/test values remain one coherent f(x). The old interval-prior catalog is kept
 # unchanged as an opt-out path when CFG.use_gp_function_priors=False.
 if CFG.use_gp_function_priors:
-    EVAL_MODE = "gp_function_samples"
-    if gp_prior_bank is None:
-        raise RuntimeError("GP-function evaluation requires the pre-training gp_prior_bank.")
-    print(
-        f"\nSelected evaluation prior mode: {EVAL_MODE} | "
-        f"K={CFG.gp_prior_eval_samples} coherent GP functions | "
-        f"particle noise std={CFG.gp_prior_particle_noise_std:.4f}"
-    )
-    print(
-        "These cached prior functions were sampled from a fresh UNFITTED GP carrying the "
-        f"{CFG.gp_prior_hyperparameter_source.upper()} kernel hyperparameters. "
-        "No fitted-GP posterior is used as a transport prior."
-    )
-    plot_gp_function_prior_bank(
-        X_train, Y_train, X_test, gp_prior_bank,
-        out / f"evaluation_prior_ranges_{EVAL_MODE}.pdf", CFG,
-    )
+    if CFG.gp_prior_representation == "covariance_cloud":
+        EVAL_MODE = "gp_covariance_cloud"
+        if gp_covariance_prior is None:
+            raise RuntimeError("GP covariance-cloud evaluation requires gp_covariance_prior.")
+        print(
+            f"\nSelected evaluation prior mode: {EVAL_MODE} | one joint cloud | "
+            f"rank={gp_covariance_prior.rank} | eval particles={CFG.eval_particles}"
+        )
+        print(
+            "Built directly from the fresh UNFITTED GP mean/kernel covariance using "
+            f"{CFG.gp_prior_hyperparameter_source.upper()} hyperparameters. "
+            "No function sampling, output noisification, or prior averaging is used."
+        )
+        plot_gp_covariance_prior_cloud(
+            X_train, Y_train, X_test, gp_covariance_prior,
+            out / f"evaluation_prior_ranges_{EVAL_MODE}.pdf", CFG,
+        )
+    else:
+        EVAL_MODE = "gp_function_samples"
+        if gp_prior_bank is None:
+            raise RuntimeError("GP-function evaluation requires the pre-training gp_prior_bank.")
+        print(
+            f"\nSelected evaluation prior mode: {EVAL_MODE} | "
+            f"K={CFG.gp_prior_eval_samples} coherent GP functions | "
+            f"particle noise std={CFG.gp_prior_particle_noise_std:.4f}"
+        )
+        print(
+            "These cached prior functions were sampled from a fresh UNFITTED GP carrying the "
+            f"{CFG.gp_prior_hyperparameter_source.upper()} kernel hyperparameters."
+        )
+        plot_gp_function_prior_bank(
+            X_train, Y_train, X_test, gp_prior_bank,
+            out / f"evaluation_prior_ranges_{EVAL_MODE}.pdf", CFG,
+        )
 else:
     # Historical post-training interval-prior experiments are preserved unchanged below.
     EVAL_MODE = CFG.evaluation_prior_mode
@@ -3095,32 +3410,36 @@ else:
     # DEPLOYMENT_OBSERVATIONS = CFG.max_observations_per_step
 
 if CFG.use_gp_function_priors:
-    # Evaluate K prior functions in parallel. Each sampled f(x) independently generates one full
-    # posterior cloud. The returned tr_* cloud is the equal-weight empirical mixture over all K,
-    # which is the averaged prediction plotted beside the NN and fitted GP baselines.
-    tr_train = predict_transport_gp_function_priors(
-        transport, X_train, gp_prior_bank.train_values, CFG,
-        seed=CFG.seed + 30_001,
-        num_prior_samples=CFG.gp_prior_eval_samples,
-        num_observations=DEPLOYMENT_OBSERVATIONS,
-    )
-    tr_test = predict_transport_gp_function_priors(
-        transport, X_test, gp_prior_bank.test_values, CFG,
-        seed=CFG.seed + 30_002,
-        num_prior_samples=CFG.gp_prior_eval_samples,
-        num_observations=DEPLOYMENT_OBSERVATIONS,
-    )
-
-    # One sampled prior function -> one posterior cloud. Save several such plots before the
-    # aggregate comparison so prior-to-prior variability is directly visible.
-    for prior_index in range(CFG.gp_prior_plot_samples):
-        one_train = select_gp_function_prior_prediction(tr_train, prior_index, CFG)
-        one_test = select_gp_function_prior_prediction(tr_test, prior_index, CFG)
-        plot_gp_function_prior_posterior(
-            X_train, Y_train, X_test, Y_test,
-            one_train, one_test, prior_index,
-            out / f"transport_gp_prior_sample_{prior_index + 1:02d}.pdf", CFG,
+    if CFG.gp_prior_representation == "covariance_cloud":
+        tr_train = predict_transport_gp_covariance_cloud(
+            transport, X_train, gp_covariance_prior.train_eval_cloud, CFG,
+            num_observations=DEPLOYMENT_OBSERVATIONS,
         )
+        tr_test = predict_transport_gp_covariance_cloud(
+            transport, X_test, gp_covariance_prior.test_eval_cloud, CFG,
+            num_observations=DEPLOYMENT_OBSERVATIONS,
+        )
+    else:
+        # Historical v2 evaluation: K sampled prior functions, one posterior each, then averaging.
+        tr_train = predict_transport_gp_function_priors(
+            transport, X_train, gp_prior_bank.train_values, CFG,
+            seed=CFG.seed + 30_001,
+            num_prior_samples=CFG.gp_prior_eval_samples,
+            num_observations=DEPLOYMENT_OBSERVATIONS,
+        )
+        tr_test = predict_transport_gp_function_priors(
+            transport, X_test, gp_prior_bank.test_values, CFG,
+            seed=CFG.seed + 30_002,
+            num_prior_samples=CFG.gp_prior_eval_samples,
+            num_observations=DEPLOYMENT_OBSERVATIONS,
+        )
+        for prior_index in range(CFG.gp_prior_plot_samples):
+            one_train = select_gp_function_prior_prediction(tr_train, prior_index, CFG)
+            one_test = select_gp_function_prior_prediction(tr_test, prior_index, CFG)
+            plot_gp_function_prior_posterior(
+                X_train, Y_train, X_test, Y_test, one_train, one_test, prior_index,
+                out / f"transport_gp_prior_sample_{prior_index + 1:02d}.pdf", CFG,
+            )
 else:
     # Historical evaluation path retained unchanged.
     tr_train = predict_transport_from_bounds(
@@ -3161,9 +3480,18 @@ metrics = {
     "gp_prior_hyperparameter_source": (
         CFG.gp_prior_hyperparameter_source if CFG.use_gp_function_priors else None
     ),
-    "gp_prior_eval_samples": int(CFG.gp_prior_eval_samples) if CFG.use_gp_function_priors else None,
+    "gp_prior_representation": (CFG.gp_prior_representation if CFG.use_gp_function_priors else None),
+    "gp_prior_covariance_rank": (None if gp_covariance_prior is None else int(gp_covariance_prior.rank)),
+    "gp_prior_covariance_trace_fraction_captured": (
+        None if gp_covariance_prior is None else float(gp_covariance_prior.trace_fraction_captured)
+    ),
+    "gp_prior_eval_samples": (
+        int(CFG.gp_prior_eval_samples)
+        if CFG.use_gp_function_priors and CFG.gp_prior_representation == "function_samples" else None
+    ),
     "gp_prior_particle_noise_std": (
-        float(CFG.gp_prior_particle_noise_std) if CFG.use_gp_function_priors else None
+        float(CFG.gp_prior_particle_noise_std)
+        if CFG.use_gp_function_priors and CFG.gp_prior_representation == "function_samples" else None
     ),
     "likelihood_conditioning_mode": CFG.likelihood_conditioning_mode,
     "deployment_observations": int(DEPLOYMENT_OBSERVATIONS),
@@ -3185,11 +3513,18 @@ print(
     f"likelihood observations={DEPLOYMENT_OBSERVATIONS}"
 )
 if CFG.use_gp_function_priors:
-    print(
-        f"GP-function average uses K={CFG.gp_prior_eval_samples} coherent prior draws with "
-        f"{CFG.gp_prior_hyperparameter_source.upper()} GP hyperparameters; "
-        f"saved {CFG.gp_prior_plot_samples} individual prior->posterior plots."
-    )
+    if CFG.gp_prior_representation == "covariance_cloud":
+        print(
+            f"GP covariance cloud uses rank={gp_covariance_prior.rank} with "
+            f"{CFG.gp_prior_hyperparameter_source.upper()} GP hyperparameters; "
+            "one prior cloud and one posterior cloud are used at inference."
+        )
+    else:
+        print(
+            f"GP function-sample average uses K={CFG.gp_prior_eval_samples} coherent prior draws with "
+            f"{CFG.gp_prior_hyperparameter_source.upper()} GP hyperparameters; "
+            f"saved {CFG.gp_prior_plot_samples} individual prior->posterior plots."
+        )
 elif EVAL_MODE == "nearest_posterior":
     print(
         "Nearest-posterior propagation: "
