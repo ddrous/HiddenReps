@@ -1,15 +1,16 @@
 #%% 0) Imports and experiment overview
 """Conditional empirical-posterior regression from observed (x, y) pairs only.
 
-A cloud of candidate y values is transported by one particle Transformer. For the GP-derived
-covariance-cloud path, each query x receives a simple local Gaussian prior. The SAME GP kernel used
-by the baseline supplies non-negative similarity weights to the observed training pairs: the prior
-mean is their kernel-weighted y average, and the local weighted y variance is blended toward the
-global training-y variance as kernel support disappears. Thus priors are narrow near observed x
-support and widen away from it. Particles are sampled directly from those pointwise Gaussians; no
-Cholesky factorisation, low-rank joint covariance construction, GP function bank, output
-noisification, or inference-time prior averaging is required. The historical sampled-function GP
-prior remains available as an option.
+A cloud of candidate y values is transported by one particle Transformer. An optional data-free
+Stage 0 performs functional-prior matching before supervised transport training: random measurement
+inputs are drawn from the configured input domain, target functions are sampled from the configured
+UNFITTED initial GP prior, and a Wasserstein critic adapts the transport so its prior function samples
+look GP-like before any observed (x,y) pair or empirical likelihood is used. Disabling Stage 0 leaves
+the original Equinox parameter initialization untouched.
+
+For the GP-derived covariance-cloud path, each query x receives a simple local Gaussian prior. The
+SAME GP kernel used by the baseline supplies non-negative similarity weights to the observed training
+pairs; the historical sampled-function GP prior remains available as an option.
 For each observed training pair (x, y*), x is treated as the centre of a configurable Gaussian
 empirical likelihood p(x_lik | y*). A configurable block of independent noisy x_lik observations
 is causally contextualised by a likelihood Transformer before conditioning the particle transport.
@@ -92,11 +93,28 @@ class Config:
 
     # Training: one epoch = one observed-data minibatch / optimizer step.
     epochs: int = 25000
-    batch_size: int = 64*1
+    batch_size: int = 64*4
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     grad_clip_norm: float = 5.0
     log_every: int = 250
+
+    # Stage 0: data-free functional-prior matching before supervised transport training.
+    # The critic settings follow Tran et al. (2022): two 200-unit Softplus layers, Adagrad lr=0.02,
+    # gradient-penalty lambda=10, and 200 critic iterations per outer update. For the outer RMSprop step
+    # we use the paper's 0.01 rate for non-UCI/non-banana experiments. The paper does not set a
+    # universal outer-loop count (it runs until convergence), so this script exposes one explicitly.
+    stage0_enabled: bool = False
+    stage0_outer_steps: int = 250
+    stage0_num_function_samples: int = 128
+    stage0_measurement_points: int = 100
+    stage0_n_lipschitz: int = 200
+    stage0_critic_hidden_dim: int = 200
+    stage0_critic_learning_rate: float = 0.01
+    stage0_model_learning_rate: float = 0.01
+    stage0_gradient_penalty: float = 10.0
+    stage0_log_every: int = 10
+    stage0_plot_functions: int = 8
 
     # Historical/legacy base y-prior family, preserved unchanged for reproducibility and for the
     # non-GP training/evaluation paths. "uniform" preserves the hard support [prior_min, prior_max].
@@ -111,12 +129,15 @@ class Config:
     gaussian_prior_std: float = 1.0
     gaussian_prior_visual_z: float = 2.0
 
-    # Historical shared-tau contraction/interpolation range; inactive for fresh priors when
-    # GP priors are used for training. Defaults reproduce the existing tau~U(0,1).
-    # For a Gaussian cloud and a fixed anchor, C_tau=(1-tau)Z+tau*anchor remains Gaussian and
-    # its within-cloud std contracts exactly to (1-tau)*gaussian_prior_std.
+    # Historical shared-tau contraction/interpolation range; TRAINING ONLY and inactive for fresh
+    # priors when GP priors are used for training. Defaults reproduce the existing tau~U(0,1), but
+    # tau may now exceed 1 for extrapolation through the anchor:
+    #     C_tau = (1-tau) Z + tau * anchor.
+    # Its cloud width is |1-tau| times the base-cloud width, so tau > 2 presents clouds wider than
+    # the original base prior during training. Evaluation bounds remain controlled independently by
+    # evaluation_prior_mode / prior_min / prior_max and are never enlarged by this setting.
     prior_interpolation_tau_min: float = 0.0
-    prior_interpolation_tau_max: float = 1.0
+    prior_interpolation_tau_max: float = 4.0
 
     # Empirical likelihood attached to each supplied training pair:
     #     x_lik ~ Normal(x_pair, likelihood_x_noise_std^2).
@@ -156,8 +177,13 @@ class Config:
     #       With prior=[-2,2] and fraction=0.5, this gives U(y*-1, y*+1).
     #   "widest": reuse the full configured training support.
     #   "nearest_training": infer a local support only from nearby known training (x,y) pairs.
-    evaluation_prior_mode: str = "widest"  # {"cheating", "widest", "nearest_training"}
-    cheating_prior_width_fraction: float = 0.90
+    #   "in_domain_oracle_ood_widest": oracle-centred prior in-domain; widest prior OOD.
+    #   "honest": no query labels/OOD flag; locally interpolate known training outputs in inferred
+    #       training support, then rapidly revert to the widest prior outside that support.
+    evaluation_prior_mode: str = "widest"  # {"cheating", "widest", "nearest_training", "in_domain_oracle_ood_widest", "honest"}
+    honest_ood_decay_scale = 1.0
+    cheating_prior_width_fraction: float = 0.05
+    # cheating_prior_width_fraction: float = 0.9
     eval_local_prior_k: int = 64
     eval_local_prior_margin: float = 0.25
     eval_local_prior_min_width: float = 1.00
@@ -240,6 +266,21 @@ def gp_priors_enabled_for_evaluation(cfg: Config = CFG) -> bool:
 def validate_config(cfg: Config) -> None:
     if cfg.num_particles < 2 or cfg.eval_particles < 2:
         raise ValueError("Particle counts must be >= 2.")
+    if cfg.stage0_enabled:
+        if cfg.stage0_outer_steps < 1:
+            raise ValueError("stage0_outer_steps must be >= 1.")
+        if cfg.stage0_num_function_samples < 2:
+            raise ValueError("stage0_num_function_samples must be >= 2.")
+        if cfg.stage0_measurement_points < 2:
+            raise ValueError("stage0_measurement_points must be >= 2.")
+        if cfg.stage0_n_lipschitz < 1 or cfg.stage0_critic_hidden_dim < 1:
+            raise ValueError("stage0_n_lipschitz and stage0_critic_hidden_dim must be >= 1.")
+        if cfg.stage0_critic_learning_rate <= 0.0 or cfg.stage0_model_learning_rate <= 0.0:
+            raise ValueError("Stage-0 learning rates must be > 0.")
+        if cfg.stage0_gradient_penalty < 0.0:
+            raise ValueError("stage0_gradient_penalty must be >= 0.")
+        if cfg.stage0_log_every < 1 or cfg.stage0_plot_functions < 1:
+            raise ValueError("stage0_log_every and stage0_plot_functions must be >= 1.")
     if cfg.hidden_dim % cfg.heads != 0:
         raise ValueError("hidden_dim must be divisible by heads.")
     if cfg.posterior_conditioning not in {"adaln", "cross_attention"}:
@@ -258,8 +299,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("gaussian_prior_std must be > 0.")
     if cfg.gaussian_prior_visual_z <= 0.0:
         raise ValueError("gaussian_prior_visual_z must be > 0.")
-    if not (0.0 <= cfg.prior_interpolation_tau_min <= cfg.prior_interpolation_tau_max <= 1.0):
-        raise ValueError("prior_interpolation_tau_min/max must satisfy 0 <= min <= max <= 1.")
+    if not (0.0 <= cfg.prior_interpolation_tau_min <= cfg.prior_interpolation_tau_max):
+        raise ValueError("prior_interpolation_tau_min/max must satisfy 0 <= min <= max.")
     if cfg.likelihood_x_noise_std <= 0.0:
         raise ValueError("likelihood_x_noise_std must be > 0 for a non-degenerate Gaussian likelihood.")
     if cfg.likelihood_conditioning_mode not in {"transformer", "direct"}:
@@ -295,10 +336,13 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("likelihood_hidden_dim must be divisible by likelihood_heads.")
     if cfg.likelihood_mlp_ratio < 1 or cfg.likelihood_depth < 1:
         raise ValueError("likelihood_mlp_ratio and likelihood_depth must both be >= 1.")
-    if cfg.evaluation_prior_mode not in {"cheating", "widest", "nearest_training", "nearest_posterior"}:
+    if cfg.evaluation_prior_mode not in {
+        "cheating", "widest", "nearest_training", "nearest_posterior",
+        "in_domain_oracle_ood_widest", "honest",
+    }:
         raise ValueError(
             "evaluation_prior_mode must be 'cheating', 'widest', 'nearest_training', "
-            "or 'nearest_posterior'."
+            "'nearest_posterior', 'in_domain_oracle_ood_widest', or 'honest'."
         )
     if not 0.0 < cfg.cheating_prior_width_fraction <= 1.0:
         raise ValueError("cheating_prior_width_fraction must lie in (0,1].")
@@ -341,21 +385,30 @@ def base_prior_effective_bounds(cfg: Config = CFG) -> tuple[float, float]:
     return float(cfg.gaussian_prior_mean) - half, float(cfg.gaussian_prior_mean) + half
 
 
-def make_scaling(x_train: np.ndarray, y_train: np.ndarray, cfg: Config = CFG) -> Scaling:
-    """Normalization derived from x_train and the configured base-prior effective span."""
-    del y_train  # y targets do not determine the base prior.
-    x_lo, x_hi = float(x_train.min()), float(x_train.max())
+def make_scaling_from_x_bounds(x_lo: float, x_hi: float, cfg: Config = CFG) -> Scaling:
+    """Build transport normalization from explicit x bounds and the configured base-prior span."""
     prior_low, prior_high = base_prior_effective_bounds(cfg)
     y_center = 0.5 * (prior_low + prior_high)
     y_half = max(0.5 * (prior_high - prior_low), 1e-6)
     return Scaling(
-        x_center=0.5 * (x_lo + x_hi),
-        x_scale=max(0.5 * (x_hi - x_lo), 1e-6),
+        x_center=0.5 * (float(x_lo) + float(x_hi)),
+        x_scale=max(0.5 * (float(x_hi) - float(x_lo)), 1e-6),
         y_center=y_center,
         y_scale=y_half,
         prior_low=prior_low,
         prior_high=prior_high,
     )
+
+
+def make_scaling(x_train: np.ndarray, y_train: np.ndarray, cfg: Config = CFG) -> Scaling:
+    """Historical supervised normalization, still derived from the observed training x range."""
+    del y_train  # y targets do not determine the base prior.
+    return make_scaling_from_x_bounds(float(x_train.min()), float(x_train.max()), cfg)
+
+
+def make_stage0_scaling(cfg: Config = CFG) -> Scaling:
+    """Data-free normalization from the configured input domain only."""
+    return make_scaling_from_x_bounds(float(cfg.x_range[0]), float(cfg.x_range[1]), cfg)
 
 
 
@@ -409,7 +462,7 @@ def plot_prior_interpolation_demo(
     *,
     seed: int | None = None,
 ) -> None:
-    """Visualise shared-tau contraction of the selected base prior before any predictions."""
+    """Visualise training-only shared-tau contraction/extrapolation of the selected base prior."""
     rng = np.random.default_rng(cfg.seed + 707 if seed is None else int(seed))
     n = 512
     z = sample_base_prior_np(rng, (n,), cfg)
@@ -433,10 +486,10 @@ def plot_prior_interpolation_demo(
         body.set_alpha(.35)
     parts["cmeans"].set_linewidth(2.0)
     ax.axhline(anchor, color="black", linestyle="--", linewidth=1.2, label="illustrative anchor")
-    ax.set_xlabel(r"shared contraction/interpolation $\tau$")
+    ax.set_xlabel(r"shared contraction/extrapolation $\tau$")
     ax.set_ylabel("candidate y")
     family = "Uniform" if cfg.base_prior_distribution == "uniform" else "Gaussian"
-    ax.set_title(f"{family} base-prior contraction before training/prediction")
+    ax.set_title(f"{family} training-prior contraction/extrapolation")
     ax.set_xticks(taus)
     ax.grid(alpha=.15)
     ax.legend(loc="best")
@@ -527,7 +580,7 @@ else:
             f"= [{scaling.prior_low:.3f}, {scaling.prior_high:.3f}]"
         )
     print(
-        "Shared-tau prior interpolation/contraction: "
+        "Shared-tau TRAINING prior contraction/extrapolation: "
         f"tau ~ U({CFG.prior_interpolation_tau_min:.3f}, {CFG.prior_interpolation_tau_max:.3f})"
     )
 
@@ -896,6 +949,22 @@ class ConditionalParticleTransport(eqx.Module):
         self.min_observations = int(cfg.min_observations_per_step)
         self.max_observations = int(cfg.max_observations_per_step)
 
+    def functional_prior_transport(self, prior_y: Array, x: Array) -> Array:
+        """Evaluate a prior function at one clean x coordinate, with no empirical likelihood draw.
+
+        Stage 0 uses synthetic measurement coordinates sampled from ``cfg.x_range``. In direct mode
+        the clean coordinate follows the existing x projection. In Transformer mode it is represented
+        by one clean token only; there is no Gaussian x_lik noise, observed pair, prefix sequence, or
+        replay state. This keeps Stage 0 a function-space initialization procedure rather than a
+        likelihood-conditioning step.
+        """
+        if self.likelihood_conditioning_mode == "direct":
+            return self.direct_transport(prior_y, x)
+        contexts = self.encode_observations(jnp.reshape(x, (1,)))
+        return self.transport_with_contexts(
+            prior_y, contexts, jnp.asarray(1, dtype=jnp.int32)
+        )
+
     def direct_transport(self, prior_y: Array, x: Array) -> Array:
         """Historical direct cosine path: prior_y [N], ONE x scalar -> posterior_y [N]."""
         if self.likelihood_conditioning_mode != "direct":
@@ -1260,13 +1329,14 @@ def sample_interpolated_prior_np(
     cfg: Config,
     scaling: Scaling,
 ) -> np.ndarray:
-    """Legacy shared-tau contraction/interpolation for either Uniform or Gaussian base particles.
+    """Training-only shared-tau contraction/extrapolation for Uniform or Gaussian base particles.
 
-    This path is retained unchanged for reproducibility and is used when
-    GP priors are disabled for training.
+    This path is used only when GP priors are disabled for training. Evaluation priors are built
+    separately from their configured bounds and never use this tau range.
 
     C_tau=(1-tau)Z+tau*anchor uses one shared tau per cloud. For Gaussian Z and a fixed anchor,
-    the resulting cloud is still Gaussian with std (1-tau)*sigma, so contraction is exact.
+    the resulting cloud remains Gaussian with std |1-tau|*sigma. Thus 0<=tau<=1 contracts toward
+    the anchor, tau>1 extrapolates through it, and tau>2 is wider than the original base cloud.
     No synthetic (x,y) pairs are created.
     """
     b = len(target_y)
@@ -1727,14 +1797,312 @@ def fit_gp(
 ) -> GaussianProcessRegressor:
     print("Gaussian Process...")
 
-    # ## Randomly subsample 1000 examples
-    # indices = np.random.choice(len(x_train), size=min(1000, len(x_train)), replace=False)
-    # x_train = x_train[indices]
-    # y_train = y_train[indices]
-
     gp.fit(x_train[:, None], y_train)
     print(f"Learned kernel: {gp.kernel_}")
     return gp
+
+
+
+def _gp_prior_factor_np(kernel, x: np.ndarray) -> np.ndarray:
+    """Cholesky factor of the finite zero-mean GP prior at one measurement set."""
+    x2 = np.asarray(x, dtype=np.float64).reshape(-1, 1)
+    covariance = np.asarray(kernel(x2), dtype=np.float64)
+    jitter = 1e-8 * max(float(np.max(np.diag(covariance))), 1.0)
+    return np.linalg.cholesky(
+        covariance + jitter * np.eye(len(x2), dtype=np.float64)
+    )
+
+
+def _sample_zero_mean_gp_functions_np(
+    factor: np.ndarray,
+    num_functions: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draw finite GP-prior functions from a precomputed covariance factor."""
+    factor = np.asarray(factor, dtype=np.float64)
+    noise = rng.normal(size=(int(num_functions), factor.shape[0]))
+    return (noise @ factor.T).astype(np.float32)
+
+
+def _functional_samples_from_clouds(
+    model: ConditionalParticleTransport,
+    base_clouds: Array,
+    x_measure: Array,
+    num_functions: int,
+) -> Array:
+    """Treat particle index across clean measurement x values as one sampled prior function."""
+    def functions_from_one_cloud(cloud):
+        values_by_x = jax.vmap(lambda xi: model.functional_prior_transport(cloud, xi))(x_measure)
+        return jnp.swapaxes(values_by_x, 0, 1)  # [particles, measurement points]
+
+    functions = jax.vmap(functions_from_one_cloud)(base_clouds)
+    return functions.reshape(-1, x_measure.shape[0])[: int(num_functions)]
+
+
+def _stage0_base_clouds_np(
+    rng: np.random.Generator,
+    cfg: Config,
+    scaling: Scaling,
+) -> np.ndarray:
+    groups = int(np.ceil(cfg.stage0_num_function_samples / cfg.num_particles))
+    return sample_base_prior_np(rng, (groups, cfg.num_particles), cfg, scaling)
+
+
+def fit_stage0_functional_prior(
+    model: ConditionalParticleTransport,
+    target_kernel,
+    scaling: Scaling,
+    cfg: Config = CFG,
+) -> tuple[ConditionalParticleTransport, dict[str, list[float]]]:
+    """Data-free Wasserstein functional-prior matching adapted from Tran et al. (2022).
+
+    Only configured input bounds, the configured base prior, an unfitted GP kernel, and fresh random
+    samples are used. Observed X/Y arrays, empirical likelihood noise, replay, GP fitting, and the
+    supervised energy-score objective are intentionally absent.
+    """
+    critic = eqx.nn.MLP(
+        in_size=cfg.stage0_measurement_points,
+        out_size=1,
+        width_size=cfg.stage0_critic_hidden_dim,
+        depth=2,
+        activation=jax.nn.softplus,
+        key=jax.random.key(cfg.seed + 70_001),
+    )
+    critic_opt = optax.adagrad(cfg.stage0_critic_learning_rate)
+    model_opt = optax.rmsprop(cfg.stage0_model_learning_rate)
+
+    # ``eqx.nn.MLP`` contains static Python/JAX callables (e.g. ``jax.nn.softplus``).
+    # A ``jax.lax.scan`` carry may contain only JAX-compatible leaves, so keep the
+    # critic's static structure outside the scan and carry only its array parameters.
+    critic_params, critic_static = eqx.partition(critic, eqx.is_array)
+    critic_state = critic_opt.init(critic_params)
+    model_state = model_opt.init(eqx.filter(model, eqx.is_array))
+    rng = np.random.default_rng(cfg.seed + 70_003)
+    key = jax.random.key(cfg.seed + 70_005)
+    num_functions = int(cfg.stage0_num_function_samples)
+
+    def critic_scores(c, functions):
+        return jax.vmap(lambda f: c(f)[0])(functions)
+
+    def critic_statistics(c, gp_functions, model_functions, epsilon):
+        gp_score = critic_scores(c, gp_functions)
+        model_score = critic_scores(c, model_functions)
+        interpolated = epsilon * model_functions + (1.0 - epsilon) * gp_functions
+        grad_fn = jax.grad(lambda f: c(f)[0])
+        gradients = jax.vmap(grad_fn)(interpolated)
+        penalty = jnp.mean((jnp.linalg.norm(gradients, axis=1) - 1.0) ** 2)
+        wasserstein = jnp.mean(gp_score) - jnp.mean(model_score)
+        return wasserstein, penalty
+
+    @eqx.filter_value_and_grad
+    def critic_param_loss(c_params, gp_functions, model_functions, epsilon):
+        c = eqx.combine(c_params, critic_static)
+        wasserstein, penalty = critic_statistics(
+            c, gp_functions, model_functions, epsilon
+        )
+        # Minimize the negative Kantorovich objective plus the WGAN-GP Lipschitz penalty.
+        return -wasserstein + cfg.stage0_gradient_penalty * penalty
+
+    @eqx.filter_jit
+    def critic_round(c_params, state, gp_functions, model_functions, round_key):
+        def one_step(carry, _):
+            params_now, state_now, key_now = carry
+            key_now, eps_key = jax.random.split(key_now)
+            epsilon = jax.random.uniform(eps_key, (num_functions, 1))
+            loss, grads = critic_param_loss(
+                params_now, gp_functions, model_functions, epsilon
+            )
+            updates, state_now = critic_opt.update(grads, state_now, params_now)
+            params_now = eqx.apply_updates(params_now, updates)
+            return (params_now, state_now, key_now), loss
+
+        (c_params, state, round_key), losses = jax.lax.scan(
+            one_step, (c_params, state, round_key),
+            xs=None, length=cfg.stage0_n_lipschitz,
+        )
+        return c_params, state, round_key, jnp.mean(losses)
+
+    @eqx.filter_value_and_grad
+    def model_loss(m, c, gp_functions, base_clouds, x_measure):
+        model_functions = _functional_samples_from_clouds(
+            m, base_clouds, x_measure, num_functions
+        )
+        return jnp.mean(critic_scores(c, gp_functions)) - jnp.mean(
+            critic_scores(c, model_functions)
+        )
+
+    @eqx.filter_jit
+    def model_step(m, state, c, gp_functions, base_clouds, x_measure):
+        loss, grads = model_loss(m, c, gp_functions, base_clouds, x_measure)
+        updates, state = model_opt.update(grads, state, eqx.filter(m, eqx.is_array))
+        return eqx.apply_updates(m, updates), state, loss
+
+    history = {"step": [], "estimated_w1": [], "critic_loss": [], "gradient_penalty": []}
+    x_lo, x_hi = map(float, cfg.x_range)
+
+    for step in range(1, cfg.stage0_outer_steps + 1):
+        # q(x): low-dimensional uniform measurement set, independent of observed data.
+        x_measure_np = np.sort(
+            rng.uniform(x_lo, x_hi, cfg.stage0_measurement_points).astype(np.float32)
+        )
+        gp_factor = _gp_prior_factor_np(target_kernel, x_measure_np)
+        gp_functions_np = _sample_zero_mean_gp_functions_np(
+            gp_factor, num_functions, rng
+        )
+        base_clouds_np = _stage0_base_clouds_np(rng, cfg, scaling)
+        x_measure = jnp.asarray(x_measure_np)
+        gp_functions = jnp.asarray(gp_functions_np)
+        base_clouds = jnp.asarray(base_clouds_np)
+
+        # The transport is fixed during the inner critic optimization, so one fresh function batch per
+        # outer iteration is sufficient and avoids recomputing the expensive particle map 200 times.
+        model_functions = _functional_samples_from_clouds(
+            model, base_clouds, x_measure, num_functions
+        )
+        critic_params, critic_state, key, mean_critic_loss = critic_round(
+            critic_params, critic_state, gp_functions, model_functions, key
+        )
+        critic = eqx.combine(critic_params, critic_static)
+
+        # Fresh samples for the single outer update, mirroring Algorithm 1's separation of the loops.
+        gp_functions_np = _sample_zero_mean_gp_functions_np(
+            gp_factor, num_functions, rng
+        )
+        base_clouds_np = _stage0_base_clouds_np(rng, cfg, scaling)
+        gp_functions = jnp.asarray(gp_functions_np)
+        base_clouds = jnp.asarray(base_clouds_np)
+        model, model_state, _ = model_step(
+            model, model_state, critic, gp_functions, base_clouds, x_measure
+        )
+
+        model_functions_after = _functional_samples_from_clouds(
+            model, base_clouds, x_measure, num_functions
+        )
+        key, eps_key = jax.random.split(key)
+        epsilon = jax.random.uniform(eps_key, (num_functions, 1))
+        estimated_w1, penalty = critic_statistics(
+            critic, gp_functions, model_functions_after, epsilon
+        )
+        history["step"].append(step)
+        history["estimated_w1"].append(float(estimated_w1))
+        history["critic_loss"].append(float(mean_critic_loss))
+        history["gradient_penalty"].append(float(penalty))
+
+        if step == 1 or step % cfg.stage0_log_every == 0 or step == cfg.stage0_outer_steps:
+            print(
+                f"Stage 0 {step:4d}/{cfg.stage0_outer_steps} | "
+                f"W1~ {float(estimated_w1):.5f} | "
+                f"critic {float(mean_critic_loss):.5f} | grad-pen {float(penalty):.5f}"
+            )
+
+    return model, history
+
+
+def plot_stage0_functional_prior(
+    before: ConditionalParticleTransport,
+    after: ConditionalParticleTransport,
+    target_kernel,
+    scaling: Scaling,
+    path: Path,
+    cfg: Config = CFG,
+) -> None:
+    """Plot target GP functions and transport prior functions before/after Stage 0, data-free."""
+    rng = np.random.default_rng(cfg.seed + 70_101)
+    x = np.linspace(float(cfg.x_range[0]), float(cfg.x_range[1]), 180, dtype=np.float32)
+    n = max(int(cfg.stage0_num_function_samples), 64)
+    groups = int(np.ceil(n / cfg.num_particles))
+    base_clouds = sample_base_prior_np(rng, (groups, cfg.num_particles), cfg, scaling)
+    gp_factor = _gp_prior_factor_np(target_kernel, x)
+    gp_functions = _sample_zero_mean_gp_functions_np(gp_factor, n, rng)
+    xb = jnp.asarray(x)
+    clouds = jnp.asarray(base_clouds)
+    before_functions = np.asarray(jax.device_get(
+        _functional_samples_from_clouds(before, clouds, xb, n)
+    ))
+    after_functions = np.asarray(jax.device_get(
+        _functional_samples_from_clouds(after, clouds, xb, n)
+    ))
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6.5), sharex=True, sharey=True)
+    panels = (
+        ("Target unfitted GP prior", gp_functions),
+        ("Transport output functions before Stage 0", before_functions),
+        ("Transport output functions after Stage 0", after_functions),
+    )
+    for ax, (title, functions) in zip(axes, panels):
+        mean = np.mean(functions, axis=0)
+        low, high = np.quantile(functions, [0.025, 0.975], axis=0)
+        for f in functions[: cfg.stage0_plot_functions]:
+            ax.plot(x, f, linewidth=1.0, alpha=.45)
+        ax.plot(x, mean, color="black", linewidth=2.2, label="sample mean")
+        ax.fill_between(x, low, high, color="gray", alpha=.18, label="95% sample band")
+        ax.set_title(title)
+        ax.set_xlabel("measurement x")
+        ax.grid(alpha=.15)
+    axes[0].set_ylabel("transport / GP function output")
+    axes[-1].legend(loc="best")
+    fig.suptitle("Stage 0: data-free functional-prior matching", fontsize=21)
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
+
+
+def plot_stage0_loss_diagnostics(
+    history: dict[str, list[float]],
+    path: Path,
+    cfg: Config = CFG,
+) -> None:
+    """Plot the recorded Stage-0 Wasserstein/critic optimization diagnostics."""
+    step = np.asarray(history.get("step", []), dtype=np.float64)
+    if step.size == 0:
+        return
+
+    diagnostics = (
+        ("estimated_w1", "Estimated Wasserstein-1"),
+        ("critic_loss", "Mean critic loss"),
+        ("gradient_penalty", "Gradient penalty"),
+    )
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), sharex=True)
+    for ax, (key, title) in zip(axes, diagnostics):
+        values = np.asarray(history.get(key, []), dtype=np.float64)
+        ax.plot(step, values, linewidth=1.8)
+        ax.set_title(title)
+        ax.set_xlabel("Stage-0 outer step")
+        ax.grid(alpha=.15)
+    axes[0].set_ylabel("diagnostic value")
+    fig.suptitle("Stage 0 optimization diagnostics", fontsize=20)
+    fig.tight_layout()
+    _save_and_show(fig, path, cfg)
+
+
+def transfer_transport_arrays(
+    source: ConditionalParticleTransport,
+    target_template: ConditionalParticleTransport,
+) -> ConditionalParticleTransport:
+    """Transfer Stage-0 learned modules while keeping supervised static normalization.
+
+    Stage 0 deliberately uses data-free x normalization from ``cfg.x_range`` whereas the
+    historical supervised template uses the observed training-x range. Those values are static
+    Equinox fields, so partition/combine cannot merge the two models because their PyTree metadata
+    differ. Replace only the learned submodules instead; the target template keeps its own static
+    x/y scaling and all other historical configuration.
+    """
+    target = eqx.tree_at(lambda m: m.particle_in, target_template, source.particle_in)
+    target = eqx.tree_at(lambda m: m.blocks, target, source.blocks)
+    target = eqx.tree_at(lambda m: m.final_norm, target, source.final_norm)
+    target = eqx.tree_at(lambda m: m.displacement_head, target, source.displacement_head)
+
+    if target.likelihood_conditioning_mode == "direct":
+        if source.x_in is None or source.x_out is None:
+            raise ValueError("Stage-0 source is missing direct-conditioning projections.")
+        target = eqx.tree_at(lambda m: m.x_in, target, source.x_in)
+        target = eqx.tree_at(lambda m: m.x_out, target, source.x_out)
+    else:
+        if source.likelihood_embedder is None:
+            raise ValueError("Stage-0 source is missing the likelihood embedder.")
+        target = eqx.tree_at(
+            lambda m: m.likelihood_embedder, target, source.likelihood_embedder
+        )
+    return target
 
 
 def count_eqx_parameters(model: eqx.Module) -> int:
@@ -1831,16 +2199,47 @@ def plot_training(history: dict[str, list[float]], path: Path, cfg: Config = CFG
 
 
 
-#%% 8) Build and train all models ONCE
-# Build EVERY model before training so sizes are known before the first optimization/fit call.
-# If fitted GP hyperparameters are requested for transport priors, the SAME baseline GP is fitted
-# exactly once here before transport training. Its learned kernel_ is then cloned into a fresh
-# UNFITTED GP prior sampler. If initial hyperparameters are requested, the baseline GP remains
-# unfitted until the historical late-baseline fit below.
-transport_init = ConditionalParticleTransport(CFG, scaling, key=jax.random.key(CFG.seed))
+#%% 8) Stage 0 (optional), then build/train all supervised models ONCE
+# The historical supervised transport template is built exactly as before. Stage 0, when enabled,
+# starts from the same random array initialization but uses only configured domain metadata and an
+# unfitted INITIAL GP kernel. Its learned array leaves are then transferred back onto the historical
+# supervised template so the existing training normalization/static architecture remain unchanged.
+transport_template = ConditionalParticleTransport(CFG, scaling, key=jax.random.key(CFG.seed))
 nn_init = StandardMLP(CFG, key=jax.random.key(CFG.seed))
 gp_init = make_gp(CFG)
-print_model_parameter_counts(transport_init, nn_init, gp_init, len(X_train))
+print_model_parameter_counts(transport_template, nn_init, gp_init, len(X_train))
+
+stage0_history: dict[str, list[float]] | None = None
+if CFG.stage0_enabled:
+    print("\n--- Stage 0: data-free GP functional-prior matching ---")
+    print(
+        f"measurement points={CFG.stage0_measurement_points} | function samples={CFG.stage0_num_function_samples} | "
+        f"critic steps/outer={CFG.stage0_n_lipschitz} | outer steps={CFG.stage0_outer_steps}"
+    )
+    print("Stage 0 uses NO observed X_train/Y_train, likelihood noise, replay, or fitted GP.")
+    stage0_scaling = make_stage0_scaling(CFG)
+    stage0_before = ConditionalParticleTransport(
+        CFG, stage0_scaling, key=jax.random.key(CFG.seed)
+    )
+    stage0_target_kernel = clone(gp_init.kernel)  # always INITIAL: fitted would use observed data.
+    print(f"Stage 0 target GP kernel (INITIAL/unfitted): {stage0_target_kernel}")
+    stage0_after, stage0_history = fit_stage0_functional_prior(
+        stage0_before, stage0_target_kernel, stage0_scaling, CFG
+    )
+    plot_stage0_functional_prior(
+        stage0_before, stage0_after, stage0_target_kernel, stage0_scaling,
+        out / "stage0_functional_prior_before_after.pdf", CFG,
+    )
+    plot_stage0_loss_diagnostics(
+        stage0_history, out / "stage0_loss_diagnostics.pdf", CFG
+    )
+    with (out / "stage0_history.json").open("w") as f:
+        json.dump(stage0_history, f, indent=2)
+    transport_init = transfer_transport_arrays(stage0_after, transport_template)
+    print("Stage 0 complete; transferred fitted array parameters into the supervised transport template.")
+else:
+    transport_init = transport_template
+    print("\n--- Stage 0 DISABLED: keeping the original Equinox parameter initialization ---")
 
 gp: GaussianProcessRegressor | None = None
 gp_prior_sampler: GaussianProcessRegressor | None = None
@@ -1988,6 +2387,13 @@ AVAILABLE_EVAL_PRIOR_MODES = {
     "widest": "the base-prior effective span (hard support for Uniform; +/-z sigma for Gaussian)",
     "nearest_training": "kNN min/max y envelope + fixed margin (existing method)",
     "nearest_posterior": "sequentially reuse the closest previously achieved posterior cloud",
+    "in_domain_oracle_ood_widest": (
+        "oracle-centred interval in-domain; widest base-prior span for OOD points"
+    ),
+    "honest": (
+        "label-free deployment prior: local training interpolation in inferred support; "
+        "rapid automatic reversion to widest outside support"
+    ),
 
     # GP-informed modes: reuse the already fitted GP; NEVER refit it here.
     "gp_variance_matched": "selected prior family with GP predictive mean and matched variance",
@@ -2074,6 +2480,93 @@ def _nearest_indices_and_distances(
     nearest = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
     nearest_distance = np.min(distances, axis=1)
     return nearest, nearest_distance
+
+
+def _honest_prior_bounds(
+    x_query: np.ndarray,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    scaling: Scaling,
+    cfg: Config,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Deployment-style local prior with automatic support detection and OOD widening.
+
+    This mode never receives query labels or an IND/OOD flag. Known training pairs define
+    contiguous x-support automatically. Within that inferred support, a local linear interpolation
+    of the observed training outputs provides a label-free centre and the width matches the existing
+    cheating-prior width. Outside support, trust decays over the ordinary training-point spacing and
+    both bounds rapidly converge to the exact widest configured prior.
+    """
+    xq = _as_1d_float(x_query)
+    xt = _as_1d_float(x_train)
+    yt = _as_1d_float(y_train)
+    if len(xt) != len(yt) or len(xt) == 0:
+        raise ValueError("x_train and y_train must be non-empty and have the same length.")
+
+    order = np.argsort(xt)
+    xs = xt[order]
+    ys = yt[order]
+
+    # Collapse duplicate x values so np.interp has a strictly increasing coordinate array.
+    xu, inverse = np.unique(xs, return_inverse=True)
+    if len(xu) != len(xs):
+        ysum = np.zeros(len(xu), dtype=np.float64)
+        count = np.zeros(len(xu), dtype=np.float64)
+        np.add.at(ysum, inverse, ys)
+        np.add.at(count, inverse, 1.0)
+        yu = ysum / np.maximum(count, 1.0)
+    else:
+        yu = ys
+
+    global_low = float(scaling.prior_low)
+    global_high = float(scaling.prior_high)
+    global_width = global_high - global_low
+    local_width = float(cfg.cheating_prior_width_fraction) * global_width
+    local_half = 0.5 * local_width
+
+    if len(xu) == 1:
+        local_center = np.full(len(xq), yu[0], dtype=np.float64)
+        spacing = max(float(scaling.x_scale), 1e-6)
+        distance_to_support = np.abs(xq - xu[0])
+    else:
+        gaps = np.diff(xu)
+        positive_gaps = gaps[gaps > 0.0]
+        if len(positive_gaps) == 0:
+            spacing = max(float(scaling.x_scale), 1e-6)
+            split_threshold = np.inf
+        else:
+            # Robust ordinary in-support spacing. Intentional holes are much larger than this.
+            median_gap = float(np.median(positive_gaps))
+            q90_gap = float(np.quantile(positive_gaps, 0.90))
+            spacing = max(q90_gap, median_gap, 1e-6)
+            split_threshold = max(8.0 * median_gap, 4.0 * q90_gap)
+
+        # Infer connected training-support intervals solely from the training x coordinates.
+        split_after = np.where(gaps > split_threshold)[0]
+        starts = np.r_[0, split_after + 1]
+        stops = np.r_[split_after, len(xu) - 1]
+        intervals = np.column_stack([xu[starts], xu[stops]])
+
+        distance_to_support = np.full(len(xq), np.inf, dtype=np.float64)
+        for lo, hi in intervals:
+            distance = np.where(
+                xq < lo, lo - xq,
+                np.where(xq > hi, xq - hi, 0.0),
+            )
+            distance_to_support = np.minimum(distance_to_support, distance)
+
+        # Piecewise-linear interpolation is deliberately simple and uses only known training pairs.
+        local_center = np.interp(xq, xu, yu)
+
+    # support=1 everywhere inside inferred training support. Once outside, the width approaches
+    # widest exponentially; after ~3 ordinary training spacings it is already ~95% of the way there.
+    # support = np.exp(-distance_to_support / max(spacing, 1e-12))
+    support = np.exp(-distance_to_support / max(cfg.honest_ood_decay_scale * spacing, 1e-12))
+    local_low = local_center - local_half
+    local_high = local_center + local_half
+    low = support * local_low + (1.0 - support) * global_low
+    high = support * local_high + (1.0 - support) * global_high
+    return low.astype(np.float32), high.astype(np.float32)
 
 
 def _support_score_from_distance(distance: np.ndarray, length_scale: float) -> np.ndarray:
@@ -2252,6 +2745,26 @@ def evaluation_prior_bounds_np(
         low = np.full(len(xq), scaling.prior_low, dtype=np.float32)
         high = np.full(len(xq), scaling.prior_high, dtype=np.float32)
         return low, high
+
+    if mode == "in_domain_oracle_ood_widest":
+        # Hybrid diagnostic: callers provide y_query_oracle only for points whose true y is
+        # available (the in-domain/train side). OOD points deliberately omit it and therefore
+        # receive the unchanged widest prior. The in-domain width reuses the existing cheating
+        # prior hyperparameter; with the configured Uniform family this is U(y* - h, y* + h).
+        if y_query_oracle is None:
+            low = np.full(len(xq), scaling.prior_low, dtype=np.float32)
+            high = np.full(len(xq), scaling.prior_high, dtype=np.float32)
+            return low, high
+        y_oracle = _as_1d_float(y_query_oracle)
+        if len(y_oracle) != len(xq):
+            raise ValueError("y_query_oracle must have the same length as x_query.")
+        oracle_width = float(cfg.cheating_prior_width_fraction) * global_width
+        half = 0.5 * oracle_width
+        return (y_oracle - half).astype(np.float32), (y_oracle + half).astype(np.float32)
+
+    if mode == "honest":
+        # Deployment-style mode: no query y and no externally supplied IND/OOD identity.
+        return _honest_prior_bounds(xq, xt, yt, scaling, cfg)
 
     if mode == "nearest_training":
         nearest, _ = _nearest_indices_and_distances(xq, xt, cfg.eval_local_prior_k)
@@ -3408,13 +3921,15 @@ if EVALUATE_WITH_GP_PRIORS:
         )
 else:
     # Historical post-training interval-prior experiments are preserved unchanged below.
-    EVAL_MODE = CFG.evaluation_prior_mode
-    # EVAL_MODE = "train_y_range"
+    # EVAL_MODE = CFG.evaluation_prior_mode
+    EVAL_MODE = "widest"
 
     # Examples -- all available immediately after training:
     # EVAL_MODE = "cheating"               # oracle upper benchmark
     # EVAL_MODE = "widest"                 # fixed U(CFG.prior_min, CFG.prior_max)
     # EVAL_MODE = "nearest_training"        # existing kNN min/max envelope
+    # EVAL_MODE = "in_domain_oracle_ood_widest"  # U around true train y; widest for OOD
+    # EVAL_MODE = "honest"                 # no query y/OOD flag; local in support -> widest outside
     # EVAL_MODE = "gp_variance_matched"     # fitted-GP mean; uniform has matched variance
     # EVAL_MODE = "gp_95"                   # fitted-GP predictive 95%-style bounds
     # EVAL_MODE = "kernel_support"          # GP-like fallback without fitting/using a GP
@@ -3448,10 +3963,17 @@ else:
             eval_cfg=EVAL_PRIOR_CFG,
         )
 
-    # In-domain/train diagnostics stay on the widest prior, exactly as in the historical cell.
+    # Preserve the historical widest in-domain diagnostic for every existing mode except the two
+    # support-aware comparisons: the oracle hybrid uses true in-domain y, while honest reconstructs
+    # its in-domain prior from training support without query labels.
+    _train_eval_mode = (
+        EVAL_MODE if EVAL_MODE in {"in_domain_oracle_ood_widest", "honest"} else "widest"
+    )
+    _train_oracle = Y_train if EVAL_MODE == "in_domain_oracle_ood_widest" else None
     train_prior_low, train_prior_high = evaluation_prior_bounds_np(
         X_train, X_train, Y_train, scaling, CFG,
-        mode="widest",
+        mode=_train_eval_mode,
+        y_query_oracle=_train_oracle,
         gp_model=gp,
         eval_cfg=EVAL_PRIOR_CFG,
     )
@@ -3536,7 +4058,9 @@ else:
     tr_train = predict_transport_from_bounds(
         transport, X_train, train_prior_low, train_prior_high, CFG,
         seed=CFG.seed + 30_001,
-        prior_mode="widest",
+        prior_mode=(
+            EVAL_MODE if EVAL_MODE in {"in_domain_oracle_ood_widest", "honest"} else "widest"
+        ),
         num_observations=DEPLOYMENT_OBSERVATIONS,
     )
 
