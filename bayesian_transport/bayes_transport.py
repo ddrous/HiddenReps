@@ -193,7 +193,7 @@ class Config:
     #   "in_domain_oracle_ood_widest": oracle-centred prior in-domain; widest prior OOD.
     #   "honest": no query labels/OOD flag; locally interpolate known training outputs in inferred
     #       training support, then rapidly revert to the widest prior outside that support.
-    evaluation_prior_mode: str = "widest"  # {"cheating", "widest", "nearest_training", "in_domain_oracle_ood_widest", "honest"}
+    evaluation_prior_mode: str = "widest"  # {"cheating", "widest", "nearest_training", "in_domain_oracle_ood_widest", "honest", "gp_posterior_mean"}
     honest_ood_decay_scale = 1.0
     cheating_prior_width_fraction: float = 0.1
     # cheating_prior_width_fraction: float = 0.9
@@ -361,11 +361,11 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("likelihood_mlp_ratio and likelihood_depth must both be >= 1.")
     if cfg.evaluation_prior_mode not in {
         "cheating", "widest", "nearest_training", "nearest_posterior",
-        "in_domain_oracle_ood_widest", "honest",
+        "in_domain_oracle_ood_widest", "honest", "gp_posterior_mean",
     }:
         raise ValueError(
             "evaluation_prior_mode must be 'cheating', 'widest', 'nearest_training', "
-            "'nearest_posterior', 'in_domain_oracle_ood_widest', or 'honest'."
+            "'nearest_posterior', 'in_domain_oracle_ood_widest', 'honest', or 'gp_posterior_mean'."
         )
     if not 0.0 < cfg.cheating_prior_width_fraction <= 1.0:
         raise ValueError("cheating_prior_width_fraction must lie in (0,1].")
@@ -2718,6 +2718,10 @@ class EvaluationPriorConfig:
     # GP-informed priors reuse the GP that was already fitted ONCE in cell 8.
     gp_interval_z: float = 1.96
 
+    # Separate GP used only by gp_posterior_mean. It is never the baseline GP being evaluated.
+    # 0 uses the unfitted GP prior mean; (0,1] fits a deterministic subset of X_train/Y_train.
+    gp_posterior_mean_fit_fraction: float = 0.5
+
     # Smooth kernel/locality calculations. This is NOT a learned hyperparameter.
     kernel_length_scale: float = 0.15
     kernel_eps: float = 1e-12
@@ -2774,9 +2778,13 @@ AVAILABLE_EVAL_PRIOR_MODES = {
         "rapid automatic reversion to widest outside support"
     ),
 
-    # GP-informed modes: reuse the already fitted GP; NEVER refit it here.
+    # GP-informed modes. The first two reuse the fitted baseline GP; gp_posterior_mean fits its
+    # own separate GP and uses only that model's predicted mean, never its predictive variance.
     "gp_variance_matched": "selected prior family with GP predictive mean and matched variance",
     "gp_95": "selected prior family using GP mean +/- configured z * GP predictive std span",
+    "gp_posterior_mean": (
+        "separate GP predictive mean + cheating/honest-width cloud; predictive variance ignored"
+    ),
 
     # GP-like but no GP is used or fitted.
     "kernel_support": "kernel local centre; width and centre revert toward the global prior OOD",
@@ -2802,6 +2810,38 @@ def print_evaluation_prior_catalog() -> None:
 
 def _as_1d_float(x: np.ndarray) -> np.ndarray:
     return np.asarray(x, dtype=np.float64).reshape(-1)
+
+
+def _fit_gp_posterior_mean_prior_model(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    cfg: Config,
+    eval_cfg: EvaluationPriorConfig,
+) -> GaussianProcessRegressor:
+    """Build the separate GP used only to centre the gp_posterior_mean evaluation cloud."""
+    fraction = float(eval_cfg.gp_posterior_mean_fit_fraction)
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("gp_posterior_mean_fit_fraction must lie in [0,1].")
+
+    x_train = _as_1d_float(x_train)
+    y_train = _as_1d_float(y_train)
+    if len(x_train) != len(y_train) or len(x_train) == 0:
+        raise ValueError("x_train and y_train must be non-empty and have the same length.")
+
+    # A distinct estimator/optimizer seed keeps this GP separate from the baseline GP being tested.
+    mean_gp = make_gp(cfg).set_params(random_state=int(cfg.seed + 91_001))
+    if fraction == 0.0:
+        print("[gp_posterior_mean] fit_fraction=0: using the separate unfitted GP prior mean.")
+        return mean_gp
+
+    n_fit = min(len(x_train), max(1, int(np.ceil(fraction * len(x_train)))))
+    subset_rng = np.random.default_rng(int(cfg.seed + 91_002))
+    fit_ids = subset_rng.choice(len(x_train), size=n_fit, replace=False)
+    print(
+        f"[gp_posterior_mean] fitting separate mean-GP on {n_fit}/{len(x_train)} "
+        f"training points ({fraction:.3f} configured fraction)."
+    )
+    return fit_gp(mean_gp, x_train[fit_ids], y_train[fit_ids])
 
 
 def _global_prior_geometry(scaling: Scaling) -> tuple[float, float, float]:
@@ -3083,9 +3123,10 @@ def evaluation_prior_bounds_np(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return one post-training evaluation y-prior interval per query x.
 
-    No mode here retrains the transport, NN, or GP. ``cheating`` deliberately uses the true
-    query label. GP modes reuse the already-fitted ``gp_model``. Every other mode is built
-    directly from the closed training set with simple deterministic NumPy calculations.
+    No mode here retrains the transport or NN. ``cheating`` deliberately uses the true query label.
+    GP modes consume the supplied ``gp_model``; ``gp_posterior_mean`` is passed its own separately
+    fitted evaluation GP by ``evaluate_prior_mode``. Every other mode is built directly from the
+    closed training set with simple deterministic NumPy calculations.
     """
     mode = cfg.evaluation_prior_mode if mode is None else str(mode)
     if mode not in AVAILABLE_EVAL_PRIOR_MODES:
@@ -3159,7 +3200,16 @@ def evaluation_prior_bounds_np(
         )
         return low.astype(np.float32), high.astype(np.float32)
 
-    # ---- GP-informed priors: reuse the GP fitted once in cell 8. ----
+    # ---- GP-informed priors. ----
+    if mode == "gp_posterior_mean":
+        if gp_model is None:
+            raise ValueError("gp_posterior_mean requires its separate GP mean model.")
+        # Intentionally ignore predictive std: only the GP predicted mean centres the cloud.
+        gp_mean = np.asarray(gp_model.predict(xq[:, None]), dtype=np.float64).reshape(-1)
+        half = 0.5 * float(cfg.cheating_prior_width_fraction) * global_width
+        return (gp_mean - half).astype(np.float32), (gp_mean + half).astype(np.float32)
+
+    # Historical GP interval modes reuse the GP fitted once in cell 8.
     if mode in {"gp_variance_matched", "gp_95"}:
         if gp_model is None:
             raise ValueError(f"{mode} requires the already-fitted gp_model; it is not refit here.")
@@ -4264,9 +4314,10 @@ def evaluate_prior_mode(
 ) -> dict[str, Any]:
     """Evaluate the already-trained transport under one requested interval-prior mode.
 
-    The NN and GP baselines are cached from cell 8 and are NEVER retrained here. ``cheating`` is
-    deliberately oracle-centred for BOTH the training and held-out/test coordinates. ``widest``
-    uses the same effective data-function-aware bounds used by fresh training priors.
+    The NN and GP baselines are cached from cell 8 and are NEVER retrained here. ``gp_posterior_mean``
+    deliberately trains a separate GP only to centre its transport prior cloud. ``cheating`` is
+    oracle-centred for BOTH the training and held-out/test coordinates. ``widest`` uses the same
+    effective data-function-aware bounds used by fresh training priors.
     """
     mode = str(eval_mode)
     if mode not in AVAILABLE_EVAL_PRIOR_MODES:
@@ -4277,6 +4328,10 @@ def evaluate_prior_mode(
     n_obs = _deployment_observation_count(cfg)
     if cfg.likelihood_conditioning_mode == "direct":
         print(f"\n[{mode}] DIRECT deployment: exactly ONE clean x observation.")
+
+    prior_gp_model = gp
+    if mode == "gp_posterior_mean":
+        prior_gp_model = _fit_gp_posterior_mean_prior_model(X_train, Y_train, cfg, eval_cfg)
 
     if mode == "nearest_posterior":
         # Preserve the dynamic empirical-cloud mode. The training side is only a reference baseline;
@@ -4314,14 +4369,14 @@ def evaluate_prior_mode(
             X_train, X_train, Y_train, scaling, cfg,
             mode=mode,
             y_query_oracle=train_oracle,
-            gp_model=gp,
+            gp_model=prior_gp_model,
             eval_cfg=eval_cfg,
         )
         test_prior_low, test_prior_high = evaluation_prior_bounds_np(
             X_test, X_train, Y_train, scaling, cfg,
             mode=mode,
             y_query_oracle=test_oracle,
-            gp_model=gp,
+            gp_model=prior_gp_model,
             eval_cfg=eval_cfg,
         )
 
@@ -4555,7 +4610,7 @@ print(
     "The same trained NN, GP, and transport are reused for cheating, widest, and nearest_training."
 )
 EVALUATION_RESULTS = evaluate_and_plot_prior_modes(
-    ("cheating", "honest", "nearest_training", "widest"),
+    ("cheating", "honest", "gp_posterior_mean", "nearest_training", "widest"),
     filename="evaluation_suite.pdf",
 )
 
