@@ -1,5 +1,9 @@
 #%% 0) Imports, configuration, and experiment constants
-"""Notebook-style Bayes Transport on the Greenberg et al. (2019) two-moons benchmark.
+"""Bayes Transport two-moons benchmark — v4 with variable-size particle-set training.
+
+Version 4 preserves the current evaluation/plotting path, including the v2 post-hoc normalized neural
+spline-flow density estimator alongside the original crude Gaussian KDE.  The training path can now
+randomize the number of particles presented to the particle Transformer, up to one configured maximum.
 
 Run this file one #%% cell at a time in VS Code / Spyder / Jupyter-compatible editors.
 There is intentionally no main() function.
@@ -63,7 +67,7 @@ Array = jax.Array
 class Config:
     # Reproducibility / outputs
     seed: int = 2028
-    output_dir: str = "plots/bayes_transport_two_moons"
+    output_dir: str = "plots/bayes_transport_two_moons_v4"
 
     # Exact two-moons benchmark from Greenberg et al. (2019), Appendix A.5.1
     prior_low: float = -1.0
@@ -79,13 +83,18 @@ class Config:
     batch_size: int = 128
 
     # Particle transport -- intentionally kept very close to the previous script.
-    num_particles: int = 16 * 2
-    eval_particles: int = 1024 // 2
-    hidden_dim: int = 64 * 4
+    # Only the MAXIMUM training particle count is configured.  When variable_training_particles=True,
+    # each optimizer step draws one set size from an automatically-derived geometric ladder ending at
+    # max_training_particles.  Setting the flag False always uses the maximum, reproducing the previous
+    # fixed-particle-count training path.  Evaluation remains independently controlled by eval_particles.
+    max_training_particles: int = 16 * 4*1
+    variable_training_particles: bool = True
+    eval_particles: int = 16*16*16
+    hidden_dim: int = 64 * 2
     heads: int = 4
     mlp_ratio: int = 4
-    posterior_depth: int = 5
-    posterior_conditioning: str = "cross_attention"  # {"cross_attention", "adaln"}
+    posterior_depth: int = 4
+    posterior_conditioning: str = "adaln"  # {"cross_attention", "adaln"}
     max_normalized_displacement: float = 6.0
     attention_dropout_rate: float = 0.0
 
@@ -98,10 +107,10 @@ class Config:
     observation_scale: float = 1.0
 
     # Bayes Transport optimisation -- preserved from the supplied/latest setup.
-    training_steps: int = 10_000
-    learning_rate: float = 1e-5
-    weight_decay: float = 1e-6
-    grad_clip_norm: float = 5.0
+    training_steps: int = 25_000
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-5
+    grad_clip_norm: float = 5000.0
     log_every: int = 1250
 
     # Three mutually-exclusive TRAINING prior sources:
@@ -127,6 +136,27 @@ class Config:
     kde_grid_size: int = 220
     sliced_wasserstein_projections: int = 128
 
+    # v2 post-hoc density visualization.  This is NEVER used by the transport training objective.
+    # We aggregate several independent test-prior clouds because the particle Transformer couples
+    # particles within a cloud; concatenating whole clouds gives a much better empirical marginal
+    # without changing the inference problem seen by the model.
+    density_estimation_clouds: int = 16
+    density_grid_size: int = 260
+
+    # Neural spline flow (NSF) density estimator: an expressive, normalized change-of-variables
+    # model fitted only to Bayes-Transport posterior samples after training/evaluation.
+    nsf_layers: int = 8
+    nsf_bins: int = 12
+    nsf_hidden_dim: int = 64
+    nsf_tail_bound: float = 4.0
+    nsf_learning_rate: float = 2e-3
+    nsf_weight_decay: float = 1e-6
+    nsf_batch_size: int = 512
+    nsf_max_epochs: int = 1200
+    nsf_validation_fraction: float = 0.15
+    nsf_validation_every: int = 10
+    nsf_patience_checks: int = 30
+
     # Figure-1-style simulator budgets from the paper. With minibatches of 128, the snapshot is
     # taken at the first optimizer step whose cumulative simulator count reaches/exceeds each target.
     # Thus 1000 becomes 1024 calls, 5000 becomes 5120, etc.; the plot reports the actual count.
@@ -134,6 +164,25 @@ class Config:
 
     # Prior-predictive plot at the very start. Diagnostic only; not used for training.
     prior_predictive_plot_samples: int = 30_000
+
+
+def training_particle_count_choices(max_particles: int) -> tuple[int, ...]:
+    """Automatically derive a small geometric ladder of JAX-friendly training set sizes.
+
+    There is deliberately no configurable minimum particle count.  At most five distinct shapes are
+    used so variable-size training does not trigger a separate JIT compilation for every integer from
+    2 to max_particles.  For the default maximum of 256 this returns (16, 32, 64, 128, 256).
+    """
+    max_particles = int(max_particles)
+    if max_particles < 2:
+        raise ValueError("max_training_particles must be at least 2.")
+    ratios = (1.0 / 16.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0, 1.0)
+    choices = {
+        min(max_particles, max(2, int(round(max_particles * ratio))))
+        for ratio in ratios
+    }
+    choices.add(max_particles)
+    return tuple(sorted(choices))
 
 
 CFG = Config()
@@ -165,6 +214,23 @@ if CFG.prior_low >= CFG.prior_high:
     raise ValueError("prior_low must be smaller than prior_high.")
 if CFG.radial_std <= 0.0 or CFG.observation_scale <= 0.0:
     raise ValueError("radial_std and observation_scale must be positive.")
+if CFG.max_training_particles < 2:
+    raise ValueError("max_training_particles must be at least 2.")
+if CFG.density_estimation_clouds < 1 or CFG.density_grid_size < 32:
+    raise ValueError("density_estimation_clouds must be >=1 and density_grid_size must be >=32.")
+if CFG.nsf_layers < 1 or CFG.nsf_bins < 2 or CFG.nsf_hidden_dim < 4:
+    raise ValueError("NSF requires nsf_layers>=1, nsf_bins>=2, and nsf_hidden_dim>=4.")
+if CFG.nsf_tail_bound <= 0.0:
+    raise ValueError("nsf_tail_bound must be positive.")
+if not 0.0 < CFG.nsf_validation_fraction < 0.5:
+    raise ValueError("nsf_validation_fraction must lie strictly between 0 and 0.5.")
+
+TRAINING_PARTICLE_COUNTS = (
+    training_particle_count_choices(CFG.max_training_particles)
+    if CFG.variable_training_particles
+    else (int(CFG.max_training_particles),)
+)
+
 
 TRAIN_EXACT_PRIOR_PROBABILITY = (
     1.0
@@ -195,6 +261,9 @@ print(
     f"exact-test-uniform={TRAIN_EXACT_PRIOR_PROBABILITY:.3f}"
 )
 print(f"Interpolation base cloud: {CFG.interpolation_base_cloud}")
+print("Variable training particle count:", CFG.variable_training_particles)
+print("Training particle-count choices:", TRAINING_PARTICLE_COUNTS)
+print("Maximum training particles:", CFG.max_training_particles)
 print("Evaluation prior: exact Uniform([-1,1]^2)")
 print("Observed datum:", X_OBS)
 
@@ -293,10 +362,12 @@ def sample_interpolation_base_cloud_np(
 def sample_interpolated_training_prior_np(
     rng: np.random.Generator,
     theta_target: np.ndarray,
+    n_particles: int,
     cfg: Config = CFG,
 ) -> tuple[np.ndarray, float]:
     """Training-only C_tau=(1-tau)Z+tau*anchor with one shared tau per particle cloud."""
-    z = sample_interpolation_base_cloud_np(rng, cfg.num_particles, cfg)
+    n_particles = int(n_particles)
+    z = sample_interpolation_base_cloud_np(rng, n_particles, cfg)
 
     if rng.random() < cfg.truth_anchor_probability:
         anchor = np.asarray(theta_target, dtype=np.float32).reshape(2)
@@ -317,13 +388,18 @@ class HistoricalPosteriorBuffer:
 
     On replay, ONLY the current prior cloud is replaced. The current x and current theta* target
     remain untouched, matching the intent of the original Bayes-Transport replay mechanism.
+
+    v4 additionally records each cloud's actual particle count.  A replay request uses the nearest
+    historical cloud with at least the requested number of particles and subsamples it without
+    replacement.  Thus variable-size training never pads fake particles or duplicates particles.
     """
 
-    def __init__(self, capacity: int, num_particles: int):
+    def __init__(self, capacity: int, max_particles: int):
         self.capacity = int(capacity)
-        self.num_particles = int(num_particles)
+        self.max_particles = int(max_particles)
         self.x = np.empty((self.capacity, 2), dtype=np.float32)
-        self.clouds = np.empty((self.capacity, self.num_particles, 2), dtype=np.float32)
+        self.clouds = np.empty((self.capacity, self.max_particles, 2), dtype=np.float32)
+        self.counts = np.zeros(self.capacity, dtype=np.int32)
         self.size = 0
         self.next_index = 0
 
@@ -338,31 +414,69 @@ class HistoricalPosteriorBuffer:
     def active_clouds(self) -> np.ndarray:
         return self.clouds[: self.size]
 
+    @property
+    def active_counts(self) -> np.ndarray:
+        return self.counts[: self.size]
+
+    def has_cloud_with_at_least(self, n_particles: int) -> bool:
+        """Whether replay can supply n_particles without replacement."""
+        if self.size == 0:
+            return False
+        return bool(np.any(self.active_counts >= int(n_particles)))
+
     def add_batch(self, x: np.ndarray, clouds: np.ndarray) -> None:
         x = np.asarray(x, dtype=np.float32)
         clouds = np.asarray(clouds, dtype=np.float32)
         if x.ndim != 2 or x.shape[1] != 2:
             raise ValueError("x must have shape [B,2].")
-        if clouds.shape != (len(x), self.num_particles, 2):
+        if clouds.ndim != 3 or clouds.shape[0] != len(x) or clouds.shape[2] != 2:
+            raise ValueError("clouds must have shape [B,M,2].")
+        n_particles = int(clouds.shape[1])
+        if not 1 <= n_particles <= self.max_particles:
             raise ValueError(
-                f"clouds must have shape {(len(x), self.num_particles, 2)}, got {clouds.shape}."
+                f"cloud particle count must lie in [1,{self.max_particles}], got {n_particles}."
             )
         for xi, cloud in zip(x, clouds):
             self.x[self.next_index] = xi
-            self.clouds[self.next_index] = cloud
+            self.clouds[self.next_index, :n_particles] = cloud
+            self.counts[self.next_index] = n_particles
             self.next_index = (self.next_index + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
 
-    def nearest_batch(self, x_query: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def nearest_batch(
+        self,
+        x_query: np.ndarray,
+        n_particles: int,
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self.size == 0:
             raise ValueError("HistoricalPosteriorBuffer is empty.")
+        n_particles = int(n_particles)
+        eligible = np.flatnonzero(self.active_counts >= n_particles)
+        if len(eligible) == 0:
+            raise ValueError(
+                f"HistoricalPosteriorBuffer has no cloud with at least {n_particles} particles."
+            )
+
         x_query = np.asarray(x_query, dtype=np.float32).reshape(-1, 2)
         # Fixed observation scale avoids unstable standardization when the buffer is still tiny.
-        delta = (x_query[:, None, :] - self.active_x[None, :, :]) / float(CFG.observation_scale)
+        candidate_x = self.active_x[eligible]
+        delta = (x_query[:, None, :] - candidate_x[None, :, :]) / float(CFG.observation_scale)
         d2 = np.sum(delta**2, axis=-1)
-        ids = np.argmin(d2, axis=1)
-        distances = np.sqrt(d2[np.arange(len(x_query)), ids])
-        return self.active_clouds[ids].copy(), distances.astype(np.float32)
+        local_ids = np.argmin(d2, axis=1)
+        ids = eligible[local_ids]
+        distances = np.sqrt(d2[np.arange(len(x_query)), local_ids])
+
+        result = np.empty((len(x_query), n_particles, 2), dtype=np.float32)
+        for row, slot in enumerate(ids):
+            stored_count = int(self.counts[slot])
+            if stored_count == n_particles:
+                # Preserve the old fixed-size replay path exactly when counts match.
+                result[row] = self.clouds[slot, :n_particles]
+            else:
+                subset = rng.choice(stored_count, size=n_particles, replace=False)
+                result[row] = self.clouds[slot, subset]
+        return result, distances.astype(np.float32)
 
 
 def make_training_prior_batch_np(
@@ -371,39 +485,50 @@ def make_training_prior_batch_np(
     theta_target: np.ndarray,
     x_batch: np.ndarray,
     replay_buffer: HistoricalPosteriorBuffer,
+    n_particles: int,
     cfg: Config = CFG,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Choose exactly one prior source independently for each training inference problem."""
     theta_target = np.asarray(theta_target, dtype=np.float32)
     x_batch = np.asarray(x_batch, dtype=np.float32)
     b = theta_target.shape[0]
+    n_particles = int(n_particles)
+    if not 2 <= n_particles <= cfg.max_training_particles:
+        raise ValueError(
+            f"training particle count must lie in [2,{cfg.max_training_particles}], got {n_particles}."
+        )
 
-    prior = np.empty((b, cfg.num_particles, 2), dtype=np.float32)
+    prior = np.empty((b, n_particles, 2), dtype=np.float32)
     u = mode_rng.random(b)
     p_interp = cfg.prior_interpolation_probability
     p_buffer = cfg.historical_output_prior_probability
 
     interp_mask = u < p_interp
     requested_buffer_mask = (u >= p_interp) & (u < p_interp + p_buffer)
-    buffer_mask = requested_buffer_mask & (len(replay_buffer) > 0)
+    buffer_available = replay_buffer.has_cloud_with_at_least(n_particles)
+    buffer_mask = requested_buffer_mask & buffer_available
     exact_mask = ~(interp_mask | buffer_mask)
 
     tau = np.zeros(b, dtype=np.float32)
     replay_distance = np.full(b, np.nan, dtype=np.float32)
 
     for i in np.flatnonzero(interp_mask):
-        prior[i], tau[i] = sample_interpolated_training_prior_np(rng, theta_target[i], cfg)
+        prior[i], tau[i] = sample_interpolated_training_prior_np(
+            rng, theta_target[i], n_particles, cfg
+        )
 
     buffer_ids = np.flatnonzero(buffer_mask)
     if len(buffer_ids):
-        clouds, dist = replay_buffer.nearest_batch(x_batch[buffer_ids])
+        clouds, dist = replay_buffer.nearest_batch(
+            x_batch[buffer_ids], n_particles, rng
+        )
         prior[buffer_ids] = clouds
         replay_distance[buffer_ids] = dist
 
     exact_ids = np.flatnonzero(exact_mask)
     if len(exact_ids):
-        prior[exact_ids] = sample_exact_prior_np(rng, len(exact_ids) * cfg.num_particles).reshape(
-            len(exact_ids), cfg.num_particles, 2
+        prior[exact_ids] = sample_exact_prior_np(rng, len(exact_ids) * n_particles).reshape(
+            len(exact_ids), n_particles, 2
         )
 
     info = {
@@ -813,7 +938,8 @@ train_step = make_train_step(optimizer)
 print("Model initialized.")
 print("Conditioning:", CFG.posterior_conditioning)
 print("Training batch size (independent simulator pairs):", CFG.batch_size)
-print("Training particles per inference problem:", CFG.num_particles)
+print("Maximum training particles per inference problem:", CFG.max_training_particles)
+print("Training particle-count choices:", TRAINING_PARTICLE_COUNTS)
 
 
 #%% 5) Ground-truth posterior, plotting, metrics, and checkpoint utilities
@@ -1123,6 +1249,514 @@ def kde_density_on_grid(
     return kde(points).reshape(g1.shape)
 
 
+
+# -----------------------------------------------------------------------------
+# v2: post-hoc neural spline-flow density estimation for posterior visualization
+# -----------------------------------------------------------------------------
+# The Scott-rule Gaussian KDE above is intentionally retained as a crude baseline.
+# The estimator below is a proper normalized density model: a stack of alternating
+# coupling transforms whose scalar maps are monotone rational-quadratic splines.
+# It is trained by maximum likelihood ONLY on Bayes-Transport posterior particles.
+# The exact posterior density is never used to fit or select this estimator.
+
+_NSF_MIN_BIN_WIDTH = 1e-3
+_NSF_MIN_BIN_HEIGHT = 1e-3
+_NSF_MIN_DERIVATIVE = 1e-3
+_LOG_2PI = math.log(2.0 * math.pi)
+
+
+def _inverse_softplus_np(y: float) -> float:
+    y = float(y)
+    return math.log(math.expm1(y))
+
+
+def _init_nsf_conditioner(
+    key: Array,
+    hidden_dim: int,
+    output_dim: int,
+    derivative_bias_start: int,
+    derivative_bias_value: float,
+) -> dict[str, Array]:
+    """Small MLP conditioner, initialized close to the identity spline."""
+    k1, k2, k3 = jax.random.split(key, 3)
+    w1 = jax.random.normal(k1, (1, hidden_dim)) / math.sqrt(1.0)
+    w2 = jax.random.normal(k2, (hidden_dim, hidden_dim)) / math.sqrt(float(hidden_dim))
+    # Tiny last layer: starts very close to equal-width/equal-height identity bins.
+    w3 = 1e-3 * jax.random.normal(k3, (hidden_dim, output_dim)) / math.sqrt(float(hidden_dim))
+    b1 = jnp.zeros((hidden_dim,))
+    b2 = jnp.zeros((hidden_dim,))
+    b3 = jnp.zeros((output_dim,))
+    if derivative_bias_start < output_dim:
+        b3 = b3.at[derivative_bias_start:].set(derivative_bias_value)
+    return {"w1": w1, "b1": b1, "w2": w2, "b2": b2, "w3": w3, "b3": b3}
+
+
+def _nsf_conditioner(params: dict[str, Array], context: Array) -> Array:
+    context = jnp.reshape(context, (-1, 1))
+    h = jax.nn.silu(context @ params["w1"] + params["b1"])
+    h = jax.nn.silu(h @ params["w2"] + params["b2"])
+    return h @ params["w3"] + params["b3"]
+
+
+def _rational_quadratic_spline_forward(
+    inputs: Array,
+    raw_params: Array,
+    num_bins: int,
+    tail_bound: float,
+) -> tuple[Array, Array]:
+    """Monotone RQ spline x->y with identity linear tails and exact log|dy/dx|.
+
+    `raw_params` contains K widths, K heights, and K-1 interior derivatives.
+    Endpoint derivatives are fixed to one, making the spline join the identity tails
+    continuously and yielding a bijection R -> R.
+    """
+    inputs = jnp.reshape(inputs, (-1,))
+    k = int(num_bins)
+    bound = float(tail_bound)
+
+    raw_w = raw_params[:, :k]
+    raw_h = raw_params[:, k:2 * k]
+    raw_d = raw_params[:, 2 * k:]
+
+    available_width = 2.0 * bound - _NSF_MIN_BIN_WIDTH * k
+    available_height = 2.0 * bound - _NSF_MIN_BIN_HEIGHT * k
+    widths = _NSF_MIN_BIN_WIDTH + available_width * jax.nn.softmax(raw_w, axis=-1)
+    heights = _NSF_MIN_BIN_HEIGHT + available_height * jax.nn.softmax(raw_h, axis=-1)
+
+    cumwidths = -bound + jnp.cumsum(widths, axis=-1)
+    cumheights = -bound + jnp.cumsum(heights, axis=-1)
+    cumwidths = jnp.concatenate([
+        -bound * jnp.ones((len(inputs), 1), dtype=inputs.dtype),
+        cumwidths,
+    ], axis=-1)
+    cumheights = jnp.concatenate([
+        -bound * jnp.ones((len(inputs), 1), dtype=inputs.dtype),
+        cumheights,
+    ], axis=-1)
+    # Avoid tiny accumulated round-off at the final boundary.
+    cumwidths = cumwidths.at[:, -1].set(bound)
+    cumheights = cumheights.at[:, -1].set(bound)
+
+    interior_derivatives = _NSF_MIN_DERIVATIVE + jax.nn.softplus(raw_d)
+    derivatives = jnp.concatenate([
+        jnp.ones((len(inputs), 1), dtype=inputs.dtype),
+        interior_derivatives,
+        jnp.ones((len(inputs), 1), dtype=inputs.dtype),
+    ], axis=-1)
+
+    inside = (inputs >= -bound) & (inputs <= bound)
+    # Bin index in {0,...,K-1}; clipping protects the exact right endpoint.
+    bin_idx = jnp.sum(inputs[:, None] >= cumwidths[:, 1:-1], axis=-1)
+    bin_idx = jnp.clip(bin_idx, 0, k - 1).astype(jnp.int32)
+
+    def gather(a: Array, idx: Array) -> Array:
+        return jnp.take_along_axis(a, idx[:, None], axis=1)[:, 0]
+
+    x0 = gather(cumwidths[:, :-1], bin_idx)
+    y0 = gather(cumheights[:, :-1], bin_idx)
+    w = gather(widths, bin_idx)
+    h = gather(heights, bin_idx)
+    d0 = gather(derivatives[:, :-1], bin_idx)
+    d1 = gather(derivatives[:, 1:], bin_idx)
+    delta = h / w
+
+    theta = jnp.clip((inputs - x0) / w, 0.0, 1.0)
+    one_minus_theta = 1.0 - theta
+    theta_prod = theta * one_minus_theta
+    common = d0 + d1 - 2.0 * delta
+    denominator = delta + common * theta_prod
+    numerator = h * (delta * theta**2 + d0 * theta_prod)
+    outputs_inside = y0 + numerator / denominator
+
+    derivative_numerator = delta**2 * (
+        d1 * theta**2
+        + 2.0 * delta * theta_prod
+        + d0 * one_minus_theta**2
+    )
+    logabsdet_inside = jnp.log(derivative_numerator) - 2.0 * jnp.log(denominator)
+
+    outputs = jnp.where(inside, outputs_inside, inputs)
+    logabsdet = jnp.where(inside, logabsdet_inside, 0.0)
+    return outputs, logabsdet
+
+
+def _nsf_forward_standardized(
+    params: tuple[dict[str, Array], ...],
+    standardized_theta: Array,
+    num_bins: int,
+    tail_bound: float,
+) -> tuple[Array, Array]:
+    """Data -> base-space transform and exact per-row log-Jacobian determinant."""
+    z = jnp.asarray(standardized_theta)
+    total_logdet = jnp.zeros((z.shape[0],), dtype=z.dtype)
+    for layer_idx, layer_params in enumerate(params):
+        target_dim = layer_idx % 2
+        context_dim = 1 - target_dim
+        raw = _nsf_conditioner(layer_params, z[:, context_dim])
+        transformed, logdet = _rational_quadratic_spline_forward(
+            z[:, target_dim], raw, num_bins, tail_bound
+        )
+        z = z.at[:, target_dim].set(transformed)
+        total_logdet = total_logdet + logdet
+    return z, total_logdet
+
+
+def _nsf_standardized_log_prob(
+    params: tuple[dict[str, Array], ...],
+    standardized_theta: Array,
+    num_bins: int,
+    tail_bound: float,
+) -> Array:
+    z, logdet = _nsf_forward_standardized(params, standardized_theta, num_bins, tail_bound)
+    base_log_prob = -0.5 * jnp.sum(z**2 + _LOG_2PI, axis=-1)
+    return base_log_prob + logdet
+
+
+def fit_neural_spline_flow_density(
+    samples: np.ndarray,
+    cfg: Config = CFG,
+    seed: int | None = None,
+) -> dict[str, Any]:
+    """Fit a 2-D neural spline flow by held-out maximum likelihood.
+
+    This is deliberately post-hoc.  Neither X_OBS's analytic likelihood nor EXACT_DENSITY
+    appears anywhere in the fitting procedure.  Validation is performed only on held-out
+    Bayes-Transport particles.
+    """
+    samples = np.asarray(samples, dtype=np.float32)
+    samples = samples[np.all(np.isfinite(samples), axis=1)]
+    if len(samples) < 64:
+        raise ValueError("Need at least 64 finite posterior samples to fit the neural spline flow.")
+
+    seed = int(cfg.seed + 91_001 if seed is None else seed)
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(samples))
+    n_val = max(32, int(round(cfg.nsf_validation_fraction * len(samples))))
+    n_val = min(n_val, len(samples) // 3)
+    val_samples = samples[order[:n_val]]
+    train_samples = samples[order[n_val:]]
+
+    center = np.mean(train_samples, axis=0).astype(np.float32)
+    scale = np.std(train_samples, axis=0, ddof=1).astype(np.float32)
+    scale = np.maximum(scale, np.float32(1e-3))
+    train_z = ((train_samples - center) / scale).astype(np.float32)
+    val_z = ((val_samples - center) / scale).astype(np.float32)
+
+    k = int(cfg.nsf_bins)
+    output_dim = 3 * k - 1
+    derivative_start = 2 * k
+    derivative_bias = _inverse_softplus_np(1.0 - _NSF_MIN_DERIVATIVE)
+    keys = jax.random.split(jax.random.key(seed), int(cfg.nsf_layers))
+    params = tuple(
+        _init_nsf_conditioner(
+            keys[i],
+            int(cfg.nsf_hidden_dim),
+            output_dim,
+            derivative_start,
+            derivative_bias,
+        )
+        for i in range(int(cfg.nsf_layers))
+    )
+
+    optimizer = optax.adamw(cfg.nsf_learning_rate, weight_decay=cfg.nsf_weight_decay)
+    opt_state = optimizer.init(params)
+
+    def nll_fn(p, batch):
+        return -jnp.mean(_nsf_standardized_log_prob(
+            p, batch, int(cfg.nsf_bins), float(cfg.nsf_tail_bound)
+        ))
+
+    nll_and_grad = jax.jit(jax.value_and_grad(nll_fn))
+    nll_eval = jax.jit(nll_fn)
+
+    @jax.jit
+    def update_step(p, state, batch):
+        loss, grads = nll_and_grad(p, batch)
+        updates, state = optimizer.update(grads, state, p)
+        p = optax.apply_updates(p, updates)
+        return p, state, loss
+
+    batch_size = max(32, min(int(cfg.nsf_batch_size), len(train_z)))
+    best_params = params
+    best_val = float("inf")
+    best_epoch = 0
+    stale_checks = 0
+    train_history: list[tuple[int, float, float]] = []
+
+    for epoch in range(1, int(cfg.nsf_max_epochs) + 1):
+        perm = rng.permutation(len(train_z))
+        epoch_losses = []
+        for start in range(0, len(train_z), batch_size):
+            batch_ids = perm[start:start + batch_size]
+            batch = jnp.asarray(train_z[batch_ids])
+            params, opt_state, batch_loss = update_step(params, opt_state, batch)
+            epoch_losses.append(float(jax.device_get(batch_loss)))
+
+        if epoch == 1 or epoch % int(cfg.nsf_validation_every) == 0:
+            train_nll = float(np.mean(epoch_losses))
+            val_nll = float(jax.device_get(nll_eval(params, jnp.asarray(val_z))))
+            if not np.isfinite(train_nll) or not np.isfinite(val_nll):
+                raise FloatingPointError(
+                    f"Non-finite NSF objective at epoch {epoch}: train={train_nll}, val={val_nll}."
+                )
+            train_history.append((epoch, train_nll, val_nll))
+
+            if val_nll < best_val - 1e-4:
+                best_val = val_nll
+                best_epoch = epoch
+                best_params = jax.tree_util.tree_map(lambda x: jnp.array(x), params)
+                stale_checks = 0
+            else:
+                stale_checks += 1
+
+            if epoch == 1 or epoch % 100 == 0:
+                print(
+                    f"NSF epoch {epoch:4d} | train NLL {train_nll:.5f} | "
+                    f"validation NLL {val_nll:.5f} | best {best_val:.5f}"
+                )
+
+            if stale_checks >= int(cfg.nsf_patience_checks):
+                print(f"NSF early stopping at epoch {epoch}; best epoch={best_epoch}.")
+                break
+
+    return {
+        "params": best_params,
+        "center": center.astype(np.float32),
+        "scale": scale.astype(np.float32),
+        "num_bins": int(cfg.nsf_bins),
+        "tail_bound": float(cfg.nsf_tail_bound),
+        "best_validation_nll_standardized": float(best_val),
+        "best_epoch": int(best_epoch),
+        "num_train": int(len(train_z)),
+        "num_validation": int(len(val_z)),
+        "history": train_history,
+    }
+
+
+def neural_spline_flow_log_density_np(
+    estimator: dict[str, Any],
+    points: np.ndarray,
+    chunk_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate the fitted NSF log density in theta coordinates."""
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    center = np.asarray(estimator["center"], dtype=np.float32)
+    scale = np.asarray(estimator["scale"], dtype=np.float32)
+    log_standardization_jacobian = -float(np.sum(np.log(scale.astype(np.float64))))
+
+    @jax.jit
+    def eval_chunk(z):
+        return _nsf_standardized_log_prob(
+            estimator["params"],
+            z,
+            int(estimator["num_bins"]),
+            float(estimator["tail_bound"]),
+        )
+
+    out = np.empty((len(points),), dtype=np.float64)
+    for start in range(0, len(points), int(chunk_size)):
+        end = min(start + int(chunk_size), len(points))
+        z = (points[start:end] - center) / scale
+        logp_std = np.asarray(jax.device_get(eval_chunk(jnp.asarray(z))), dtype=np.float64)
+        out[start:end] = logp_std + log_standardization_jacobian
+    return out
+
+
+def neural_spline_flow_density_on_grid(
+    estimator: dict[str, Any],
+    theta1_grid: np.ndarray,
+    theta2_grid: np.ndarray,
+) -> np.ndarray:
+    g1, g2 = np.meshgrid(theta1_grid, theta2_grid, indexing="xy")
+    points = np.column_stack([g1.ravel(), g2.ravel()])
+    log_density = neural_spline_flow_log_density_np(estimator, points)
+    density = np.exp(np.clip(log_density, -745.0, 700.0))
+    return density.reshape(g1.shape)
+
+
+def collect_bt_density_samples(
+    model: ConditionalParticleTransport,
+    first_cloud: np.ndarray,
+    x: np.ndarray = X_OBS,
+    cfg: Config = CFG,
+) -> np.ndarray:
+    """Aggregate complete evaluation clouds without changing the trained particle-set size."""
+    clouds = [np.asarray(first_cloud, dtype=np.float32)]
+    rng = np.random.default_rng(cfg.seed + 90_013)
+    n_clouds = max(1, int(cfg.density_estimation_clouds))
+    for _ in range(1, n_clouds):
+        prior = sample_exact_prior_np(rng, cfg.eval_particles)
+        clouds.append(evaluate_bt(model, prior, x))
+    return np.concatenate(clouds, axis=0).astype(np.float32)
+
+
+def exact_density_on_grid_axes(
+    theta1_grid: np.ndarray,
+    theta2_grid: np.ndarray,
+    x: np.ndarray = X_OBS,
+    cfg: Config = CFG,
+) -> np.ndarray:
+    """Exact diagnostic posterior evaluated and normalized on an arbitrary rectangular grid."""
+    g1, g2 = np.meshgrid(theta1_grid, theta2_grid, indexing="xy")
+    theta = np.stack([g1, g2], axis=-1)
+    density = two_moons_likelihood_density_np(x, theta, cfg)
+    d1 = float(theta1_grid[1] - theta1_grid[0])
+    d2 = float(theta2_grid[1] - theta2_grid[0])
+    z = float(np.sum(density) * d1 * d2)
+    return density / max(z, 1e-300)
+
+
+def density_grid_diagnostics(
+    exact_density: np.ndarray,
+    estimated_density: np.ndarray,
+    theta1_grid: np.ndarray,
+    theta2_grid: np.ndarray,
+) -> dict[str, float]:
+    """Grid diagnostics that respect the exact posterior's zero density outside [-1,1]^2."""
+    exact = np.asarray(exact_density, dtype=np.float64)
+    estimated = np.asarray(estimated_density, dtype=np.float64)
+    d1 = float(theta1_grid[1] - theta1_grid[0])
+    d2 = float(theta2_grid[1] - theta2_grid[0])
+    area = d1 * d2
+
+    exact_mass = float(np.sum(exact) * area)
+    estimated_square_mass = float(np.sum(estimated) * area)
+    outside_mass = max(0.0, 1.0 - estimated_square_mass)
+    overlap = float(np.sum(np.sqrt(np.maximum(exact, 0.0) * np.maximum(estimated, 0.0))) * area)
+    hellinger2 = max(0.0, 1.0 - overlap / math.sqrt(max(exact_mass, 1e-15)))
+    l1_inside = float(np.sum(np.abs(exact - estimated)) * area)
+    total_variation = 0.5 * (l1_inside + outside_mass)
+
+    e = exact.reshape(-1)
+    q = estimated.reshape(-1)
+    if np.std(e) > 0 and np.std(q) > 0:
+        corr = float(np.corrcoef(e, q)[0, 1])
+    else:
+        corr = float("nan")
+
+    return {
+        "mass_inside_exact_prior_square": estimated_square_mass,
+        "mass_outside_exact_prior_square": outside_mass,
+        "hellinger_squared": hellinger2,
+        "total_variation_approx": total_variation,
+        "grid_density_correlation": corr,
+    }
+
+
+def plot_v2_density_comparison(
+    bt_density_samples: np.ndarray,
+    nsf_estimator: dict[str, Any],
+    cfg: Config = CFG,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Heatmap comparison: exact posterior | crude KDE | neural spline flow.
+
+    Every heatmap is normalized by its own maximum only for display, so the viewer compares
+    geometry rather than absolute peak height.  Exact credible-density contours are overlaid on
+    both estimates to make geometric agreement/mismatch immediately visible.
+    """
+    axis = np.linspace(cfg.prior_low, cfg.prior_high, cfg.density_grid_size, dtype=np.float64)
+    exact = exact_density_on_grid_axes(axis, axis, X_OBS, cfg)
+    kde = kde_density_on_grid(bt_density_samples, axis, axis)
+    nsf = neural_spline_flow_density_on_grid(nsf_estimator, axis, axis)
+    levels = credible_density_levels(exact)
+
+    kde_metrics = density_grid_diagnostics(exact, kde, axis, axis)
+    nsf_metrics = density_grid_diagnostics(exact, nsf, axis, axis)
+
+    # Persist the common grid and raw (not display-normalized) densities for reproducible replotting.
+    np.save(OUT / "v2_density_axis.npy", axis)
+    np.save(OUT / "v2_exact_density_grid.npy", exact)
+    np.save(OUT / "v2_kde_density_grid.npy", kde)
+    np.save(OUT / "v2_nsf_density_grid.npy", nsf)
+
+    extent = [cfg.prior_low, cfg.prior_high, cfg.prior_low, cfg.prior_high]
+    fig, axes = plt.subplots(1, 3, figsize=(15.8, 5.0), sharex=True, sharey=True)
+
+    panels = [
+        (exact, "Ground-truth posterior"),
+        (kde, "Crude Gaussian KDE (Scott bandwidth)"),
+        (nsf, "Neural spline-flow density (v2)"),
+    ]
+    for i, (ax, (density, title)) in enumerate(zip(axes, panels)):
+        shown = density / max(float(np.max(density)), 1e-12)
+        im = ax.imshow(
+            shown,
+            origin="lower",
+            extent=extent,
+            cmap="viridis",
+            vmin=0.0,
+            vmax=1.0,
+            aspect="equal",
+            interpolation="nearest",
+        )
+        if i > 0:
+            ax.contour(
+                axis,
+                axis,
+                exact,
+                levels=levels,
+                colors="white",
+                linewidths=1.15,
+                alpha=0.95,
+            )
+        ax.set_title(title)
+        ax.set_xlabel(r"$\theta_1$")
+        ax.set_ylabel(r"$\theta_2$")
+        ax.set_xlim(cfg.prior_low, cfg.prior_high)
+        ax.set_ylim(cfg.prior_low, cfg.prior_high)
+        ax.grid(False)
+
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.88, pad=0.02)
+    cbar.set_label("relative density (panel max = 1)")
+    fig.suptitle(
+        rf"Two moons at $x_o=(0,0)$ — post-hoc density estimation from {len(bt_density_samples):,} BT particles",
+        fontsize=15,
+    )
+    fig.subplots_adjust(left=0.06, right=0.91, bottom=0.11, top=0.86, wspace=0.18)
+    fig.savefig(OUT / "32_v2_density_heatmaps_kde_vs_nsf.png", dpi=220, bbox_inches="tight")
+    plt.show()
+
+    # A second direct-overlay panel: if the NSF follows the exact posterior, the white exact
+    # credible contours should sit naturally on the high-density bands of the learned heatmap.
+    fig, ax = plt.subplots(figsize=(7.4, 7.0))
+    shown = nsf / max(float(np.max(nsf)), 1e-12)
+    im = ax.imshow(
+        shown,
+        origin="lower",
+        extent=extent,
+        cmap="viridis",
+        vmin=0.0,
+        vmax=1.0,
+        aspect="equal",
+        interpolation="nearest",
+    )
+    ax.contour(axis, axis, exact, levels=levels, colors="white", linewidths=1.7)
+    # Thin particle overlay keeps the heatmap readable while showing where the empirical mass came from.
+    show_n = min(1800, len(bt_density_samples))
+    ids = np.linspace(0, len(bt_density_samples) - 1, show_n, dtype=int)
+    ax.scatter(
+        bt_density_samples[ids, 0],
+        bt_density_samples[ids, 1],
+        s=3,
+        alpha=0.10,
+        c="black",
+        linewidths=0,
+    )
+    ax.set_xlim(cfg.prior_low, cfg.prior_high)
+    ax.set_ylim(cfg.prior_low, cfg.prior_high)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel(r"$\theta_1$")
+    ax.set_ylabel(r"$\theta_2$")
+    ax.set_title("v2 NSF heatmap + exact 50/80/95% density contours")
+    ax.grid(False)
+    fig.colorbar(im, ax=ax, label="relative NSF density")
+    fig.tight_layout()
+    fig.savefig(OUT / "32_v2_nsf_exact_contour_overlay.png", dpi=220, bbox_inches="tight")
+    plt.show()
+
+    return kde_metrics, nsf_metrics
+
+
 def plot_true_posterior_viridis(
     theta1_grid: np.ndarray,
     theta2_grid: np.ndarray,
@@ -1414,15 +2048,17 @@ plot_true_posterior_viridis(THETA1_GRID, THETA2_GRID, EXACT_DENSITY)
 
 train_rng = np.random.default_rng(CFG.seed + 10_001)
 mode_rng = np.random.default_rng(CFG.seed + 20_003)
+particle_count_rng = np.random.default_rng(CFG.seed + 25_019)
 dropout_key = jax.random.key(CFG.seed + 30_007)
 replay_buffer = HistoricalPosteriorBuffer(
     CFG.historical_output_buffer_capacity,
-    CFG.num_particles,
+    CFG.max_training_particles,
 )
 
 history = {name: [] for name in (
     "step",
     "simulations_seen",
+    "training_particles",
     "energy_score",
     "attraction",
     "repulsion",
@@ -1444,6 +2080,10 @@ FIGURE1_PRIOR_PARTICLES = sample_exact_prior_np(_snapshot_rng, CFG.eval_particle
 figure1_snapshot_samples: dict[int, tuple[int, np.ndarray]] = {}
 
 for step in range(1, CFG.training_steps + 1):
+    # One true set size per minibatch keeps the input unpadded while limiting JAX recompilations to
+    # the automatically-derived TRAINING_PARTICLE_COUNTS.  With the flag off this is always the max.
+    training_particles = int(particle_count_rng.choice(TRAINING_PARTICLE_COUNTS))
+
     # Fresh simulator-supervised minibatch.
     theta_target = sample_exact_prior_np(train_rng, CFG.batch_size)
     x_batch = simulate_two_moons_batch_np(train_rng, theta_target)
@@ -1455,6 +2095,7 @@ for step in range(1, CFG.training_steps + 1):
         theta_target,
         x_batch,
         replay_buffer,
+        training_particles,
         CFG,
     )
 
@@ -1480,6 +2121,7 @@ for step in range(1, CFG.training_steps + 1):
     scalar_values = {
         "step": float(step),
         "simulations_seen": float(step * CFG.batch_size),
+        "training_particles": float(training_particles),
         "energy_score": float(host["energy_score"]),
         "attraction": float(host["attraction"]),
         "repulsion": float(host["repulsion"]),
@@ -1515,6 +2157,7 @@ for step in range(1, CFG.training_steps + 1):
         print(
             f"step {step:6d}/{CFG.training_steps} | "
             f"sims {step * CFG.batch_size:9,d} | "
+            f"M {training_particles:4d}/{CFG.max_training_particles:<4d} | "
             f"ES {scalar_values['energy_score']:.5f} | "
             f"mean-err {scalar_values['mean_error']:.4f} | "
             f"grad {scalar_values['grad_norm']:.3e} | "
@@ -1561,6 +2204,25 @@ if "EVAL_PRIOR_PARTICLES" not in globals():
 
 BT_POSTERIOR = evaluate_bt(model, EVAL_PRIOR_PARTICLES, X_OBS)
 
+# v2 density-estimation sample set: preserve the trained set size (CFG.eval_particles) and
+# aggregate independent complete clouds.  No simulator calls and no exact-posterior information
+# are used here; these are simply additional transports of fresh exact-prior particles at x_o.
+BT_DENSITY_SAMPLES = collect_bt_density_samples(model, BT_POSTERIOR, X_OBS, CFG)
+print(f"\nv2 density visualization uses {len(BT_DENSITY_SAMPLES):,} BT posterior particles "
+      f"from {CFG.density_estimation_clouds} complete evaluation clouds.")
+
+print("Fitting post-hoc neural spline-flow density estimator (BT particles only)...")
+NSF_DENSITY_ESTIMATOR = fit_neural_spline_flow_density(BT_DENSITY_SAMPLES, CFG)
+print(
+    "NSF fit complete | "
+    f"best epoch={NSF_DENSITY_ESTIMATOR['best_epoch']} | "
+    f"held-out standardized NLL={NSF_DENSITY_ESTIMATOR['best_validation_nll_standardized']:.6f}"
+)
+with (OUT / "v2_nsf_training_history.csv").open("w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["epoch", "train_nll_standardized", "validation_nll_standardized"])
+    writer.writerows(NSF_DENSITY_ESTIMATOR["history"])
+
 plot_samples_on_exact_contours(
     BT_POSTERIOR,
     THETA1_GRID,
@@ -1577,6 +2239,26 @@ plot_final_density_comparison(
     BT_POSTERIOR,
     CFG,
 )
+
+# v2 heatmaps: same BT sample set for the crude KDE and the NSF, with exact contours overlaid.
+KDE_DENSITY_METRICS, NSF_DENSITY_METRICS = plot_v2_density_comparison(
+    BT_DENSITY_SAMPLES,
+    NSF_DENSITY_ESTIMATOR,
+    CFG,
+)
+
+print("\nv2 density-grid diagnostics (lower Hellinger/TV is better; higher correlation is better):")
+for method_name, method_metrics in (("crude KDE", KDE_DENSITY_METRICS), ("neural spline flow", NSF_DENSITY_METRICS)):
+    print(f"  {method_name}:")
+    for k, v in method_metrics.items():
+        print(f"    {k}: {v:.8f}")
+
+with (OUT / "v2_density_metrics.csv").open("w", newline="") as f:
+    fieldnames = ["method"] + list(KDE_DENSITY_METRICS.keys())
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerow({"method": "crude_kde_scott", **KDE_DENSITY_METRICS})
+    writer.writerow({"method": "neural_spline_flow", **NSF_DENSITY_METRICS})
 
 plot_marginals(EXACT_SAMPLES, BT_POSTERIOR)
 plot_prior_to_posterior_transport(EVAL_PRIOR_PARTICLES, BT_POSTERIOR)
@@ -1598,18 +2280,26 @@ with (OUT / "final_metrics.csv").open("w", newline="") as f:
 
 np.save(OUT / "evaluation_prior_particles.npy", EVAL_PRIOR_PARTICLES)
 np.save(OUT / "bt_posterior_samples.npy", BT_POSTERIOR)
+np.save(OUT / "bt_density_estimation_samples_v2.npy", BT_DENSITY_SAMPLES)
 np.save(OUT / "ground_truth_posterior_samples.npy", EXACT_SAMPLES)
 np.save(OUT / "observed_x.npy", X_OBS)
 
 
-#%% 8) Optional compact publication-style panel: prior | exact | BT particles | BT density
+#%% 8) Optional compact publication-style panel (v4): prior | exact | particles | KDE | NSF
 # This cell uses only objects already produced above.
 
-_kde_axis = np.linspace(CFG.prior_low, CFG.prior_high, CFG.kde_grid_size)
-_bt_density = kde_density_on_grid(BT_POSTERIOR, _kde_axis, _kde_axis)
+_density_axis = np.linspace(CFG.prior_low, CFG.prior_high, CFG.density_grid_size)
+_kde_density_v2 = kde_density_on_grid(BT_DENSITY_SAMPLES, _density_axis, _density_axis)
+_nsf_density_v2 = neural_spline_flow_density_on_grid(
+    NSF_DENSITY_ESTIMATOR,
+    _density_axis,
+    _density_axis,
+)
 _levels = credible_density_levels(EXACT_DENSITY)
+_exact_density_v2 = exact_density_on_grid_axes(_density_axis, _density_axis)
+_exact_levels_v2 = credible_density_levels(_exact_density_v2)
 
-fig, axes = plt.subplots(1, 4, figsize=(17, 4.2))
+fig, axes = plt.subplots(1, 5, figsize=(20.5, 4.2))
 
 axes[0].scatter(EVAL_PRIOR_PARTICLES[:, 0], EVAL_PRIOR_PARTICLES[:, 1], s=7, alpha=0.30)
 axes[0].set_title("Exact test prior")
@@ -1630,7 +2320,7 @@ axes[2].scatter(BT_POSTERIOR[:, 0], BT_POSTERIOR[:, 1], s=7, alpha=0.30)
 axes[2].set_title("BT particles")
 
 axes[3].imshow(
-    _bt_density / max(float(np.max(_bt_density)), 1e-12),
+    _kde_density_v2 / max(float(np.max(_kde_density_v2)), 1e-12),
     origin="lower",
     extent=[CFG.prior_low, CFG.prior_high, CFG.prior_low, CFG.prior_high],
     cmap="viridis",
@@ -1638,7 +2328,22 @@ axes[3].imshow(
     vmax=1,
     aspect="equal",
 )
-axes[3].set_title("BT KDE")
+# axes[3].contour(_density_axis, _density_axis, _exact_density_v2,
+#                 levels=_exact_levels_v2, colors="white", linewidths=0.9)
+axes[3].set_title("Crude KDE")
+
+axes[4].imshow(
+    _nsf_density_v2 / max(float(np.max(_nsf_density_v2)), 1e-12),
+    origin="lower",
+    extent=[CFG.prior_low, CFG.prior_high, CFG.prior_low, CFG.prior_high],
+    cmap="viridis",
+    vmin=0,
+    vmax=1,
+    aspect="equal",
+)
+# axes[4].contour(_density_axis, _density_axis, _exact_density_v2,
+#                 levels=_exact_levels_v2, colors="white", linewidths=0.9)
+axes[4].set_title("Neural spline flow (v2)")
 
 for ax in axes:
     ax.set_xlim(CFG.prior_low, CFG.prior_high)
@@ -1648,7 +2353,7 @@ for ax in axes:
     ax.set_ylabel(r"$\theta_2$")
     ax.grid(False)
 
-fig.suptitle(r"Two moons at $x_o=(0,0)$ — Bayes Transport", fontsize=15)
+fig.suptitle(r"Two moons at $x_o=(0,0)$ — Bayes Transport v4", fontsize=15)
 fig.tight_layout()
-fig.savefig(OUT / "50_compact_publication_panel.png", dpi=220, bbox_inches="tight")
+fig.savefig(OUT / "50_compact_publication_panel_v4.png", dpi=220, bbox_inches="tight")
 plt.show()

@@ -93,7 +93,7 @@ class Config:
     observation_scale: float = 1.0
 
     # Optimisation: preserved from the supplied/current setup.
-    training_steps: int = 25_000
+    training_steps: int = 100_000
     learning_rate: float = 1e-5
     weight_decay: float = 1e-6
     grad_clip_norm: float = 5.0
