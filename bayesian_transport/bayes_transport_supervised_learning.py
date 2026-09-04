@@ -83,7 +83,7 @@ class Config:
 
     # Synthetic regression law. The default exactly preserves the current hand-edited staircase law.
     # Change only this string to stress-test the transport on other deliberately GP-hostile functions.
-    data_function: str = "weierstrass"  # see BELOW for more 
+    data_function: str = "cosine_linear"  # see BELOW for more 
 
     # Particle transport.
     num_particles: int = 16*2
@@ -114,7 +114,8 @@ class Config:
     #     built from the corresponding fixed basis.
     #   * None: sigma(x) == 1 exactly.
     # Setting BOTH fields to None reproduces the historical transport output exactly.
-    mean_function_class: str | None = "same_as_data"
+    # mean_function_class: str | None = "same_as_data"
+    mean_function_class: str | None = None
     scale_function_class: str | None = None
     structural_scale_floor: float = 1e-4
 
