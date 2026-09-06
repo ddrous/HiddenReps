@@ -2302,7 +2302,7 @@ _exact_levels_v2 = credible_density_levels(_exact_density_v2)
 fig, axes = plt.subplots(1, 5, figsize=(20.5, 4.2))
 
 axes[0].scatter(EVAL_PRIOR_PARTICLES[:, 0], EVAL_PRIOR_PARTICLES[:, 1], s=7, alpha=0.30)
-axes[0].set_title("Exact test prior")
+axes[0].set_title("Prior particles")
 
 axes[1].imshow(
     EXACT_DENSITY / np.max(EXACT_DENSITY),
@@ -2315,9 +2315,9 @@ axes[1].imshow(
 )
 axes[1].set_title("Ground truth")
 
-axes[2].contour(THETA1_GRID, THETA2_GRID, EXACT_DENSITY, levels=_levels, cmap="viridis", linewidths=1.5)
+# axes[2].contour(THETA1_GRID, THETA2_GRID, EXACT_DENSITY, levels=_levels, cmap="viridis", linewidths=1.5)
 axes[2].scatter(BT_POSTERIOR[:, 0], BT_POSTERIOR[:, 1], s=7, alpha=0.30)
-axes[2].set_title("BT particles")
+axes[2].set_title("Posterior particles")
 
 axes[3].imshow(
     _kde_density_v2 / max(float(np.max(_kde_density_v2)), 1e-12),
@@ -2330,7 +2330,7 @@ axes[3].imshow(
 )
 # axes[3].contour(_density_axis, _density_axis, _exact_density_v2,
 #                 levels=_exact_levels_v2, colors="white", linewidths=0.9)
-axes[3].set_title("Crude KDE")
+axes[3].set_title("KDE")
 
 axes[4].imshow(
     _nsf_density_v2 / max(float(np.max(_nsf_density_v2)), 1e-12),
@@ -2343,7 +2343,7 @@ axes[4].imshow(
 )
 # axes[4].contour(_density_axis, _density_axis, _exact_density_v2,
 #                 levels=_exact_levels_v2, colors="white", linewidths=0.9)
-axes[4].set_title("Neural spline flow (v2)")
+axes[4].set_title("Neural spline flow")
 
 for ax in axes:
     ax.set_xlim(CFG.prior_low, CFG.prior_high)
@@ -2353,7 +2353,7 @@ for ax in axes:
     ax.set_ylabel(r"$\theta_2$")
     ax.grid(False)
 
-fig.suptitle(r"Two moons at $x_o=(0,0)$ — Bayes Transport v4", fontsize=15)
+fig.suptitle(r"Two moons at $x_o=(0,0)$ — PSPT", fontsize=15)
 fig.tight_layout()
 fig.savefig(OUT / "50_compact_publication_panel_v4.png", dpi=220, bbox_inches="tight")
 plt.show()

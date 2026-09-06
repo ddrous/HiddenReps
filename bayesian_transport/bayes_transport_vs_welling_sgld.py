@@ -66,30 +66,30 @@ class Config:
     batch_size: int = 128
 
     # Particle transport
-    num_particles: int = 16*2
-    eval_particles: int = 1024//2
-    hidden_dim: int = 64*4
-    heads: int = 4
+    num_particles: int = 16*8
+    eval_particles: int = 1024//1
+    hidden_dim: int = 64*2
+    heads: int = 8
     mlp_ratio: int = 4
-    posterior_depth: int = 5
-    posterior_conditioning: str = "adaln"  # {"cross_attention", "adaln"}
+    posterior_depth: int = 4
+    posterior_conditioning: str = "cross_attention"  # {"adaln", "adaln"}
     max_normalized_displacement: float = 6.0
     attention_dropout_rate: float = 0.0
 
     # Causal likelihood Transformer over x_1, ..., x_O
-    likelihood_hidden_dim: int = 64
+    likelihood_hidden_dim: int = 64*2
     likelihood_heads: int = 4
     likelihood_mlp_ratio: int = 4
-    likelihood_depth: int = 3
+    likelihood_depth: int = 8
     normalize_observations: bool = True
 
     # Every selected causal prefix is a direct prior -> posterior map.
     # prefix_stride=1 trains on 1,2,...,128 observations from every simulated batch.
     min_observations_per_step: int = 1
-    prefix_stride: int = 16
+    prefix_stride: int = 2
 
     # Bayes Transport optimisation
-    training_steps: int = 10_000
+    training_steps: int = 25_000
     learning_rate: float = 1e-5
     weight_decay: float = 1e-6
     grad_clip_norm: float = 5.0
@@ -1184,9 +1184,9 @@ def plot_full_comparison(
     fig, axes = plt.subplots(2, 2, figsize=(14, 13), sharex=True, sharey=True)
     panels = [
         (prior_samples, "Exact prior"),
-        (exact_samples, "Exact numerical posterior"),
-        (bt_samples, "Bayes Transport"),
-        (sgld_samples, "SGLD"),
+        (exact_samples, "Exact posterior"),
+        (bt_samples, "Properly Score Particle Transport (PSPT)"),
+        (sgld_samples, "Stochastic Gradient Lagevin Dynamics (SGLD)"),
     ]
     for ax, (samples, title) in zip(axes.ravel(), panels):
         if title != "Exact prior":
@@ -1198,7 +1198,8 @@ def plot_full_comparison(
         ax.set_ylabel(r"$\theta_2$")
         ax.set_xlim(CFG.grid_theta1_min, CFG.grid_theta1_max)
         ax.set_ylim(CFG.grid_theta2_min, CFG.grid_theta2_max)
-    fig.suptitle("Section 5.1 posterior comparison: same 100 evaluation observations", fontsize=17)
+    # fig.suptitle("Section 5.1 posterior comparison: same 100 evaluation observations", fontsize=17)
+    fig.suptitle("Comparison using the same 100 evaluation observations", fontsize=22)
     fig.tight_layout()
     fig.savefig(OUT / "40_full_posterior_comparison.png", dpi=180, bbox_inches="tight")
     plt.show()
