@@ -107,7 +107,7 @@ class Config:
     observation_scale: float = 1.0
 
     # Bayes Transport optimisation -- preserved from the supplied/latest setup.
-    training_steps: int = 25_000
+    training_steps: int = 5_000
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     grad_clip_norm: float = 5000.0
@@ -152,7 +152,7 @@ class Config:
     nsf_learning_rate: float = 2e-3
     nsf_weight_decay: float = 1e-6
     nsf_batch_size: int = 512
-    nsf_max_epochs: int = 1200
+    nsf_max_epochs: int = 240
     nsf_validation_fraction: float = 0.15
     nsf_validation_every: int = 10
     nsf_patience_checks: int = 30
