@@ -1,0 +1,56 @@
+{
+  "hypothesis": "ACE-style meta-amortization over a very broad prior family may teach a genuine prior-conditioned Bayes operator. The decisive extrapolation test remains the Uniform prior with zero support near theta_true: a Bayesian updater must keep posterior mass inside the supplied support.",
+  "prior_meta_distribution": {
+    "source": "ACE Appendix B.1, adapted from histogram priors to particle clouds",
+    "mixture_probability": 0.8,
+    "flat_uniform_probability": 0.19999999999999996,
+    "geometric_q": 0.5,
+    "domain": [
+      -4.0,
+      4.0
+    ],
+    "std_fraction_range": [
+      0.025,
+      0.35
+    ],
+    "mixture_configurations": [
+      "same means / different stds",
+      "different means / same std",
+      "all means and stds different"
+    ],
+    "mixture_weights": "Dirichlet(alpha0=1)"
+  },
+  "truth_modes": {
+    "member": "theta* is sampled directly from Theta_in; target is empirical-cloud Bayes.",
+    "distribution": "theta* is an independent draw from the same underlying prior law as Theta_in."
+  },
+  "fixed_x": 1.5,
+  "theta_true_marker": 1.5,
+  "evaluation_cases": [
+    {
+      "name": "gaussian_broad",
+      "prior": "Broad Gaussian",
+      "note": "Simple reference prior; most mass lies inside the ACE training domain."
+    },
+    {
+      "name": "gaussian_shifted_narrow",
+      "prior": "Shifted narrow Gaussian",
+      "note": "Strong prior-likelihood conflict, but Gaussian support remains nonzero everywhere."
+    },
+    {
+      "name": "uniform_broad",
+      "prior": "Broad Uniform",
+      "note": "Exactly the flat-prior branch of the ACE training meta-distribution."
+    },
+    {
+      "name": "uniform_zero_support",
+      "prior": "Uniform excluding truth",
+      "note": "Hard-support OOD stress test: exact posterior has ZERO mass near theta_true."
+    },
+    {
+      "name": "ace_bimodal",
+      "prior": "ACE-style bimodal GMM",
+      "note": "Explicit multimodality from the meta-training prior family."
+    }
+  ]
+}
