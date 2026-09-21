@@ -70,10 +70,10 @@ class Config:
     likelihood_std: float = 0.45
 
     # Training
-    training_steps: int = 6_000
+    training_steps: int = 6_00
     batch_size: int = 128
-    training_particles: int = 64
-    learning_rate: float = 2e-4
+    training_particles: int = 64*8
+    learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     grad_clip_norm: float = 1000.0
     log_every: int = 500
@@ -93,7 +93,7 @@ class Config:
     # theta = (1-tau) z + tau a.
     train_gaussian_probability: float = 0.50
     interpolation_tau_min: float = 0.0
-    interpolation_tau_max: float = 0.85
+    interpolation_tau_max: float = 0.95
     anchor_low: float = -3.0
     anchor_high: float = 3.0
     gaussian_base_std: float = 2.0
@@ -105,7 +105,7 @@ class Config:
     snapshot_steps: tuple[int, ...] = (100, 500, 1_500, 3_000, 6_000)
 
     # Evaluation
-    eval_particles: int = 1024
+    eval_particles: int = 1024*8
     exact_reference_samples: int = 20_000
     density_grid_points: int = 900
     plot_transport_particles: int = 180

@@ -37,3 +37,5 @@ jax_hiddenreps/runs/*
 
 limit_weight_space/plots/cosine_transport
 bayesian_transport/plots/
+
+bayesian_transport/tests/plots
