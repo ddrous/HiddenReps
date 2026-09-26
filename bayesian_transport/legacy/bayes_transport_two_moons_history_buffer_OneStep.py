@@ -4,25 +4,11 @@
 Standalone companion to bayes_transport_two_moons_proposal_buffer.py; that file is unchanged.
 Run #%% cells in order. There is deliberately no main() function.
 
-Config.training_mode defaults to "one_step", the original experiment described below.
-Optional "ode" uses the time-conditioned posterior Transformer's residual as a vector field.
-Optional "flow_map" defines Phi(t,z0|x)=z0+t*residual(z0,t,x), differentiates it in time at
-fixed initial z0, and integrates that velocity during training. Both modes use Diffrax on
-[0,1], defaulting to 16 fixed Euler steps (solver, steps, and adaptive tolerances configurable).
-All modes minimize the unchanged energy score of the terminal cloud. Flow-map inference
-calls Phi(1,z0|x) directly; finite-step training quadrature may differ from this direct endpoint,
-so check convergence in ode_steps or use an adaptive higher-order solver. Terminal supervision
-alone does not uniquely identify intermediate paths or guarantee an invertible flow.
-Continuous modes disable posterior-cloud replay/storage and interpolation (with a warning),
-while retaining the simulated dataset and replay_epochs. The three training variants then
-coincide. The "parallel_xT" evaluation repeats x_T into a length-T observation block and makes
-one transport call from the same fresh prior as "buffer_xT". It does not feed outputs back in.
-
 Every training row contains ONE theta and up to max_training_observations iid 2-D observations.
 A separate causal observation Transformer supplies one summary per prefix. The posterior
 Transformer is vmapped over ALL valid prefixes, with equal per-row average prefix energy score.
 Replay clouds belong to the SAME row AND prefix, so suffix observations cannot leak into shorter
-prefixes. Sequential evaluation supplies one new observation per call and carries history in particles;
+prefixes. Evaluation still supplies one new observation per call and carries history in particles;
 there are no test-time gradients or extra inference simulations.
 
 Three identically initialized transports share exactly the same simulator pairs, stored loss
@@ -74,8 +60,6 @@ from pathlib import Path
 import csv
 import json
 import math
-import warnings
-from time import perf_counter
 from typing import Any
 
 import equinox as eqx
@@ -112,8 +96,8 @@ class Config:
     # Exact two-moons benchmark from Greenberg et al. (2019), Appendix A.5.1
     prior_low: float = -1.0
     prior_high: float = 1.0
-    radial_mean: float = 0.3
-    radial_std: float = 0.03
+    radial_mean: float = 0.1
+    radial_std: float = 0.01
     crescent_x_offset: float = 0.25
     observed_x1: float = 0.0
     observed_x2: float = 0.0
@@ -128,8 +112,8 @@ class Config:
     # fixed-particle-count training path.  Evaluation remains independently controlled by eval_particles.
     max_training_particles: int = 16 * 2*1
     variable_training_particles: bool = False
-    eval_particles: int = 64*4  # Repeated sequence evaluation; attention costs O(M^2).
-    hidden_dim: int = 64 * 4
+    eval_particles: int = 64  # Repeated sequence evaluation; attention costs O(M^2).
+    hidden_dim: int = 64 * 2
     heads: int = 4
     mlp_ratio: int = 4
     posterior_depth: int = 4
@@ -137,33 +121,21 @@ class Config:
     max_normalized_displacement: float = 6.0
     attention_dropout_rate: float = 0.0
 
-    # All modes score ONLY the terminal cloud with the same energy score.
-    # one_step: original residual transport; ode: integrate a learned velocity on [0,1];
-    # flow_map: integrate d Phi(t,z0)/dt during training; directly evaluate Phi(1,z0) at inference.
-    # Phi(t,z0) = z0 + t * residual(z0,t,observations). Both integrations run from 0 to 1.
-    training_mode: str = "one_step"  # {"one_step", "ode", "flow_map"}
-    ode_solver: str = "euler"  # {"euler", "heun", "midpoint", "tsit5", "dopri5"}
-    ode_steps: int = 16  # Fixed steps by default; initial step count if adaptive.
-    ode_adaptive: bool = False  # Requires tsit5 or dopri5.
-    ode_rtol: float = 1e-3
-    ode_atol: float = 1e-5
-    ode_max_steps: int = 1024
-
     # Train on every iid observation prefix 1..M; independent of the particle count and test T.
     max_training_observations: int = 8
     observation_sequence_depth: int = 4
 
     # Per-observation encoder. x=(x1,x2) is represented as two labelled tokens.
-    likelihood_hidden_dim: int = 64
-    likelihood_heads: int = 4
-    likelihood_mlp_ratio: int = 4
-    likelihood_depth: int = 4
+    likelihood_hidden_dim: int = 32
+    likelihood_heads: int = 2
+    likelihood_mlp_ratio: int = 2
+    likelihood_depth: int = 1
     normalize_observations: bool = True
     observation_scale: float = 1.0
 
     # Bayes Transport optimisation -- preserved from the supplied/latest setup.
     simulation_budget: int = 10_000  # Exact number of fresh training simulator calls.
-    replay_epochs: int = 1000  # Full shuffled passes AFTER the acquisition stage; may be zero.
+    replay_epochs: int = 300  # Full shuffled passes AFTER the acquisition stage; may be zero.
     learning_rate: float = 1e-5
     weight_decay: float = 1e-6
     grad_clip_norm: float = 5000.0
@@ -189,8 +161,8 @@ class Config:
 
     # Three mutually-exclusive input sources. The residual probability gives fresh uniform.
     # A requested same-row posterior falls back to fresh uniform on its first visit only.
-    prior_interpolation_probability: float = 0.00
-    historical_output_prior_probability: float = 0.00
+    prior_interpolation_probability: float = 0.05
+    historical_output_prior_probability: float = 0.85
     interpolation_base_cloud: str = "uniform"  # {"uniform", "gaussian"}
     prior_interpolation_tau_min: float = 0.05
     prior_interpolation_tau_max: float = 1.05
@@ -202,7 +174,7 @@ class Config:
     sliced_wasserstein_projections: int = 128
  
     # Temporal experiment. T is configurable; no function below assumes T=4.
-    sequence_length: int = 8
+    sequence_length: int = 2
     evaluation_sequences: int = 24  # Independent held-out trajectories per scenario.
     # evaluation_transitions: tuple[str, ...] = (
     #     "identity", "brownian", "driftBrownian", "constantVelocity", "rotation", "ou", "custom", "relocation",
@@ -236,41 +208,6 @@ class Config:
     prior_predictive_plot_samples: int = 30_000
 
 
-def validate_transport_config(cfg: Config) -> None:
-    if cfg.training_mode not in {"one_step", "ode", "flow_map"}:
-        raise ValueError("training_mode must be 'one_step', 'ode', or 'flow_map'.")
-    if cfg.ode_solver not in {"euler", "heun", "midpoint", "tsit5", "dopri5"}:
-        raise ValueError("Unknown ode_solver; choose euler, heun, midpoint, tsit5, or dopri5.")
-    for name in ("ode_steps", "ode_max_steps"):
-        value = getattr(cfg, name)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError(f"{name} must be a positive integer.")
-    if cfg.ode_max_steps < cfg.ode_steps:
-        raise ValueError("ode_max_steps must be >= ode_steps.")
-    if not all(math.isfinite(v) and v > 0 for v in (cfg.ode_rtol, cfg.ode_atol)):
-        raise ValueError("ODE tolerances must be finite and positive.")
-    if cfg.ode_adaptive and cfg.ode_solver not in {"tsit5", "dopri5"}:
-        raise ValueError("Adaptive integration requires ode_solver='tsit5' or 'dopri5'.")
-
-
-def prepare_transport_config(cfg: Config) -> Config:
-    """Continuous transports start from the scientific prior, without cloud replay."""
-    validate_transport_config(cfg)
-    if cfg.training_mode == "one_step":
-        return cfg
-    if cfg.prior_interpolation_probability:
-        warnings.warn(
-            f"{cfg.training_mode} mode: disable interpolation by setting "
-            "prior_interpolation_probability=0. It is ignored in this mode; "
-            "training starts from fresh exact priors.", UserWarning, stacklevel=2)
-    if cfg.historical_output_prior_probability:
-        warnings.warn(
-            f"{cfg.training_mode} mode disables posterior-cloud replay/storage; "
-            "the simulation dataset is still retained for replay_epochs.", UserWarning, stacklevel=2)
-    return replace(cfg, prior_interpolation_probability=0.0,
-                   historical_output_prior_probability=0.0)
-
-
 def training_particle_count_choices(max_particles: int) -> tuple[int, ...]:
     """Automatically derive a small geometric ladder of JAX-friendly training set sizes.
 
@@ -290,7 +227,7 @@ def training_particle_count_choices(max_particles: int) -> tuple[int, ...]:
     return tuple(sorted(choices))
 
 
-CFG = prepare_transport_config(Config())
+CFG = Config()
 OUT = Path(CFG.output_dir)
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -406,8 +343,7 @@ print(
     f"own-posterior={CFG.historical_output_prior_probability:.3f}, "
     f"fresh-uniform={1.0 - CFG.prior_interpolation_probability - CFG.historical_output_prior_probability:.3f}"
 )
-if CFG.training_mode == "one_step":
-    print("First visits replace unavailable posterior inputs with fresh priors; interpolation remains available.")
+print("First visits replace unavailable posterior inputs with fresh priors; interpolation remains available.")
 print("Proposal targeting:", CFG.categorical_proposal_enabled, "| Importance correction:", CFG.importance_weights_enabled)
 print("Variable training particle count:", CFG.variable_training_particles)
 print("Training particle-count choices:", TRAINING_PARTICLE_COUNTS)
@@ -601,8 +537,7 @@ class SimulationBuffer:
     and avoids dropping a requested replay or using a different observation's posterior.
     """
 
-    def __init__(self, capacity: int, max_particles: int, model_names: tuple[str, ...], *,
-                 store_posteriors: bool = True):
+    def __init__(self, capacity: int, max_particles: int, model_names: tuple[str, ...]):
         if capacity < 1 or max_particles < 2:
             raise ValueError("Buffer capacity must be positive and max_particles must be >=2.")
         if not model_names or len(set(model_names)) != len(model_names):
@@ -614,13 +549,11 @@ class SimulationBuffer:
         self.x = np.zeros((self.capacity, self.max_observations, 2), dtype=np.float32)
         self.observation_counts = np.zeros(self.capacity, dtype=np.int32)
         self.sample_weights = np.empty(self.capacity, dtype=np.float32)
-        # Dataset replay remains useful in every mode; cloud replay is only for one_step.
-        stored_names = model_names if store_posteriors else ()
         # Zero-filled unused tails make the saved arrays deterministic; counts defines valid data.
         self.posteriors = {name: np.zeros((self.capacity, self.max_observations, self.max_particles, 2), dtype=np.float32)
-                           for name in stored_names}
-        self.posterior_counts = {name: np.zeros(self.capacity, dtype=np.int32) for name in stored_names}
-        self.posterior_updates = {name: np.zeros(self.capacity, dtype=np.int32) for name in stored_names}
+                           for name in model_names}
+        self.posterior_counts = {name: np.zeros(self.capacity, dtype=np.int32) for name in model_names}
+        self.posterior_updates = {name: np.zeros(self.capacity, dtype=np.int32) for name in model_names}
         self.size = 0
 
     def __len__(self) -> int:
@@ -729,13 +662,6 @@ def make_training_prior_batch_np(
     indices = buffer._row_indices(indices)
     if not 2 <= n_particles <= cfg.max_training_particles:
         raise ValueError("Training particle count must lie in [2,max_training_particles].")
-    if cfg.training_mode != "one_step":
-        prior = sample_exact_prior_np(rng, len(indices) * n_particles).reshape(len(indices), n_particles, 2)
-        prior = np.repeat(prior[:, None, :, :], buffer.max_observations, axis=1)
-        zeros = np.zeros(len(indices), dtype=np.float32)
-        return prior, {"interpolation_used": zeros, "interpolation_tau": zeros,
-                       "buffer_used": zeros, "exact_prior_used": np.ones_like(zeros),
-                       "posterior_available": zeros, "posterior_bootstrapped": zeros}
     counts = buffer.posterior_counts[model_name][indices]
     available = counts > 0
     u = mode_rng.random(len(indices))
@@ -1029,35 +955,13 @@ class ConditionalParticleTransport(eqx.Module):
     blocks: tuple[Any, ...]
     final_norm: eqx.nn.LayerNorm
     displacement_head: eqx.nn.Linear
-    time_projection: eqx.nn.Linear | None
 
-    training_mode: str = eqx.field(static=True)
-    ode_solver: str = eqx.field(static=True)
-    ode_steps: int = eqx.field(static=True)
-    ode_adaptive: bool = eqx.field(static=True)
-    ode_rtol: float = eqx.field(static=True)
-    ode_atol: float = eqx.field(static=True)
-    ode_max_steps: int = eqx.field(static=True)
     conditioning_type: str = eqx.field(static=True)
     max_displacement: float = eqx.field(static=True)
     prior_center: float = eqx.field(static=True)
     prior_std: float = eqx.field(static=True)
 
     def __init__(self, cfg: Config, *, key: Array):
-        validate_transport_config(cfg)
-        if cfg.training_mode != "one_step":
-            # Keep Diffrax optional for the original one-step mode.
-            import diffrax  # noqa: F401
-        self.training_mode = cfg.training_mode
-        self.ode_solver = cfg.ode_solver
-        self.ode_steps = cfg.ode_steps
-        self.ode_adaptive = cfg.ode_adaptive
-        self.ode_rtol = cfg.ode_rtol
-        self.ode_atol = cfg.ode_atol
-        self.ode_max_steps = cfg.ode_max_steps
-        # fold_in preserves all original initialization keys and the one-step architecture.
-        self.time_projection = (None if cfg.training_mode == "one_step" else
-                                eqx.nn.Linear(1, cfg.hidden_dim, key=jax.random.fold_in(key, 9188)))
         keys = jax.random.split(key, cfg.posterior_depth + 4)
         self.observation_embedder = TwoMoonsObservationEmbedder(cfg, key=keys[0])
         self.observation_sequence_embedder = CausalObservationSequenceEmbedder(
@@ -1136,94 +1040,25 @@ class ConditionalParticleTransport(eqx.Module):
 
     def _transport(self, prior_theta: Array, conditioning: Array, *, key: Array | None = None,
                    inference: bool = False) -> Array:
-        """Return the terminal cloud; all acquisition/training/evaluation use this dispatch."""
-        if self.training_mode == "ode":
-            return self._integrate(prior_theta, conditioning, key=key, inference=inference)
-        if self.training_mode == "flow_map":
-            if inference:
-                return self._flow_map(prior_theta, conditioning, 1.0, key=key, inference=True)
-            return self._integrate(prior_theta, conditioning, key=key, inference=False)
-        delta = self._residual(prior_theta, conditioning, key=key, inference=inference)
-        return self._unstandardize(self._standardize(prior_theta) + delta)
-
-    def _residual(self, theta: Array, conditioning: Array, time: Array | float = 1.0, *,
-                  key: Array | None = None, inference: bool = False) -> Array:
-        """Normalized displacement (velocity in ODE mode), without the identity skip."""
+        # Both conditioning options consume the SAME single cumulative summary vector.
         memory = conditioning[None, :]
-        particles = _linear_tokens(self.particle_in, self._standardize(theta))
-        if self.time_projection is not None:
-            particles = particles + self.time_projection(jnp.asarray(time, dtype=theta.dtype).reshape(1))
-        block_keys = None if key is None else jax.random.split(key, len(self.blocks))
-        for i, block in enumerate(self.blocks):
-            block_key = None if block_keys is None else block_keys[i]
-            context = conditioning if self.conditioning_type == "adaln" else memory
-            particles = block(particles, context, key=block_key, inference=inference)
+        transport_key = key
+        z0 = self._standardize(prior_theta)
+        particles = _linear_tokens(self.particle_in, z0)
+        block_keys = None if transport_key is None else jax.random.split(transport_key, len(self.blocks))
+
+        if self.conditioning_type == "adaln":
+            for i, block in enumerate(self.blocks):
+                block_key = None if block_keys is None else block_keys[i]
+                particles = block(particles, conditioning, key=block_key, inference=inference)
+        else:
+            for i, block in enumerate(self.blocks):
+                block_key = None if block_keys is None else block_keys[i]
+                particles = block(particles, memory, key=block_key, inference=inference)
+
         particles = _layernorm_tokens(self.final_norm, particles)
-        return self.max_displacement * jnp.tanh(_linear_tokens(self.displacement_head, particles))
-
-    def _integrate(self, prior_theta: Array, conditioning: Array, *,
-                   key: Array | None = None, inference: bool = False) -> Array:
-        import diffrax
-
-        solvers = {"euler": diffrax.Euler, "heun": diffrax.Heun, "midpoint": diffrax.Midpoint,
-                   "tsit5": diffrax.Tsit5, "dopri5": diffrax.Dopri5}
-        controller = (diffrax.PIDController(rtol=self.ode_rtol, atol=self.ode_atol)
-                      if self.ode_adaptive else diffrax.ConstantStepSize())
-
-        def vector_field(time, theta, args):
-            model, context, dropout_key, initial_theta = args
-            if model.training_mode == "flow_map":
-                # Lagrangian velocity along Phi(t, initial_theta). Hold the INITIAL cloud fixed;
-                # substituting the evolving theta here would define a different vector field.
-                return jax.jvp(lambda t: model._flow_map(
-                    initial_theta, context, t, key=dropout_key, inference=inference),
-                    (time,), (jnp.ones_like(time),))[1]
-            # The same observation context and dropout realization are used for the whole solve.
-            # Convert normalized displacement to physical theta velocity; do NOT add theta.
-            return model.prior_std * model._residual(
-                theta, context, time, key=dropout_key, inference=inference)
-
-        solution = diffrax.diffeqsolve(
-            diffrax.ODETerm(vector_field), solvers[self.ode_solver](),
-            t0=0.0, t1=1.0, dt0=1.0 / self.ode_steps, y0=prior_theta,
-            args=(self, conditioning, key, prior_theta), stepsize_controller=controller,
-            saveat=diffrax.SaveAt(t1=True), adjoint=diffrax.RecursiveCheckpointAdjoint(),
-            max_steps=self.ode_max_steps)
-        return solution.ys[0]
-
-    def _flow_map(self, prior_theta: Array, conditioning: Array, time: Array | float, *,
-                  key: Array | None = None, inference: bool = False) -> Array:
-        # Exact identity at t=0. The input always remains the INITIAL cloud, not Phi(t, z0).
-        time = jnp.asarray(time, dtype=prior_theta.dtype)
-        return prior_theta + time * self.prior_std * self._residual(
-            prior_theta, conditioning, time, key=key, inference=inference)
-
-    def flow_at_time(self, prior_theta: Array, x: Array, time: Array | float, *,
-                     key: Array | None = None, inference: bool = False) -> Array:
-        """Direct Phi(time, prior) for time in [0,1]; terminal-only ES leaves the path nonunique.
-
-        This is a parameterized transport path, not a guarantee of invertibility or a semigroup.
-        Inference at time=1 is identical to __call__(inference=True). Training integrates
-        dPhi/dt on [0,1] with Diffrax. That terminal cloud equals Phi(1,z0) in the exact-integral
-        limit; finite solver steps introduce quadrature error relative to direct inference.
-        """
-        if self.training_mode != "flow_map":
-            raise ValueError("flow_at_time requires training_mode='flow_map'.")
-        observations = x[None, :] if x.ndim == 1 else x
-        obs_key, transport_key = (None, None) if key is None else jax.random.split(key)
-        context = self.observation_contexts(observations, key=obs_key, inference=inference)[-1]
-        return self._flow_map(prior_theta, context, time, key=transport_key, inference=inference)
-
-    def flow_velocity(self, prior_theta: Array, x: Array, time: Array | float, *,
-                      key: Array | None = None, inference: bool = False) -> Array:
-        """d Phi(t,z0)/dt at fixed z0, evaluated along the path through the initial cloud.
-
-        Includes both residual and t * d(residual)/dt. This is a Lagrangian velocity:
-        an Eulerian field at arbitrary current particles would require inverting Phi.
-        """
-        time = jnp.asarray(time, dtype=prior_theta.dtype)
-        return jax.jvp(lambda t: self.flow_at_time(
-            prior_theta, x, t, key=key, inference=inference), (time,), (jnp.ones_like(time),))[1]
+        delta = self.max_displacement * jnp.tanh(_linear_tokens(self.displacement_head, particles))
+        return self._unstandardize(z0 + delta)
 
 
 #%% 4) Proper scoring rule: stable multivariate energy score + JAX/Optax train step
@@ -1323,17 +1158,6 @@ def make_train_step(optimizer: optax.GradientTransformation):
 
 # Immutable Equinox initialization is shared; updates create separate model trees.
 initial_model = ConditionalParticleTransport(CFG, key=jax.random.key(CFG.seed))
-# Count learnable floating-point leaves only; static configuration and None are excluded.
-parameter_counts = {
-    name: sum(leaf.size for leaf in jax.tree_util.tree_leaves(getattr(initial_model, name))
-              if eqx.is_inexact_array(leaf))
-    for name in ("observation_embedder", "observation_sequence_embedder", "particle_in",
-                 "blocks", "final_norm", "displacement_head", "time_projection")
-}
-print("Learnable parameters per model:")
-for name, count in parameter_counts.items():
-    print(f"  {name}: {count:,}")
-print(f"  Total: {sum(parameter_counts.values()):,}")
 TRAIN_CONFIGS = {
     "single_observation": replace(CFG, prior_interpolation_probability=0.0,
                                   historical_output_prior_probability=0.0),
@@ -1349,11 +1173,7 @@ opt_states = {name: optimizer.init(eqx.filter(model, eqx.is_array))
               for name, model in models.items()}
 train_step = make_train_step(optimizer)
 print(f"Three matched transports initialized; training uses all prefixes 1..{CFG.max_training_observations}.")
-print(f"Transport mode: {CFG.training_mode}; energy score uses the terminal cloud.")
-print("Evaluation includes single-observation calls and a parallel repeated-x_T block control.")
-if CFG.training_mode != "one_step":
-    print("Fresh-prior training: posterior replay/storage and interpolation are disabled; "
-          "the three matched training variants coincide.")
+print("Evaluation still uses one observation per call; replay is paired by row AND prefix.")
 
 
 #%% 5) Diagnostic likelihood and reusable evaluation/checkpoint helpers
@@ -1786,9 +1606,7 @@ def run_history(model, observations: np.ndarray, priors: np.ndarray,
 # evaluation trajectories. Correction is separately optional; stored loss weights and rows are
 # shared by ALL models. After acquisition, all observations/targets come from these stored rows.
 
-simulation_buffer = SimulationBuffer(
-    TRAINING_ROWS, CFG.max_training_particles, tuple(models),
-    store_posteriors=CFG.training_mode == "one_step")
+simulation_buffer = SimulationBuffer(TRAINING_ROWS, CFG.max_training_particles, tuple(models))
 train_rng = np.random.default_rng(CFG.seed + 10_001)
 shuffle_rng = np.random.default_rng(CFG.seed + 15_013)
 particle_rng = np.random.default_rng(CFG.seed + 25_019)
@@ -1805,7 +1623,6 @@ training_rows = []
 print(f"Shared dataset: {CFG.simulation_budget:,} simulator calls in {TRAINING_ROWS:,} observation blocks; "
       f"{TOTAL_TRAINING_STEPS:,} optimizer updates PER model.")
 
-training_start_time = perf_counter()
 for step in range(1, TOTAL_TRAINING_STEPS + 1):
     training_particles = int(particle_rng.choice(TRAINING_PARTICLE_COUNTS))
     replay_epoch = 0
@@ -1855,11 +1672,10 @@ for step in range(1, TOTAL_TRAINING_STEPS + 1):
             jnp.asarray(theta_target), jnp.asarray(sample_weights), step_key, jnp.asarray(observation_counts))
         # Store the detached output of THIS call under the SAME row IDs, for the next visit.
         # Targets/observations/weights stay fixed; gradients never flow through earlier calls.
-        if cfg.training_mode == "one_step":
-            simulation_buffer.update_posteriors(name, batch_indices, np.asarray(jax.device_get(posterior)))
+        simulation_buffer.update_posteriors(name, batch_indices, np.asarray(jax.device_get(posterior)))
         host = jax.device_get(metrics)
         training_rows.append({
-            "model": name, "training_mode": cfg.training_mode, "step": step, "simulations_seen": simulations_seen,
+            "model": name, "step": step, "simulations_seen": simulations_seen,
             "replay_epoch": replay_epoch, "batch_examples": len(theta_target),
             "training_particles": training_particles, "energy_score": float(host["energy_score"]),
             **{f"energy_score_prefix_{o + 1}": float(value)
@@ -1882,12 +1698,6 @@ for step in range(1, TOTAL_TRAINING_STEPS + 1):
         print(f"step {step:6d}/{TOTAL_TRAINING_STEPS} | sims {simulations_seen:,} | "
               f"replay {replay_epoch} | M {training_particles} | " + " | ".join(
                   f"{r['model']} ES {r['energy_score']:.5f} (posterior inputs {r['buffer_fraction']:.2f})" for r in training_rows[-len(models):]))
-
-# Wait for asynchronous JAX updates before measuring wall-clock training time.
-jax.block_until_ready(eqx.filter(models, eqx.is_array))
-training_seconds = perf_counter() - training_start_time
-print(f"Total training time (all models): {training_seconds:,.2f} seconds "
-      f"({training_seconds / 60:.2f} minutes)")
 
 assert simulations_seen == CFG.simulation_budget
 
@@ -1915,7 +1725,7 @@ fig.savefig(OUT / "10_training_diagnostics.png", dpi=180, bbox_inches="tight")
 plt.show()
 
 
-#%% 8) Matched-endpoint sequences: particle history and parallel repeated-x control
+#%% 8) Matched-endpoint held-out sequences: one x per call, history only through particles
 # If loading checkpoints, run cells 0–6 and then:
 # models = {name: load_model(OUT / f"{name}.eqx", cfg) for name, cfg in TRAIN_CONFIGS.items()}
 
@@ -1925,20 +1735,13 @@ METHOD_LABELS = {
     "marginal_xT": "Buffer: predicted marginal + current x",
     "buffer_xT": "Paired buffer: current x",
     "proposal_xT": "Original proposal start",
-    "refine_xT": "Buffer: repeated current x (sequential)",
-    "parallel_xT": "Buffer: repeated current x (parallel)",
+    "refine_xT": "Buffer: repeated current x",
     "history_raw": "Buffer: raw history",
     "history_defensive": "Buffer: predicted + refreshed history",
     "no_replay_history": "No cloud replay: predicted + refreshed history",
     "reference_current": "Grid: current x only",
     "reference_history": "Grid: true temporal law",
 }
-if CFG.training_mode != "one_step":
-    # No posterior-cloud buffer exists in these modes; keep stable result keys, honest labels.
-    METHOD_LABELS = {name: label.replace("Paired buffer:", "Transport:").replace("Buffer:", "Transport:")
-                     for name, label in METHOD_LABELS.items()}
-    METHOD_LABELS["no_replay_xT"] = "Fresh prior: current x"
-# Counts transport invocations, not internal ODE vector-field evaluations.
 METHOD_CALLS = {name: (CFG.sequence_length if name in (
     "refine_xT", "history_raw", "history_defensive", "no_replay_history") else
     2 if name == "proposal_xT" else 0 if name.startswith("reference_") else 1)
@@ -1954,9 +1757,6 @@ def evaluate_sequence(observations: np.ndarray, scenario: Scenario, seed: int):
         "sbi_xT": evaluate_bt(models["single_observation"], priors[-1], x_final),
         "no_replay_xT": evaluate_bt(models["no_replay"], priors[-1], x_final),
         "buffer_xT": evaluate_bt(models["buffered"], priors[-1], x_final),
-        # One call from the same prior, with literal copies of x_T as an observation block.
-        "parallel_xT": evaluate_bt(models["buffered"], priors[-1],
-                                   np.repeat(x_final[None, :], len(observations), axis=0)),
     }
     # Dynamics-only control: propagate particles without assimilating any earlier observations.
     # This separates time-marginal prior information from information supplied by observed history.
@@ -2071,10 +1871,7 @@ with (OUT / "experiment_config.json").open("w") as f:
                "training_simulator_calls_shared": CFG.simulation_budget,
                "training_rows": TRAINING_ROWS,
                "training_prefixes": list(range(1, CFG.max_training_observations + 1)),
-               "prefix_replay": ("same row and same prefix; padded prefixes masked from loss"
-                                 if CFG.training_mode == "one_step" else "disabled; fresh prior inputs"),
-               "model_calls_notes": "Transport invocations; excludes internal ODE vector-field evaluations",
-               "flow_map_notes": "Training integrates dPhi/dt at fixed initial cloud; inference directly evaluates Phi(1). Finite-step quadrature can differ from the direct endpoint.",
+               "prefix_replay": "same row and same prefix; padded prefixes masked from loss",
                "optional_diagnostic_simulator_calls": (CFG.prior_predictive_plot_samples
                                                        if CFG.simulator_diagnostics_enabled else 0),
                "evaluation_simulator_calls": len(SCENARIOS) * CFG.evaluation_sequences * CFG.sequence_length,
@@ -2117,7 +1914,7 @@ for scenario in SCENARIOS:
     print(f"\n{scenario.name} — energy-score gain versus paired buffer/current-x:")
     for row in paired_rows:
         if (row["scenario"] == scenario.name and row["comparator"] == "buffer_xT"
-            and row["metric"] == "energy_score" and row["method"] in ("refine_xT", "parallel_xT", "history_raw", "history_defensive")):
+            and row["metric"] == "energy_score" and row["method"] in ("refine_xT", "history_raw", "history_defensive")):
             print(f"  {row['method']:22s}: {row['mean_gain']:+.5f} "
                   f"[95% interval {row['ci_low']:+.5f}, {row['ci_high']:+.5f}]")
 write_rows(OUT / "summary_metrics.csv", summary_rows)
@@ -2147,11 +1944,11 @@ plt.show()
 
 #%% 11) Final posterior panels: distinct current-only and temporal reference targets
 
-PANEL_METHODS = ("sbi_xT", "buffer_xT", "proposal_xT", "refine_xT", "parallel_xT", "history_raw", "history_defensive")
+PANEL_METHODS = ("sbi_xT", "buffer_xT", "proposal_xT", "refine_xT", "history_raw", "history_defensive")
 for scenario in SCENARIOS:
     example = example_sequences[scenario.name]
     axis = example["axis"]
-    fig, axes = plt.subplots(3, 3, figsize=(15, 13))
+    fig, axes = plt.subplots(2, 4, figsize=(17, 8))
     for ax, mass, title in zip(axes.ravel()[:2],
                               (example["single_mass"][-1], example["history_mass"][-1]),
                               (r"Grid $p(\theta_T|x_T)$", r"Grid $p(\theta_T|x_{1:T})$")):
@@ -2203,7 +2000,7 @@ plt.show()
 
 #%% 13) Paired history gains: current-only baseline and equal-call refinement control
 
-GAIN_METHODS = ("proposal_xT", "refine_xT", "parallel_xT", "history_raw", "history_defensive", "no_replay_history")
+GAIN_METHODS = ("proposal_xT", "refine_xT", "history_raw", "history_defensive", "no_replay_history")
 fig, axes = plt.subplots(1, 2, figsize=(16, 5))
 for ax, comparator in zip(axes, ("buffer_xT", "refine_xT")):
     for j, name in enumerate(GAIN_METHODS):
@@ -2227,7 +2024,7 @@ plt.show()
 
 #%% 14) Target fidelity and calibration — improvement must not mean overconfidence
 
-DISPLAY_METHODS = ("sbi_xT", "buffer_xT", "parallel_xT", "marginal_xT", "history_raw", "history_defensive", "no_replay_history",
+DISPLAY_METHODS = ("sbi_xT", "buffer_xT", "marginal_xT", "history_raw", "history_defensive", "no_replay_history",
                    "reference_current", "reference_history")
 fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 for ax, metric in zip(axes.ravel(), ("sw_current", "sw_history", "marginal_coverage", "marginal_interval_width")):
