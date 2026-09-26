@@ -4,12 +4,10 @@
 Standalone companion to bayes_transport_two_moons_proposal_buffer.py; that file is unchanged.
 Run #%% cells in order. There is deliberately no main() function.
 
-Every training row contains ONE theta and up to max_training_observations iid 2-D observations.
-A separate causal observation Transformer supplies one summary per prefix. The posterior
-Transformer is vmapped over ALL valid prefixes, with equal per-row average prefix energy score.
-Replay clouds belong to the SAME row AND prefix, so suffix observations cannot leak into shorter
-prefixes. Evaluation still supplies one new observation per call and carries history in particles;
-there are no test-time gradients or extra inference simulations.
+Every training row contains ONE theta and ONE simulated 2-D observation. Every network call at
+training and testing takes ONE 2-D observation and a particle cloud. A configurable sequence of
+observations is processed one at a time, carrying information only through the cloud. No sequence
+encoder, concatenated observations, test-time gradients, or extra inference simulations are used. 
 
 Three identically initialized transports share exactly the same simulator pairs, stored loss
 weights, minibatch order, particle counts, and number of updates:
@@ -19,17 +17,16 @@ weights, minibatch order, particle counts, and number of updates:
 Input sources are mutually exclusive: default probabilities are 0.25 interpolation, 0.50 stored
 posterior, and 0.25 fresh exact prior. On first visits, a requested but unavailable posterior falls
 back to a fresh prior. Interpolation retains its own probability and original anchor controls.
-The finite simulation buffer stores (observation block, theta*, loss weight) and per-prefix posterior clouds
+The finite simulation buffer stores (x, theta*, loss weight) and separate detached posterior clouds
 for each model. Each training call replaces that model's cloud for the selected row. Reusing it
 keeps the SAME x, theta*, and weight together, instead of looking up a nearby observation.
 After the simulation budget is exhausted, ONLY stored x/theta* pairs are used, still choosing the
 input-cloud source on each visit. The target remains theta*, scored with the energy score.
-Proposal-targeted acquisition and importance correction retain the configured settings below.
-One proposal weight applies to the average prefix score for that sampled theta and its iid block.
+Proposal-targeted simulation acquisition and importance correction are independent opt-ins, both
+disabled by default: default simulations come from the uniform prior and all loss weights are one.
 If targeting is enabled without correction, the loss follows the acquisition distribution.
 No training transitions are introduced. Neither held-out theta nor diagnostic likelihoods enter
-learned inference. All three transports learn cumulative prefixes; the baseline is evaluated on
-one observation. It is not an external NPE/SNPE implementation.
+learned inference. The matched baseline is a single-observation transport, not external NPE/SNPE.
 
 The original single-datum and categorical-proposal-start evaluations are compared with raw
 posterior carry-over and a transition/defensive-refresh version. A same-call-budget x_T-only
@@ -45,13 +42,9 @@ neural history propagation is an empirical transfer experiment, not a guaranteed
 
 Evaluation transitions are configurable: identity, brownian, driftBrownian, constantVelocity,
 rotation, ou, custom, and relocation, plus optional identity/independent controls. Boundaries reflect into
-the original square. Evaluation samples grid Markov bridges with paired theta_T AND x_T across
-scenarios. Endpoints follow a common distribution over the overlap of all terminal marginals;
-the numerical references include this selection law, never the sampled truth. Grid interpolation
-also approximates deterministic transitions. The learned evaluation paths retain their original
-uniform starts and dynamics, so this remains a transfer test under a changed evaluation prior.
-We retain the dynamics-only particle control and distance to the original uniform-prior posterior.
-Numerical filtering uses only the toy diagnostic likelihood, never for fitting a neural method.
+the original square. These dynamics can change the time-marginal prior, so we also evaluate a
+dynamics-only particle control and distance to the original uniform-prior posterior. Numerical filtering
+uses only the toy diagnostic likelihood, never for fitting or choosing a neural method.
 """
 from __future__ import annotations
 
@@ -90,7 +83,7 @@ Array = jax.Array
 @dataclass
 class Config:
     # Reproducibility / outputs
-    seed: int = 2032
+    seed: int = 2028
     output_dir: str = "plots/bayes_transport_two_moons_history_buffer"
 
     # Exact two-moons benchmark from Greenberg et al. (2019), Appendix A.5.1
@@ -103,7 +96,7 @@ class Config:
     observed_x2: float = 0.0
 
     # Maximum examples per optimizer update; acquisition/replay keep the final partial batch.
-    batch_size: int = 64
+    batch_size: int = 128
 
     # Particle transport -- intentionally kept very close to the previous script.
     # Only the MAXIMUM training particle count is configured.  When variable_training_particles=True,
@@ -112,42 +105,38 @@ class Config:
     # fixed-particle-count training path.  Evaluation remains independently controlled by eval_particles.
     max_training_particles: int = 16 * 2*1
     variable_training_particles: bool = False
-    eval_particles: int = 64  # Repeated sequence evaluation; attention costs O(M^2).
+    eval_particles: int = 256  # Repeated sequence evaluation; attention costs O(M^2).
     hidden_dim: int = 64 * 2
     heads: int = 4
     mlp_ratio: int = 4
     posterior_depth: int = 4
-    posterior_conditioning: str = "cross_attention"  # {"cross_attention", "adaln"}
+    posterior_conditioning: str = "adaln"  # {"cross_attention", "adaln"}
     max_normalized_displacement: float = 6.0
     attention_dropout_rate: float = 0.0
 
-    # Train on every iid observation prefix 1..M; independent of the particle count and test T.
-    max_training_observations: int = 8
-    observation_sequence_depth: int = 4
-
-    # Per-observation encoder. x=(x1,x2) is represented as two labelled tokens.
-    likelihood_hidden_dim: int = 32
-    likelihood_heads: int = 2
-    likelihood_mlp_ratio: int = 2
-    likelihood_depth: int = 1
+    # Observation encoder. x=(x1,x2) is represented as two labelled tokens.
+    likelihood_hidden_dim: int = 64
+    likelihood_heads: int = 4
+    likelihood_mlp_ratio: int = 4
+    likelihood_depth: int = 3
     normalize_observations: bool = True
     observation_scale: float = 1.0
 
     # Bayes Transport optimisation -- preserved from the supplied/latest setup.
     simulation_budget: int = 10_000  # Exact number of fresh training simulator calls.
-    replay_epochs: int = 300  # Full shuffled passes AFTER the acquisition stage; may be zero.
+    replay_epochs: int = 100  # Full shuffled passes AFTER the acquisition stage; may be zero.
     learning_rate: float = 1e-5
     weight_decay: float = 1e-6
     grad_clip_norm: float = 5000.0
     log_every: int = 1250
- 
+
     # Particle-native categorical proposal for simulator acquisition.  After a short warm-up,
     # a one-step posterior cloud at x_o is used only to bias WHICH fresh prior candidates receive
     # expensive simulator calls.  The scientific prior supplied to the transport is unchanged.
     # A defensive uniform mixture keeps every candidate selectable and bounds the exact discrete
     # importance weight (1/K)/alpha_k by 1/proposal_defensive_epsilon.
-    categorical_proposal_enabled: bool = True  # Preserve proposal targeting from the current setup.
-    importance_weights_enabled: bool = True  # Preserve the proposal's discrete risk correction.
+    categorical_proposal_enabled: bool = True  # Broad prior training; no region targeting by default.
+    importance_weights_enabled: bool = True  # Opt in to the proposal's discrete risk correction.
     # If proposal targeting is enabled with weights disabled, stored loss weights stay one.
     # Replaying a row always reuses the weight selected at acquisition.
     categorical_proposal_warmup_steps: int = 8
@@ -158,29 +147,26 @@ class Config:
     categorical_proposal_knn: int = 16
     categorical_proposal_bandwidth_scale: float = 1.0
     categorical_proposal_min_bandwidth: float = 0.03
-
+   
     # Three mutually-exclusive input sources. The residual probability gives fresh uniform.
     # A requested same-row posterior falls back to fresh uniform on its first visit only.
-    prior_interpolation_probability: float = 0.05
-    historical_output_prior_probability: float = 0.85
+    prior_interpolation_probability: float = 0.25
+    historical_output_prior_probability: float = 0.5
     interpolation_base_cloud: str = "uniform"  # {"uniform", "gaussian"}
-    prior_interpolation_tau_min: float = 0.05
+    prior_interpolation_tau_min: float = 0.95
     prior_interpolation_tau_max: float = 1.05
-    truth_anchor_probability: float = 1.00
+    truth_anchor_probability: float = 1.0
 
     # Exact posterior / diagnostic grids
     posterior_grid_size: int = 420
     exact_reference_samples: int = 10_000
     sliced_wasserstein_projections: int = 128
- 
+
     # Temporal experiment. T is configurable; no function below assumes T=4.
-    sequence_length: int = 2
+    sequence_length: int = 8
     evaluation_sequences: int = 24  # Independent held-out trajectories per scenario.
-    # evaluation_transitions: tuple[str, ...] = (
-    #     "identity", "brownian", "driftBrownian", "constantVelocity", "rotation", "ou", "custom", "relocation",
-    # )
     evaluation_transitions: tuple[str, ...] = (
-        "identity",
+        "identity", "brownian", "driftBrownian", "constantVelocity", "rotation", "ou", "custom", "relocation",
     )
     evaluation_controls: bool = True  # Ensure identity and independent-parameter controls are included.
     transition_dt: float = 1.0
@@ -203,7 +189,7 @@ class Config:
 
     # Opt-in diagnostics make EXTRA simulator calls outside simulation_budget.
     # Leave disabled for a run with a strict total simulator-call budget.
-    simulator_diagnostics_enabled: bool = False
+    simulator_diagnostics_enabled: bool = True
     # Prior-predictive plot at the very start. Diagnostic only; not used for training.
     prior_predictive_plot_samples: int = 30_000
 
@@ -231,7 +217,7 @@ CFG = Config()
 OUT = Path(CFG.output_dir)
 OUT.mkdir(parents=True, exist_ok=True)
 
-for _name in ("simulation_budget", "batch_size", "log_every", "max_training_observations", "observation_sequence_depth"):
+for _name in ("simulation_budget", "batch_size", "log_every"):
     _value = getattr(CFG, _name)
     if isinstance(_value, bool) or not isinstance(_value, int) or _value < 1:
         raise ValueError(f"{_name} must be a positive integer.")
@@ -317,9 +303,6 @@ TRAINING_PARTICLE_COUNTS = (
     else (int(CFG.max_training_particles),)
 )
 
-
-TRAINING_ROWS = math.ceil(CFG.simulation_budget / CFG.max_training_observations)
-TRAINING_ACQUISITION_STEPS = math.ceil(TRAINING_ROWS / CFG.batch_size)
 
 PRIOR_CENTER = 0.5 * (CFG.prior_low + CFG.prior_high)
 PRIOR_STD = (CFG.prior_high - CFG.prior_low) / math.sqrt(12.0)
@@ -525,7 +508,7 @@ def sample_interpolated_training_prior_np(
 
 
 class SimulationBuffer:
-    """Fixed observation blocks with a model-specific posterior for every row AND prefix.
+    """Fixed simulator pairs with a mutable, model-specific posterior for every row.
 
     x, theta*, and the acquisition importance weight never change after insertion. Detached
     posterior clouds are replaced with the actual output of each training call (before the
@@ -545,12 +528,10 @@ class SimulationBuffer:
         self.capacity = int(capacity)
         self.max_particles = int(max_particles)
         self.theta = np.empty((self.capacity, 2), dtype=np.float32)
-        self.max_observations = CFG.max_training_observations
-        self.x = np.zeros((self.capacity, self.max_observations, 2), dtype=np.float32)
-        self.observation_counts = np.zeros(self.capacity, dtype=np.int32)
+        self.x = np.empty((self.capacity, 2), dtype=np.float32)
         self.sample_weights = np.empty(self.capacity, dtype=np.float32)
         # Zero-filled unused tails make the saved arrays deterministic; counts defines valid data.
-        self.posteriors = {name: np.zeros((self.capacity, self.max_observations, self.max_particles, 2), dtype=np.float32)
+        self.posteriors = {name: np.zeros((self.capacity, self.max_particles, 2), dtype=np.float32)
                            for name in model_names}
         self.posterior_counts = {name: np.zeros(self.capacity, dtype=np.int32) for name in model_names}
         self.posterior_updates = {name: np.zeros(self.capacity, dtype=np.int32) for name in model_names}
@@ -568,17 +549,12 @@ class SimulationBuffer:
         return indices
 
     def add_batch(self, theta: np.ndarray, x: np.ndarray,
-                  sample_weights: np.ndarray, observation_counts: np.ndarray) -> np.ndarray:
+                  sample_weights: np.ndarray) -> np.ndarray:
         theta = np.asarray(theta, dtype=np.float32)
         x = np.asarray(x, dtype=np.float32)
         sample_weights = np.asarray(sample_weights, dtype=np.float32)
-        if theta.ndim != 2 or theta.shape[1] != 2 or x.shape != (len(theta), self.max_observations, 2):
-            raise ValueError("Expected theta [B,2] and padded observations [B,O,2].")
-        observation_counts = np.asarray(observation_counts)
-        if (observation_counts.shape != (len(theta),)
-                or not np.issubdtype(observation_counts.dtype, np.integer)
-                or np.any(observation_counts < 1) or np.any(observation_counts > self.max_observations)):
-            raise ValueError("Each row needs 1..max_training_observations valid observations.")
+        if theta.ndim != 2 or theta.shape[1] != 2 or x.shape != theta.shape:
+            raise ValueError("theta and x must both have shape [B,2].")
         if sample_weights.shape != (len(theta),):
             raise ValueError("sample_weights must have shape [B].")
         if not (np.all(np.isfinite(theta)) and np.all(np.isfinite(x))
@@ -590,28 +566,25 @@ class SimulationBuffer:
         indices = np.arange(self.size, end)
         self.theta[indices], self.x[indices] = theta, x
         self.sample_weights[indices] = sample_weights
-        self.observation_counts[indices] = observation_counts
         self.size = end
         return indices
 
-    def get_batch(self, indices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def get_batch(self, indices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         indices = self._row_indices(indices)
-        return self.theta[indices], self.x[indices], self.sample_weights[indices], self.observation_counts[indices]
+        return self.theta[indices], self.x[indices], self.sample_weights[indices]
 
     def update_posteriors(self, model_name: str, indices: np.ndarray, clouds: np.ndarray) -> None:
         indices = self._row_indices(indices)
         if len(np.unique(indices)) != len(indices):
             raise ValueError("Update each buffer row at most once per minibatch.")
         clouds = np.asarray(clouds, dtype=np.float32)
-        if (clouds.ndim != 4 or clouds.shape[:2] != (len(indices), self.max_observations)
-                or clouds.shape[-1] != 2):
-            raise ValueError("Posterior clouds must have shape [B,O,N,2].")
-        count = clouds.shape[2]
+        if clouds.ndim != 3 or clouds.shape[0] != len(indices) or clouds.shape[2] != 2:
+            raise ValueError("Posterior clouds must have shape [B,M,2].")
+        count = clouds.shape[1]
         if not 2 <= count <= self.max_particles or not np.all(np.isfinite(clouds)):
             raise ValueError("Posterior clouds must be finite with 2 <= M <= max_particles.")
         self.posteriors[model_name][indices] = 0.0
-        valid = np.arange(self.max_observations)[None, :] < self.observation_counts[indices, None]
-        self.posteriors[model_name][indices, :, :count] = np.where(valid[:, :, None, None], clouds, 0.0)
+        self.posteriors[model_name][indices, :count] = clouds
         self.posterior_counts[model_name][indices] = count
         self.posterior_updates[model_name][indices] += 1
 
@@ -620,23 +593,22 @@ class SimulationBuffer:
         indices = self._row_indices(indices)
         if not 2 <= n_particles <= self.max_particles:
             raise ValueError("Requested cloud size must lie in [2,max_particles].")
-        result = np.empty((len(indices), self.max_observations, n_particles, 2), dtype=np.float32)
+        result = np.empty((len(indices), n_particles, 2), dtype=np.float32)
         for row, index in enumerate(indices):
             count = int(self.posterior_counts[model_name][index])
             if count == 0:
                 raise ValueError("This row has no posterior for the requested model yet.")
-            cloud = self.posteriors[model_name][index, :, :count]
+            cloud = self.posteriors[model_name][index, :count]
             if count == n_particles:
                 result[row] = cloud
             else:
                 ids = rng.choice(count, n_particles, replace=n_particles > count)
-                result[row] = cloud[:, ids]
+                result[row] = cloud[ids]
         return result
 
     def save(self, path: Path) -> None:
         payload = dict(theta=self.theta[:self.size], x=self.x[:self.size],
-                       sample_weights=self.sample_weights[:self.size],
-                       observation_counts=self.observation_counts[:self.size])
+                       sample_weights=self.sample_weights[:self.size])
         for name in self.posteriors:
             payload[f"posterior_{name}"] = self.posteriors[name][:self.size]
             payload[f"posterior_counts_{name}"] = self.posterior_counts[name][:self.size]
@@ -675,8 +647,6 @@ def make_training_prior_batch_np(
     for row in np.flatnonzero(use_interpolation):
         prior[row], tau[row] = sample_interpolated_training_prior_np(
             rng, buffer.theta[indices[row]], n_particles, cfg)
-    # Fresh/interpolated inputs are identical across prefixes. Replayed inputs are prefix-specific.
-    prior = np.repeat(prior[:, None, :, :], buffer.max_observations, axis=1)
     selected = np.flatnonzero(use_buffer)
     if len(selected):
         prior[selected] = buffer.posterior_batch(model_name, indices[selected], n_particles, rng)
@@ -690,7 +660,7 @@ def make_training_prior_batch_np(
     }
 
 
-#%% 3) JAX + Equinox: coordinate encoder, causal observation encoder, posterior Transformer
+#%% 3) JAX + Equinox model: 2-D observation encoder + posterior particle Transformer
 
 def _linear_tokens(layer: eqx.nn.Linear, x: Array) -> Array:
     return jax.vmap(layer)(x)
@@ -729,10 +699,9 @@ class ObservationBlock(eqx.Module):
         self.ff_in = eqx.nn.Linear(dim, mlp_dim, key=k_ff1)
         self.ff_out = eqx.nn.Linear(mlp_dim, dim, key=k_ff2)
 
-    def __call__(self, tokens: Array, *, key: Array | None = None, inference: bool = False,
-                 mask: Array | None = None) -> Array:
+    def __call__(self, tokens: Array, *, key: Array | None = None, inference: bool = False) -> Array:
         h = _layernorm_tokens(self.norm1, tokens)
-        tokens = tokens + self.attention(h, h, h, mask=mask, key=key, inference=inference)
+        tokens = tokens + self.attention(h, h, h, key=key, inference=inference)
         h = _layernorm_tokens(self.norm2, tokens)
         h = jax.nn.gelu(_linear_tokens(self.ff_in, h))
         return tokens + _linear_tokens(self.ff_out, h)
@@ -913,44 +882,10 @@ class CrossAttentionParticleBlock(eqx.Module):
         return particles + _linear_tokens(self.ff_out, h)
 
 
-class CausalObservationSequenceEmbedder(eqx.Module):
-    """One causal pass yields a fixed-width summary of every iid observation prefix.
-
-    No positional embedding is needed for iid data; the explicit prefix count distinguishes
-    repeated identical measurements. Causality does not guarantee exact set permutation invariance.
-    """
-
-    count_projection: eqx.nn.Linear
-    blocks: tuple[ObservationBlock, ...]
-    final_norm: eqx.nn.LayerNorm
-
-    def __init__(self, cfg: Config, *, key: Array):
-        keys = jax.random.split(key, cfg.observation_sequence_depth + 1)
-        self.count_projection = eqx.nn.Linear(1, cfg.likelihood_hidden_dim, key=keys[0])
-        self.blocks = tuple(ObservationBlock(
-            cfg.likelihood_hidden_dim, cfg.likelihood_heads,
-            cfg.likelihood_mlp_ratio * cfg.likelihood_hidden_dim,
-            cfg.attention_dropout_rate, key=keys[i + 1])
-            for i in range(cfg.observation_sequence_depth))
-        self.final_norm = eqx.nn.LayerNorm(cfg.likelihood_hidden_dim)
-
-    def __call__(self, tokens: Array, *, key: Array | None = None,
-                 inference: bool = False) -> Array:
-        counts = jnp.arange(1, len(tokens) + 1, dtype=tokens.dtype)
-        tokens = tokens + _linear_tokens(self.count_projection, jnp.log(counts)[:, None])
-        causal_mask = jnp.arange(len(tokens))[:, None] >= jnp.arange(len(tokens))[None, :]
-        keys = None if key is None else jax.random.split(key, len(self.blocks))
-        for i, block in enumerate(self.blocks):
-            tokens = block(tokens, mask=causal_mask, key=None if keys is None else keys[i],
-                           inference=inference)
-        return _layernorm_tokens(self.final_norm, tokens)
-
-
 class ConditionalParticleTransport(eqx.Module):
-    """Identity-initialized particle transport conditioned on a cumulative observation summary."""
+    """Identity-initialized 2-D prior -> posterior particle transport conditioned on x in R^2."""
 
     observation_embedder: TwoMoonsObservationEmbedder
-    observation_sequence_embedder: CausalObservationSequenceEmbedder
     particle_in: eqx.nn.Linear
     blocks: tuple[Any, ...]
     final_norm: eqx.nn.LayerNorm
@@ -964,8 +899,6 @@ class ConditionalParticleTransport(eqx.Module):
     def __init__(self, cfg: Config, *, key: Array):
         keys = jax.random.split(key, cfg.posterior_depth + 4)
         self.observation_embedder = TwoMoonsObservationEmbedder(cfg, key=keys[0])
-        self.observation_sequence_embedder = CausalObservationSequenceEmbedder(
-            cfg, key=jax.random.fold_in(key, 9187))
         self.particle_in = eqx.nn.Linear(2, cfg.hidden_dim, key=keys[1])
 
         block_cls = AdaLNParticleBlock if cfg.posterior_conditioning == "adaln" else CrossAttentionParticleBlock
@@ -999,55 +932,28 @@ class ConditionalParticleTransport(eqx.Module):
     def _unstandardize(self, z: Array) -> Array:
         return self.prior_center + self.prior_std * z
 
-    def observation_contexts(self, observations: Array, *, key: Array | None = None,
-                             inference: bool = False) -> Array:
-        if observations.ndim != 2 or observations.shape[-1] != 2 or len(observations) < 1:
-            raise ValueError("Expected one or more observations with shape [O,2].")
-        keys = None if key is None else jax.random.split(key, len(observations) + 1)
-        if keys is None:
-            encoded = jax.vmap(lambda x: self.observation_embedder(x, inference=inference))(observations)
+    def __call__(
+        self,
+        prior_theta: Array,
+        x: Array,
+        *,
+        key: Array | None = None,
+        inference: bool = False,
+    ) -> Array:
+        if key is None:
+            obs_key = None
+            transport_key = None
         else:
-            encoded = jax.vmap(lambda x, k: self.observation_embedder(
-                x, key=k, inference=inference))(observations, keys[:-1])
-        return self.observation_sequence_embedder(
-            jnp.mean(encoded, axis=1), key=None if keys is None else keys[-1], inference=inference)
+            obs_key, transport_key = jax.random.split(key)
 
-    def predict_prefixes(self, prior_theta: Array, observations: Array, *,
-                         key: Array | None = None, inference: bool = False) -> Array:
-        """Direct transports for all prefixes [O,N,2]; no output feeds the next prefix.
-
-        A common [N,2] cloud is broadcast, or [O,N,2] supplies each prefix's own replay cloud.
-        """
-        obs_key, transport_key = (None, None) if key is None else jax.random.split(key)
-        contexts = self.observation_contexts(observations, key=obs_key, inference=inference)
-        if prior_theta.ndim == 2:
-            prior_theta = jnp.broadcast_to(prior_theta, (len(contexts),) + prior_theta.shape)
-        if prior_theta.ndim != 3 or prior_theta.shape[0] != len(contexts):
-            raise ValueError("Expected a shared [N,2] cloud or one [O,N,2] cloud per prefix.")
-        if transport_key is None:
-            return jax.vmap(lambda p, c: self._transport(p, c, inference=inference))(prior_theta, contexts)
-        keys = jax.random.split(transport_key, len(contexts))
-        return jax.vmap(lambda p, c, k: self._transport(
-            p, c, key=k, inference=inference))(prior_theta, contexts, keys)
-
-    def __call__(self, prior_theta: Array, x: Array, *, key: Array | None = None,
-                 inference: bool = False) -> Array:
-        # Existing evaluation calls stay single-observation; blocks are also accepted explicitly.
-        observations = x[None, :] if x.ndim == 1 else x
-        obs_key, transport_key = (None, None) if key is None else jax.random.split(key)
-        context = self.observation_contexts(observations, key=obs_key, inference=inference)[-1]
-        return self._transport(prior_theta, context, key=transport_key, inference=inference)
-
-    def _transport(self, prior_theta: Array, conditioning: Array, *, key: Array | None = None,
-                   inference: bool = False) -> Array:
-        # Both conditioning options consume the SAME single cumulative summary vector.
-        memory = conditioning[None, :]
-        transport_key = key
+        memory = self.observation_embedder(x, key=obs_key, inference=inference)  # [2,C]
         z0 = self._standardize(prior_theta)
         particles = _linear_tokens(self.particle_in, z0)
         block_keys = None if transport_key is None else jax.random.split(transport_key, len(self.blocks))
 
         if self.conditioning_type == "adaln":
+            # Symmetric summary of both observation-coordinate tokens.
+            conditioning = jnp.mean(memory, axis=0)
             for i, block in enumerate(self.blocks):
                 block_key = None if block_keys is None else block_keys[i]
                 particles = block(particles, conditioning, key=block_key, inference=inference)
@@ -1086,32 +992,27 @@ def batch_metrics(
     posterior: Array,
     target_theta: Array,
     sample_weights: Array,
-    observation_counts: Array,
 ) -> dict[str, Array]:
-    """posterior [B,O,N,2]; average valid prefixes within each importance-weighted row."""
-    score, attraction, repulsion = jax.vmap(jax.vmap(energy_score_terms, in_axes=(0, None)))(
-        posterior, target_theta)
-    valid = jnp.arange(posterior.shape[1])[None, :] < observation_counts[:, None]
-    def row_average(values):
-        return jnp.sum(jnp.where(valid, values, 0.0), axis=1) / observation_counts
-    weighted_score = sample_weights * row_average(score)
-    means = jnp.mean(posterior, axis=2)
-    mean_error = _stable_l2_norm(means - target_theta[:, None, :], axis=-1)
-    centered = posterior - means[:, :, None, :]
-    covariance_trace = jnp.mean(jnp.sum(centered**2, axis=-1), axis=2)
-    outside = jnp.mean(jnp.any(
-        (posterior < CFG.prior_low) | (posterior > CFG.prior_high), axis=-1).astype(jnp.float32), axis=2)
+    """posterior [B,M,2], target_theta [B,2], sample_weights [B]."""
+    score, attraction, repulsion = jax.vmap(energy_score_terms)(posterior, target_theta)
+    sample_weights = jnp.asarray(sample_weights, dtype=score.dtype)
+    weighted_score = sample_weights * score
+    means = jnp.mean(posterior, axis=1)
+    mean_error = _stable_l2_norm(means - target_theta, axis=-1)
+    centered = posterior - means[:, None, :]
+    covariance_trace = jnp.mean(jnp.sum(centered**2, axis=-1), axis=1)
+    outside = jnp.any(
+        (posterior < CFG.prior_low) | (posterior > CFG.prior_high),
+        axis=-1,
+    )
     return {
         "loss": jnp.mean(weighted_score),
         "energy_score": jnp.mean(weighted_score),
-        "energy_score_by_prefix": jnp.sum(jnp.where(valid, score * sample_weights[:, None], 0.0), axis=0)
-                                  / jnp.maximum(jnp.sum(valid, axis=0), 1),
-        "valid_rows_by_prefix": jnp.sum(valid, axis=0),
-        "attraction": jnp.mean(row_average(attraction)),
-        "repulsion": jnp.mean(row_average(repulsion)),
-        "mean_error": jnp.mean(row_average(mean_error)),
-        "covariance_trace": jnp.mean(row_average(covariance_trace)),
-        "outside_prior_fraction": jnp.mean(row_average(outside)),
+        "attraction": jnp.mean(attraction),
+        "repulsion": jnp.mean(repulsion),
+        "mean_error": jnp.mean(mean_error),
+        "covariance_trace": jnp.mean(covariance_trace),
+        "outside_prior_fraction": jnp.mean(outside.astype(jnp.float32)),
     }
 
 
@@ -1122,13 +1023,12 @@ def transport_objective(
     target_theta: Array,
     sample_weights: Array,
     dropout_key: Array,
-    observation_counts: Array,
 ):
     row_keys = jax.random.split(dropout_key, prior_theta.shape[0])
     posterior = jax.vmap(
-        lambda p, x, k: model.predict_prefixes(p, x, key=k, inference=False)
+        lambda p, x, k: model(p, x, key=k, inference=False)
     )(prior_theta, x_batch, row_keys)
-    metrics = batch_metrics(posterior, target_theta, sample_weights, observation_counts)
+    metrics = batch_metrics(posterior, target_theta, sample_weights)
     return metrics["loss"], (metrics, posterior)
 
 
@@ -1137,7 +1037,7 @@ _loss_and_grad = eqx.filter_value_and_grad(transport_objective, has_aux=True)
 
 def make_train_step(optimizer: optax.GradientTransformation):
     @eqx.filter_jit
-    def step(model, opt_state, prior_theta, x_batch, target_theta, sample_weights, dropout_key, observation_counts):
+    def step(model, opt_state, prior_theta, x_batch, target_theta, sample_weights, dropout_key):
         (loss, (metrics, posterior)), grads = _loss_and_grad(
             model,
             prior_theta,
@@ -1145,7 +1045,6 @@ def make_train_step(optimizer: optax.GradientTransformation):
             target_theta,
             sample_weights,
             dropout_key,
-            observation_counts,
         )
         params = eqx.filter(model, eqx.is_array)
         updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -1172,8 +1071,7 @@ optimizer = optax.chain(
 opt_states = {name: optimizer.init(eqx.filter(model, eqx.is_array))
               for name, model in models.items()}
 train_step = make_train_step(optimizer)
-print(f"Three matched transports initialized; training uses all prefixes 1..{CFG.max_training_observations}.")
-print("Evaluation still uses one observation per call; replay is paired by row AND prefix.")
+print("Three matched transports initialized; every network sees one x with shape (2,).")
 
 
 #%% 5) Diagnostic likelihood and reusable evaluation/checkpoint helpers
@@ -1377,110 +1275,15 @@ def predict_transition_np(rng: np.random.Generator, theta: np.ndarray,
     return reflect_to_prior(mean + rng.normal(0.0, transition_noise_std(scenario), mean.shape))
 
 
-def simulate_sequence_np(rng: np.random.Generator, scenario: Scenario, *,
-                         endpoint_index: int, axis: np.ndarray, marginals: np.ndarray,
-                         observation_seed: int):
-    """Backward-sample a grid Markov bridge to an exactly shared endpoint.
-
-    Uses the SAME reflected/advection/diffusion discretization as the numerical references.
-    Deterministic motion has grid interpolation error, unlike the old continuous simulator.
-    No terminal overwrite or shifted trajectory is used. Endpoint truth is only a simulator input.
-    """
-    indices = np.empty(CFG.sequence_length, dtype=np.int64)
-    indices[-1] = endpoint_index
-    for t in range(CFG.sequence_length - 1, 0, -1):
-        terminal = np.zeros_like(marginals[t])
-        terminal.flat[indices[t]] = 1.0
-        probabilities = normalize_grid_mass(
-            marginals[t - 1] * transition_grid_pullback(terminal, axis, t, scenario))
-        indices[t - 1] = rng.choice(probabilities.size, p=probabilities.ravel())
-    iy, ix = np.unravel_index(indices, marginals[0].shape)
-    theta = np.column_stack([axis[ix], axis[iy]]).astype(np.float32)
-    # Common random simulator noise gives identical x_T for paired scenarios, with T draws each.
-    observations = simulate_two_moons_batch_np(np.random.default_rng(observation_seed), theta)
-    return theta, observations
-
-
-def diagnostic_grid_axis() -> np.ndarray:
-    spacing = (CFG.prior_high - CFG.prior_low) / CFG.posterior_grid_size
-    return CFG.prior_low + (np.arange(CFG.posterior_grid_size) + 0.5) * spacing
-
-
-def transition_grid_locations(axis: np.ndarray, time_index: int, scenario: Scenario):
-    spacing = axis[1] - axis[0]
-    g1, g2 = np.meshgrid(axis, axis, indexing="xy")
-    mapped = transition_mean_np(np.stack([g1, g2], axis=-1), time_index, scenario)
-    location = np.clip((mapped.reshape(-1, 2) - axis[0]) / spacing, 0, len(axis) - 1)
-    lower = np.floor(location).astype(int)
-    upper = np.minimum(lower + 1, len(axis) - 1)
-    return lower, upper, location - lower
-
-
-def reset_probability_at(scenario: Scenario, time_index: int) -> float:
-    return 1.0 if time_index + 1 == scenario.forced_reset_time else scenario.reset_probability
-
-
-def transition_grid_pullback(values: np.ndarray, axis: np.ndarray, time_index: int,
-                             scenario: Scenario) -> np.ndarray:
-    """Adjoint of the grid Markov transition, including resets (no normalization).
-
-    Forward transition = bilinear pushforward then symmetric reflected Gaussian convolution.
-    Its adjoint convolves first, then evaluates the field at each mapped source grid point.
-    """
-    rho = reset_probability_at(scenario, time_index)
-    if rho == 1.0:
-        return np.full_like(values, np.mean(values))
-    std = transition_noise_std(scenario)
-    field = (gaussian_filter(values, std / (axis[1] - axis[0]), mode="reflect", truncate=6.0)
-             if std > 0.0 else values)
-    if scenario.name not in ("identity", "stable", "brownian", "relocation", "independent"):
-        lower, upper, fraction = transition_grid_locations(axis, time_index, scenario)
-        pulled = np.zeros(values.size, dtype=np.float64)
-        for x_high in (0, 1):
-            for y_high in (0, 1):
-                ix = upper[:, 0] if x_high else lower[:, 0]
-                iy = upper[:, 1] if y_high else lower[:, 1]
-                weight = ((fraction[:, 0] if x_high else 1 - fraction[:, 0]) *
-                          (fraction[:, 1] if y_high else 1 - fraction[:, 1]))
-                pulled += field[iy, ix] * weight
-        field = pulled.reshape(values.shape)
-    return (1.0 - rho) * field + rho * np.mean(values)
-
-
-def matched_endpoint_design(scenarios: tuple[Scenario, ...], rng: np.random.Generator):
-    """Pair endpoint samples over the common support of all forward terminal marginals.
-
-    Per scenario: sample theta_T from a COMMON mass h, then sample history given theta_T under
-    that scenario's original grid law. Selection changes the prior path law by h(theta_T)/p_T.
-    Backward selection messages let the diagnostic filter account for that change, without
-    revealing the sampled endpoint to inference. The minimum marginal avoids unsupported targets
-    and unbounded terminal selection weights when deterministic maps compress the support.
-    """
-    axis = diagnostic_grid_axis()
-    uniform = np.full((len(axis), len(axis)), 1.0 / len(axis)**2)
-    design = {}
-    for scenario in scenarios:
-        marginal = uniform.copy()
-        marginals = [marginal]
-        for t in range(1, CFG.sequence_length):
-            rho = reset_probability_at(scenario, t)
-            marginal = (uniform.copy() if rho == 1.0 else
-                        (1.0 - rho) * predict_grid_mass(marginal, axis, t, scenario) + rho * uniform)
-            marginals.append(marginal)
-        design[scenario.name] = {"marginals": np.asarray(marginals)}
-    common = np.minimum.reduce([entry["marginals"][-1] for entry in design.values()])
-    if not np.any(common > 0.0):
-        raise ValueError("Configured transitions have no common terminal grid support; cannot pair endpoints.")
-    common = normalize_grid_mass(common)
-    endpoints = rng.choice(common.size, CFG.evaluation_sequences, p=common.ravel())
-    for scenario in scenarios:
-        marginal = design[scenario.name]["marginals"][-1]
-        terminal_weight = np.divide(common, marginal, out=np.zeros_like(common), where=marginal > 0.0)
-        weights = [terminal_weight]
-        for t in range(CFG.sequence_length - 1, 0, -1):
-            weights.append(transition_grid_pullback(weights[-1], axis, t, scenario))
-        design[scenario.name]["selection_weights"] = np.asarray(weights[::-1])
-    return axis, endpoints, common, design
+def simulate_sequence_np(rng: np.random.Generator, scenario: Scenario):
+    theta = np.empty((CFG.sequence_length, 2), dtype=np.float32)
+    theta[0] = sample_exact_prior_np(rng, 1)[0]
+    for t in range(1, CFG.sequence_length):
+        reset = t + 1 == scenario.forced_reset_time or rng.random() < scenario.reset_probability
+        theta[t] = (sample_exact_prior_np(rng, 1)[0] if reset else
+                    predict_transition_np(rng, theta[t - 1], t, scenario))
+    # Exactly one independent simulator draw for each theta_t; no replicate observations.
+    return theta, simulate_two_moons_batch_np(rng, theta)
 
 
 def predict_grid_mass(mass: np.ndarray, axis: np.ndarray, time_index: int,
@@ -1496,7 +1299,12 @@ def predict_grid_mass(mass: np.ndarray, axis: np.ndarray, time_index: int,
         std = transition_noise_std(scenario)
         return (normalize_grid_mass(gaussian_filter(mass, std / spacing, mode="reflect", truncate=6.0))
                 if std > 0.0 else mass.copy())
-    lower, upper, fraction = transition_grid_locations(axis, time_index, scenario)
+    g1, g2 = np.meshgrid(axis, axis, indexing="xy")
+    mapped = transition_mean_np(np.stack([g1, g2], axis=-1), time_index, scenario)
+    location = np.clip((mapped.reshape(-1, 2) - axis[0]) / spacing, 0, len(axis) - 1)
+    lower = np.floor(location).astype(int)
+    upper = np.minimum(lower + 1, len(axis) - 1)
+    fraction = location - lower
     predicted = np.zeros(mass.size, dtype=np.float64)
     for x_high in (0, 1):
         for y_high in (0, 1):
@@ -1520,22 +1328,18 @@ def normalize_grid_mass(mass: np.ndarray) -> np.ndarray:
     return mass / total
 
 
-def filtering_grid_references(x_sequence: np.ndarray, scenario: Scenario, *,
-                              selection_weights: np.ndarray | None = None):
+def filtering_grid_references(x_sequence: np.ndarray, scenario: Scenario):
     """Numerical current-only and history posteriors under the true evaluation dynamics.
 
     Propagate an unconditioned marginal as well as the filter. OU, drift, reflected rotation, and
     custom maps can change the marginal prior: p(theta_t|x_t) must then use that time-t marginal.
     Also return the original uniform-prior posterior to expose this potential distribution shift.
-    Selection messages account for the matched endpoint distribution (not the sampled endpoint).
     Relocation's diagnostic oracle knows the reset schedule; learned methods do not.
     """
     if x_sequence.shape != (CFG.sequence_length, 2):
         raise ValueError("Expected sequence_length individual 2-D observations.")
-    axis = diagnostic_grid_axis()
-    if selection_weights is not None and selection_weights.shape != (
-            CFG.sequence_length, len(axis), len(axis)):
-        raise ValueError("Endpoint selection weights must have shape [T,G,G].")
+    spacing = (CFG.prior_high - CFG.prior_low) / CFG.posterior_grid_size
+    axis = CFG.prior_low + (np.arange(CFG.posterior_grid_size) + 0.5) * spacing
     g1, g2 = np.meshgrid(axis, axis, indexing="xy")
     theta_grid = np.stack([g1, g2], axis=-1)
     uniform = np.full(g1.shape, 1.0 / g1.size)
@@ -1554,12 +1358,10 @@ def filtering_grid_references(x_sequence: np.ndarray, scenario: Scenario, *,
         if peak <= 0.0 or not np.isfinite(peak):
             raise FloatingPointError("Observation unresolved on the diagnostic grid.")
         likelihood = likelihood / peak
-        # Selection messages describe the common endpoint distribution, NEVER the actual theta_T.
-        weight = 1.0 if selection_weights is None else selection_weights[t]
-        singles.append(normalize_grid_mass(marginal * likelihood * weight))
+        singles.append(normalize_grid_mass(marginal * likelihood))
         uniform_posteriors.append(normalize_grid_mass(likelihood))
         posterior = normalize_grid_mass(posterior * likelihood)
-        filtered.append(normalize_grid_mass(posterior * weight))
+        filtered.append(posterior.copy())
     return axis, np.asarray(singles), np.asarray(filtered), np.asarray(uniform_posteriors)
 
 
@@ -1602,11 +1404,12 @@ def run_history(model, observations: np.ndarray, priors: np.ndarray,
 
 
 #%% 7) TRAIN — matched simulator budget, fresh acquisition followed by paired dataset replay
-# Acquisition follows categorical_proposal_enabled; categorical acquisition targets X_OBS, never
+# Dataset acquisition is uniform by default because evaluation spans many held-out observations.
+# Optional original categorical acquisition focuses on the fixed design datum X_OBS, never on
 # evaluation trajectories. Correction is separately optional; stored loss weights and rows are
 # shared by ALL models. After acquisition, all observations/targets come from these stored rows.
 
-simulation_buffer = SimulationBuffer(TRAINING_ROWS, CFG.max_training_particles, tuple(models))
+simulation_buffer = SimulationBuffer(CFG.simulation_budget, CFG.max_training_particles, tuple(models))
 train_rng = np.random.default_rng(CFG.seed + 10_001)
 shuffle_rng = np.random.default_rng(CFG.seed + 15_013)
 particle_rng = np.random.default_rng(CFG.seed + 25_019)
@@ -1615,24 +1418,18 @@ proposal_rng = np.random.default_rng(CFG.seed + 27_011)
 cloud_rngs = {name: np.random.default_rng(CFG.seed + 31_001) for name in models}
 mode_rngs = {name: np.random.default_rng(CFG.seed + 32_001) for name in models}
 dropout_key = jax.random.key(CFG.seed + 30_007)
-acquisition_steps = TRAINING_ACQUISITION_STEPS
-simulations_seen = 0
+acquisition_steps = math.ceil(CFG.simulation_budget / CFG.batch_size)
 TOTAL_TRAINING_STEPS = acquisition_steps * (1 + CFG.replay_epochs)
 proposal_posterior_reference = None
 training_rows = []
-print(f"Shared dataset: {CFG.simulation_budget:,} simulator calls in {TRAINING_ROWS:,} observation blocks; "
+print(f"Shared dataset: {CFG.simulation_budget:,} simulator calls; "
       f"{TOTAL_TRAINING_STEPS:,} optimizer updates PER model.")
 
 for step in range(1, TOTAL_TRAINING_STEPS + 1):
     training_particles = int(particle_rng.choice(TRAINING_PARTICLE_COUNTS))
     replay_epoch = 0
-    if len(simulation_buffer) < TRAINING_ROWS:
-        batch_n = min(CFG.batch_size, TRAINING_ROWS - len(simulation_buffer))
-        remaining_calls = CFG.simulation_budget - simulations_seen
-        observation_counts = np.minimum(
-            CFG.max_training_observations,
-            remaining_calls - np.arange(batch_n) * CFG.max_training_observations,
-        ).astype(np.int32)
+    if len(simulation_buffer) < CFG.simulation_budget:
+        batch_n = min(CFG.batch_size, CFG.simulation_budget - len(simulation_buffer))
         if CFG.categorical_proposal_enabled and step > CFG.categorical_proposal_warmup_steps:
             if (proposal_posterior_reference is None or
                 (step - CFG.categorical_proposal_warmup_steps - 1) % CFG.categorical_proposal_refresh_every == 0):
@@ -1646,13 +1443,8 @@ for step in range(1, TOTAL_TRAINING_STEPS + 1):
             sample_weights = np.ones(batch_n, dtype=np.float32)
         if not CFG.importance_weights_enabled:
             sample_weights = np.ones(batch_n, dtype=np.float32)
-        # Each observation costs one call. Padding the final partial row costs no simulations.
-        valid = np.arange(CFG.max_training_observations)[None, :] < observation_counts[:, None]
-        repeated_theta = np.repeat(theta_target, observation_counts, axis=0)
-        x_batch = np.zeros((batch_n, CFG.max_training_observations, 2), dtype=np.float32)
-        x_batch[valid] = simulate_two_moons_batch_np(train_rng, repeated_theta)
-        simulations_seen += len(repeated_theta)
-        batch_indices = simulation_buffer.add_batch(theta_target, x_batch, sample_weights, observation_counts)
+        x_batch = simulate_two_moons_batch_np(train_rng, theta_target)
+        batch_indices = simulation_buffer.add_batch(theta_target, x_batch, sample_weights)
     else:
         replay_epoch, batch_in_epoch = divmod(step - acquisition_steps - 1, acquisition_steps)
         replay_epoch += 1
@@ -1660,7 +1452,7 @@ for step in range(1, TOTAL_TRAINING_STEPS + 1):
             epoch_indices = shuffle_rng.permutation(len(simulation_buffer))
         start = batch_in_epoch * CFG.batch_size
         batch_indices = epoch_indices[start:start + CFG.batch_size]
-        theta_target, x_batch, sample_weights, observation_counts = simulation_buffer.get_batch(batch_indices)
+        theta_target, x_batch, sample_weights = simulation_buffer.get_batch(batch_indices)
 
     dropout_key, step_key = jax.random.split(dropout_key)
     for name, cfg in TRAIN_CONFIGS.items():
@@ -1669,19 +1461,15 @@ for step in range(1, TOTAL_TRAINING_STEPS + 1):
             name, training_particles, cfg)
         models[name], opt_states[name], loss, metrics, posterior, grad_norm = train_step(
             models[name], opt_states[name], jnp.asarray(incoming), jnp.asarray(x_batch),
-            jnp.asarray(theta_target), jnp.asarray(sample_weights), step_key, jnp.asarray(observation_counts))
+            jnp.asarray(theta_target), jnp.asarray(sample_weights), step_key)
         # Store the detached output of THIS call under the SAME row IDs, for the next visit.
         # Targets/observations/weights stay fixed; gradients never flow through earlier calls.
         simulation_buffer.update_posteriors(name, batch_indices, np.asarray(jax.device_get(posterior)))
         host = jax.device_get(metrics)
         training_rows.append({
-            "model": name, "step": step, "simulations_seen": simulations_seen,
+            "model": name, "step": step, "simulations_seen": len(simulation_buffer),
             "replay_epoch": replay_epoch, "batch_examples": len(theta_target),
             "training_particles": training_particles, "energy_score": float(host["energy_score"]),
-            **{f"energy_score_prefix_{o + 1}": float(value)
-               for o, value in enumerate(host["energy_score_by_prefix"])},
-            **{f"valid_rows_prefix_{o + 1}": int(value)
-               for o, value in enumerate(host["valid_rows_by_prefix"])},
             "grad_norm": float(jax.device_get(grad_norm)),
             "outside_prior_fraction": float(host["outside_prior_fraction"]),
             "interpolation_fraction": float(np.mean(info["interpolation_used"])),
@@ -1695,11 +1483,9 @@ for step in range(1, TOTAL_TRAINING_STEPS + 1):
     if step == acquisition_steps or step == TOTAL_TRAINING_STEPS:
         simulation_buffer.save(OUT / "simulation_buffer.npz")
     if step == 1 or step % CFG.log_every == 0 or step in (acquisition_steps, TOTAL_TRAINING_STEPS):
-        print(f"step {step:6d}/{TOTAL_TRAINING_STEPS} | sims {simulations_seen:,} | "
+        print(f"step {step:6d}/{TOTAL_TRAINING_STEPS} | sims {len(simulation_buffer):,} | "
               f"replay {replay_epoch} | M {training_particles} | " + " | ".join(
                   f"{r['model']} ES {r['energy_score']:.5f} (posterior inputs {r['buffer_fraction']:.2f})" for r in training_rows[-len(models):]))
-
-assert simulations_seen == CFG.simulation_budget
 
 for name, model in models.items():
     save_model(OUT / f"{name}.eqx", model, TRAIN_CONFIGS[name])
@@ -1725,7 +1511,7 @@ fig.savefig(OUT / "10_training_diagnostics.png", dpi=180, bbox_inches="tight")
 plt.show()
 
 
-#%% 8) Matched-endpoint held-out sequences: one x per call, history only through particles
+#%% 8) Held-out sequences: one x per call, history only through the incoming particles
 # If loading checkpoints, run cells 0–6 and then:
 # models = {name: load_model(OUT / f"{name}.eqx", cfg) for name, cfg in TRAIN_CONFIGS.items()}
 
@@ -1821,21 +1607,12 @@ def write_rows(path: Path, rows: list[dict]) -> None:
 metric_rows, example_sequences = [], {}
 all_theta, all_x, all_scenario_names = [], [], []
 all_samples = {name: [] for name in METHOD_LABELS}
-endpoint_axis, paired_endpoint_indices, common_endpoint_mass, endpoint_design = matched_endpoint_design(
-    SCENARIOS, np.random.default_rng(CFG.seed + 90_001))
-np.savez_compressed(OUT / "matched_endpoint_design.npz", axis=endpoint_axis,
-                    endpoint_indices=paired_endpoint_indices, common_endpoint_mass=common_endpoint_mass)
 for scenario_id, scenario in enumerate(SCENARIOS):
     for sequence_id in range(CFG.evaluation_sequences):
-        sequence_seed = CFG.seed + 100_000 + sequence_id * 10
-        design = endpoint_design[scenario.name]
-        theta, observations = simulate_sequence_np(
-            np.random.default_rng(sequence_seed + scenario_id * 10_000), scenario,
-            endpoint_index=int(paired_endpoint_indices[sequence_id]), axis=endpoint_axis,
-            marginals=design["marginals"], observation_seed=sequence_seed + 3)
+        sequence_seed = CFG.seed + 100_000 + scenario_id * 10_000 + sequence_id * 10
+        theta, observations = simulate_sequence_np(np.random.default_rng(sequence_seed), scenario)
         final, paths = evaluate_sequence(observations, scenario, sequence_seed + 1)
-        axis, single_mass, history_mass, uniform_mass = filtering_grid_references(
-            observations, scenario, selection_weights=design["selection_weights"])
+        axis, single_mass, history_mass, uniform_mass = filtering_grid_references(observations, scenario)
         reference_rng = np.random.default_rng(sequence_seed + 2)
         current_reference = sample_grid_mass(reference_rng, axis, single_mass[-1], CFG.exact_reference_samples)
         history_reference = sample_grid_mass(reference_rng, axis, history_mass[-1], CFG.exact_reference_samples)
@@ -1869,20 +1646,14 @@ np.savez_compressed(OUT / "held_out_sequences_and_posteriors.npz",
 with (OUT / "experiment_config.json").open("w") as f:
     json.dump({"config": asdict(CFG), "scenarios": [asdict(s) for s in SCENARIOS],
                "training_simulator_calls_shared": CFG.simulation_budget,
-               "training_rows": TRAINING_ROWS,
-               "training_prefixes": list(range(1, CFG.max_training_observations + 1)),
-               "prefix_replay": "same row and same prefix; padded prefixes masked from loss",
                "optional_diagnostic_simulator_calls": (CFG.prior_predictive_plot_samples
                                                        if CFG.simulator_diagnostics_enabled else 0),
                "evaluation_simulator_calls": len(SCENARIOS) * CFG.evaluation_sequences * CFG.sequence_length,
                "inference_simulator_calls": 0,
-               "configured_updates_per_model": TRAINING_ACQUISITION_STEPS * (1 + CFG.replay_epochs),
+               "configured_updates_per_model": math.ceil(CFG.simulation_budget / CFG.batch_size) * (1 + CFG.replay_epochs),
                "method_calls": METHOD_CALLS,
                "uncertainty_scope": "held-out trajectories conditional on one training seed",
-               "paired_endpoints": True,
-               "paired_final_observations": True,
-               "evaluation_path_law": "grid Markov bridges; common terminal mass proportional to minimum scenario marginal",
-               "reference_notes": "Grid approximations including deterministic transition interpolation; references account for endpoint selection distribution, never the sampled endpoint; relocation oracle knows reset time, neural methods do not."}, f, indent=2)
+               "reference_notes": "Grid approximations; relocation oracle knows reset time; neural methods do not."}, f, indent=2)
 
 
 #%% 9) Paired improvements with trajectory-bootstrap uncertainty
@@ -1957,13 +1728,13 @@ for scenario in SCENARIOS:
         ax.set_title(title)
     for ax, name in zip(axes.ravel()[2:], PANEL_METHODS):
         samples = example["final"][name]
-        ax.scatter(samples[:, 0], samples[:, 1], s=7, alpha=0.45, zorder=3)
+        ax.scatter(samples[:, 0], samples[:, 1], s=7, alpha=0.35)
         ax.contour(axis, axis, example["single_mass"][-1],
-                   levels=credible_density_levels(example["single_mass"][-1], masses=(CFG.credible_mass,)),
-                   colors="grey", linestyles="--", linewidths=0.65, alpha=0.65, zorder=1)
+                   levels=credible_density_levels(example["single_mass"][-1]),
+                   colors="grey", linestyles="--", linewidths=0.8)
         ax.contour(axis, axis, example["history_mass"][-1],
-                   levels=credible_density_levels(example["history_mass"][-1], masses=(CFG.credible_mass,)),
-                   colors="darkorange", linewidths=0.7, alpha=0.75, zorder=2)
+                   levels=credible_density_levels(example["history_mass"][-1]),
+                   colors="darkorange", linewidths=0.9)
         ax.set_title(METHOD_LABELS[name], fontsize=10)
     for ax in axes.ravel():
         ax.scatter(*example["theta"][-1], marker="*", s=120, c="crimson", edgecolors="white", zorder=5)
@@ -2049,8 +1820,7 @@ print("\nResults saved to", OUT.resolve())
 print("History is useful only if held-out scores improve; narrow clouds alone are not evidence.")
 print("A closer temporal posterior can be farther from the current-only posterior: inspect both targets.")
 print("The relocation grid knows the change schedule; the learned history method does not.")
-print("Matched grid endpoints change the evaluation prior; references include selection, learned methods retain their configured priors.")
-print("Compare marginal_xT and sw_uniform; deterministic motion also has grid interpolation error.")
+print("Nonstationary marginals can shift the prior: compare marginal_xT and the sw_uniform diagnostic too.")
 print("Repeat with other Config.seed values and finer grids before drawing scientific conclusions.")
 
 #%%
