@@ -33,9 +33,12 @@ limit_weight_space/src/engression
 
 jax_hiddenreps/data/*
 jax_hiddenreps/runs/*
+jax_hiddenreps/runs/*
 
 
 limit_weight_space/plots/cosine_transport
 bayesian_transport/plots/
 
 bayesian_transport/tests/plots
+
+bayesian_transport/runs/*

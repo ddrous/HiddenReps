@@ -70,6 +70,8 @@ Numerical filtering uses only the toy diagnostic likelihood, never for fitting a
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, replace
+from datetime import datetime
+from functools import partial
 from pathlib import Path
 import csv
 import json
@@ -100,6 +102,9 @@ plt.rcParams.update({
 # Uncomment only when debugging numerical issues. It substantially slows JAX execution.
 # jax.config.update("jax_debug_nans", True)
 
+# Flush every script print immediately, including when stdout is redirected by nohup.
+print = partial(print, flush=True)
+
 Array = jax.Array
 
 
@@ -107,7 +112,7 @@ Array = jax.Array
 class Config:
     # Reproducibility / outputs
     seed: int = 2032
-    output_dir: str = "plots/bayes_transport_two_moons_history_buffer"
+    output_dir: str = f"bayesian_transport/runs/{datetime.now():%Y-%m-%d_%H-%M-%S-%f}"
 
     # Exact two-moons benchmark from Greenberg et al. (2019), Appendix A.5.1
     prior_low: float = -1.0
@@ -128,7 +133,7 @@ class Config:
     # fixed-particle-count training path.  Evaluation remains independently controlled by eval_particles.
     max_training_particles: int = 16 * 2*1
     variable_training_particles: bool = False
-    eval_particles: int = 64*4  # Repeated sequence evaluation; attention costs O(M^2).
+    eval_particles: int = 32*2  # Repeated sequence evaluation; attention costs O(M^2).
     hidden_dim: int = 64 * 4
     heads: int = 4
     mlp_ratio: int = 4
@@ -163,7 +168,7 @@ class Config:
 
     # Bayes Transport optimisation -- preserved from the supplied/latest setup.
     simulation_budget: int = 10_000  # Exact number of fresh training simulator calls.
-    replay_epochs: int = 1000  # Full shuffled passes AFTER the acquisition stage; may be zero.
+    replay_epochs: int = 10000  # Full shuffled passes AFTER the acquisition stage; may be zero.
     learning_rate: float = 1e-5
     weight_decay: float = 1e-6
     grad_clip_norm: float = 5000.0
@@ -189,8 +194,8 @@ class Config:
 
     # Three mutually-exclusive input sources. The residual probability gives fresh uniform.
     # A requested same-row posterior falls back to fresh uniform on its first visit only.
-    prior_interpolation_probability: float = 0.00
-    historical_output_prior_probability: float = 0.00
+    prior_interpolation_probability: float = 0.25
+    historical_output_prior_probability: float = 0.5
     interpolation_base_cloud: str = "uniform"  # {"uniform", "gaussian"}
     prior_interpolation_tau_min: float = 0.05
     prior_interpolation_tau_max: float = 1.05
@@ -292,7 +297,10 @@ def training_particle_count_choices(max_particles: int) -> tuple[int, ...]:
 
 CFG = prepare_transport_config(Config())
 OUT = Path(CFG.output_dir)
+if not OUT.is_absolute():
+    OUT = Path(__file__).resolve().parents[1] / OUT
 OUT.mkdir(parents=True, exist_ok=True)
+CFG = replace(CFG, output_dir=str(OUT))  # Persist the actual run directory in saved configs.
 
 for _name in ("simulation_budget", "batch_size", "log_every", "max_training_observations", "observation_sequence_depth"):
     _value = getattr(CFG, _name)
