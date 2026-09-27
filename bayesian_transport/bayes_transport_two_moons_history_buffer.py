@@ -4,6 +4,25 @@
 Standalone companion to bayes_transport_two_moons_proposal_buffer.py; that file is unchanged.
 Run #%% cells in order. There is deliberately no main() function.
 
+Training saves ten complete .eqx checkpoint sets at ceil(k * total_steps / 10), k=1..10
+(or one per update for tiny runs with fewer than ten updates), plus CSV statistics, elapsed
+training time, and the simulation buffer. The schedule, configuration, and a copy of this script
+are saved before training. Set Config.train=False in the saved script, or run it with --no-train,
+to load the latest complete checkpoint beside it. --checkpoint-dir can select another run.
+Saved training/evaluation metrics are reloaded and plotted; missing optional results warn and
+allow evaluation to continue. Changed evaluation settings trigger fresh evaluation.
+
+Evaluation also compares uniform and moment-matched Gaussian input clouds at multiple tau
+values. Evaluation uses tau * cloud + (1-tau) * anchor, so tau=1 reproduces the original calls;
+this is the opposite tau convention to the existing training interpolation. The default anchor
+is a pilot posterior mean using only the current observation, and its calls are counted. The
+sweep changes initial/fresh input clouds, including proposal candidates, while history carries
+previous outputs. The held-out trajectory law and grid targets remain fixed. This measures
+input-cloud sensitivity, not exact inference under a newly specified scientific prior.
+A combined score/calibration figure compares every strategy. GIFs show sequential posterior
+clouds and the temporal reference at each time for both priors (tau=1), plus repeated-x_T
+refinement against the fixed final current-only reference.
+
 Config.training_mode defaults to "one_step", the original experiment described below.
 Optional "ode" uses the time-conditioned posterior Transformer's residual as a vector field.
 Optional "flow_map" defines Phi(t,z0|x)=z0+t*residual(z0,t,x), differentiates it in time at
@@ -73,7 +92,10 @@ from dataclasses import dataclass, asdict, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+import argparse
 import csv
+import os
+import shutil
 import json
 import math
 import warnings
@@ -112,6 +134,8 @@ Array = jax.Array
 class Config:
     # Reproducibility / outputs
     seed: int = 2032
+    train: bool = False  # False: load the latest checkpoint beside this script and evaluate.
+    checkpoint_dir: str | None = None  # Optional run directory for evaluation-only mode.
     output_dir: str = f"bayesian_transport/runs/{datetime.now():%Y-%m-%d_%H-%M-%S-%f}"
 
     # Exact two-moons benchmark from Greenberg et al. (2019), Appendix A.5.1
@@ -195,11 +219,19 @@ class Config:
     # Three mutually-exclusive input sources. The residual probability gives fresh uniform.
     # A requested same-row posterior falls back to fresh uniform on its first visit only.
     prior_interpolation_probability: float = 0.25
-    historical_output_prior_probability: float = 0.5
+    historical_output_prior_probability: float = 0.25
     interpolation_base_cloud: str = "uniform"  # {"uniform", "gaussian"}
     prior_interpolation_tau_min: float = 0.05
-    prior_interpolation_tau_max: float = 1.05
+    prior_interpolation_tau_max: float = 1.15
     truth_anchor_probability: float = 1.00
+
+    # Evaluation input-cloud sensitivity; tau=1 preserves the original incoming cloud.
+    # These change neural inputs, not the held-out data law or diagnostic target posterior.
+    evaluation_priors: tuple[str, ...] = ("uniform", "gaussian")
+    evaluation_taus: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
+    evaluation_interpolation_anchor: str = "posterior_mean"
+    evaluation_gif: bool = True
+    evaluation_gif_fps: int = 2
 
     # Exact posterior / diagnostic grids
     posterior_grid_size: int = 420
@@ -295,12 +327,88 @@ def training_particle_count_choices(max_particles: int) -> tuple[int, ...]:
     return tuple(sorted(choices))
 
 
-CFG = prepare_transport_config(Config())
-OUT = Path(CFG.output_dir)
-if not OUT.is_absolute():
-    OUT = Path(__file__).resolve().parents[1] / OUT
-OUT.mkdir(parents=True, exist_ok=True)
-CFG = replace(CFG, output_dir=str(OUT))  # Persist the actual run directory in saved configs.
+def checkpoint_schedule(total_steps: int) -> tuple[int, ...]:
+    """Ten evenly spaced completed updates (ceil at fractional boundaries).
+
+    Fewer than ten updates can only produce that many distinct trained checkpoints.
+    """
+    if total_steps < 1:
+        raise ValueError("total_steps must be positive.")
+    count = min(10, total_steps)
+    return tuple((i * total_steps + count - 1) // count for i in range(1, count + 1))
+
+
+def checkpoint_location(out: Path, names: tuple[str, ...]) -> tuple[Path, int | None]:
+    """Ignore interrupted/incomplete sets; choose the greatest completed step."""
+    candidates = []
+    for folder in out.glob("checkpoint_*"):
+        suffix = folder.name.removeprefix("checkpoint_")
+        if folder.is_dir() and suffix.isdigit() and all((folder / f"{n}.eqx").is_file() for n in names):
+            candidates.append((int(suffix), folder))
+    if candidates:
+        step, folder = max(candidates)
+        return folder, step
+    if all((out / f"{n}.eqx").is_file() for n in names):
+        return out, None  # Legacy, end-of-training checkpoints.
+    raise FileNotFoundError(f"No complete model checkpoint set found in {out}.")
+
+
+def setup_run(cfg: Config, script_path: Path) -> tuple[Config, Path]:
+    script_path = script_path.resolve()
+    if cfg.train:
+        out = Path(cfg.output_dir).expanduser()
+        if not out.is_absolute():
+            out = script_path.parents[1] / out
+        out.mkdir(parents=True, exist_ok=True)
+        if any(out.glob("*.eqx")) or any(out.glob("checkpoint_*")):
+            raise FileExistsError(f"Training output {out} already has checkpoints; choose a new output_dir.")
+        if script_path != out / script_path.name:
+            shutil.copy2(script_path, out / script_path.name)
+    else:
+        out = Path(cfg.checkpoint_dir).expanduser().resolve() if cfg.checkpoint_dir else script_path.parent
+        folder, _ = checkpoint_location(out, ("single_observation", "no_replay", "buffered"))
+        config_path = folder / "buffered.json"
+        if not config_path.exists():
+            config_path = out / "run_config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Missing saved model configuration: {config_path}")
+        saved = json.loads(config_path.read_text())
+        # Restore model/training settings; retain the requested evaluation settings.
+        overrides = {name: value for name, value in asdict(cfg).items()
+                     if name.startswith("evaluation_") or name in {
+                         "eval_particles", "sequence_length", "posterior_grid_size", "exact_reference_samples",
+                         "metric_particles", "bootstrap_replicates", "sliced_wasserstein_projections",
+                         "credible_mass", "simulator_diagnostics_enabled"}}
+        cfg = replace(Config(**saved), **overrides, train=False, checkpoint_dir=str(out))
+    cfg = prepare_transport_config(replace(cfg, output_dir=str(out)))
+    if cfg.train:
+        (out / "run_config.json").write_text(json.dumps(asdict(cfg), indent=2))
+    return cfg, out
+
+
+_requested_config = Config()
+if __name__ == "__main__":
+    _parser = argparse.ArgumentParser(description=__doc__)
+    _parser.add_argument("--no-train", action="store_true", help="Load checkpoints and evaluate only.")
+    _parser.add_argument("--checkpoint-dir", help="Saved run folder (defaults to the script's folder).")
+    _parser.add_argument("--output-dir", help="New training output directory.")
+    _args = _parser.parse_args()
+    _requested_config = replace(_requested_config,
+        train=_requested_config.train and not _args.no_train,
+        checkpoint_dir=_args.checkpoint_dir or _requested_config.checkpoint_dir,
+        output_dir=_args.output_dir or _requested_config.output_dir)
+CFG, OUT = setup_run(_requested_config, Path(__file__))
+
+if (not CFG.evaluation_priors or not set(CFG.evaluation_priors) <= {"uniform", "gaussian"}
+        or len(set(CFG.evaluation_priors)) != len(CFG.evaluation_priors)):
+    raise ValueError("evaluation_priors must contain distinct uniform/gaussian entries.")
+if (not CFG.evaluation_taus or any(not math.isfinite(t) or not 0 <= t <= 1 for t in CFG.evaluation_taus)
+        or len(set(CFG.evaluation_taus)) != len(CFG.evaluation_taus) or 1.0 not in CFG.evaluation_taus):
+    raise ValueError("evaluation_taus must be distinct values in [0,1], including 1.")
+if CFG.evaluation_interpolation_anchor not in {"posterior_mean", "prior_center"}:
+    raise ValueError("evaluation_interpolation_anchor must be posterior_mean or prior_center.")
+if CFG.evaluation_gif_fps < 1:
+    raise ValueError("evaluation_gif_fps must be positive.")
 
 for _name in ("simulation_budget", "batch_size", "log_every", "max_training_observations", "observation_sequence_depth"):
     _value = getattr(CFG, _name)
@@ -471,6 +579,7 @@ def categorical_proposal_from_posterior_particles_np(
     posterior_reference: np.ndarray,
     batch_size: int,
     cfg: Config = CFG,
+    *, candidates: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Select simulator parameters from a categorical distribution over fresh prior candidates.
 
@@ -491,7 +600,9 @@ def categorical_proposal_from_posterior_particles_np(
         return theta, np.ones(int(batch_size), dtype=np.float32)
 
     k_candidates = int(cfg.categorical_proposal_candidate_particles)
-    candidates = sample_exact_prior_np(rng, k_candidates).astype(np.float64)
+    candidates = (sample_exact_prior_np(rng, k_candidates) if candidates is None
+                  else np.asarray(candidates)).astype(np.float64)
+    k_candidates = len(candidates)
 
     # A particle-native KDE proxy: average Gaussian affinity to the k nearest posterior particles.
     tree = cKDTree(posterior_reference)
@@ -1354,7 +1465,7 @@ optimizer = optax.chain(
     optax.adamw(CFG.learning_rate, weight_decay=CFG.weight_decay),
 )
 opt_states = {name: optimizer.init(eqx.filter(model, eqx.is_array))
-              for name, model in models.items()}
+              for name, model in models.items()} if CFG.train else {}
 train_step = make_train_step(optimizer)
 print(f"Three matched transports initialized; training uses all prefixes 1..{CFG.max_training_observations}.")
 print(f"Transport mode: {CFG.training_mode}; energy score uses the terminal cloud.")
@@ -1469,6 +1580,57 @@ def sliced_wasserstein(a: np.ndarray, b: np.ndarray, n_proj: int = 128) -> float
         np.mean(np.abs(np.sort(a @ u) - np.sort(b @ u)))
         for u in directions
     ]))
+
+
+def write_rows(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+        f.flush()
+        os.fsync(f.fileno())
+    temporary.replace(path)
+
+
+def read_training_rows(path: Path, max_step: int | None = None) -> list[dict]:
+    try:
+        with path.open(newline="") as f:
+            rows = []
+            for row in csv.DictReader(f):
+                parsed = {key: value if key in {"model", "training_mode"} else float(value)
+                          for key, value in row.items()}
+                if max_step is None or parsed["step"] <= max_step:
+                    rows.append(parsed)
+        if not rows:
+            warnings.warn(f"Training metrics are absent or empty: {path}; continuing evaluation.")
+        return rows
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        warnings.warn(f"Training metrics unavailable at {path}: {exc}; continuing evaluation.")
+        return []
+
+
+def save_training_checkpoint(out, step, models, configs, rows, buffer, progress):
+    """Publish all models together only after serialization finishes successfully."""
+    folder = out / f"checkpoint_{step:09d}"
+    temporary = out / f".checkpoint_{step:09d}.tmp"
+    temporary.mkdir(exist_ok=True)
+    for name, model in models.items():
+        save_model(temporary / f"{name}.eqx", model, configs[name])
+    (temporary / "training_progress.json").write_text(json.dumps(progress, indent=2))
+    # Metrics may run ahead of a checkpoint after interruption; loading filters by its step.
+    write_rows(out / "training_history.csv", rows)
+    buffer_path = out / "simulation_buffer.tmp.npz"
+    buffer.save(buffer_path)
+    buffer_path.replace(out / "simulation_buffer.npz")
+    temporary.replace(folder)
+    progress_path = out / "training_progress.json.tmp"
+    progress_path.write_text(json.dumps(progress, indent=2))
+    progress_path.replace(out / "training_progress.json")
+    print(f"Saved checkpoint {step:,}: {folder}")
 
 
 #%% 6) Temporal simulator and numerical filtering references (diagnostics only)
@@ -1763,7 +1925,7 @@ def sample_grid_mass(rng: np.random.Generator, axis: np.ndarray,
 
 def history_input_cloud(rng: np.random.Generator, posterior: np.ndarray,
                         fresh_prior: np.ndarray, scenario: Scenario, time_index: int) -> np.ndarray:
-    """Predict particles with assumed dynamics, then defensively refresh from the original prior.
+    """Predict particles with assumed dynamics, then refresh from the supplied fresh cloud.
 
     No current/future x, latent truth, or diagnostic density is inspected here. Folding particles
     back to prior support is part of prediction only; output support violations are still scored.
@@ -1794,138 +1956,155 @@ def run_history(model, observations: np.ndarray, priors: np.ndarray,
 # evaluation trajectories. Correction is separately optional; stored loss weights and rows are
 # shared by ALL models. After acquisition, all observations/targets come from these stored rows.
 
-simulation_buffer = SimulationBuffer(
-    TRAINING_ROWS, CFG.max_training_particles, tuple(models),
-    store_posteriors=CFG.training_mode == "one_step")
-train_rng = np.random.default_rng(CFG.seed + 10_001)
-shuffle_rng = np.random.default_rng(CFG.seed + 15_013)
-particle_rng = np.random.default_rng(CFG.seed + 25_019)
-proposal_rng = np.random.default_rng(CFG.seed + 27_011)
-# Separate RNGs with common seeds keep cloud/mode choices independent of simulator acquisition.
-cloud_rngs = {name: np.random.default_rng(CFG.seed + 31_001) for name in models}
-mode_rngs = {name: np.random.default_rng(CFG.seed + 32_001) for name in models}
-dropout_key = jax.random.key(CFG.seed + 30_007)
 acquisition_steps = TRAINING_ACQUISITION_STEPS
-simulations_seen = 0
 TOTAL_TRAINING_STEPS = acquisition_steps * (1 + CFG.replay_epochs)
-proposal_posterior_reference = None
-training_rows = []
-print(f"Shared dataset: {CFG.simulation_budget:,} simulator calls in {TRAINING_ROWS:,} observation blocks; "
-      f"{TOTAL_TRAINING_STEPS:,} optimizer updates PER model.")
+CHECKPOINT_STEPS = checkpoint_schedule(TOTAL_TRAINING_STEPS)
+if CFG.train:
+    print(f"Will save {len(CHECKPOINT_STEPS)} checkpoint sets at updates {CHECKPOINT_STEPS}.")
+    (OUT / "checkpoint_schedule.json").write_text(json.dumps({
+        "total_steps": TOTAL_TRAINING_STEPS, "checkpoint_steps": CHECKPOINT_STEPS,
+        "models_per_checkpoint": list(TRAIN_CONFIGS)}, indent=2))
+    simulation_buffer = SimulationBuffer(
+        TRAINING_ROWS, CFG.max_training_particles, tuple(models),
+        store_posteriors=CFG.training_mode == "one_step")
+    train_rng = np.random.default_rng(CFG.seed + 10_001)
+    shuffle_rng = np.random.default_rng(CFG.seed + 15_013)
+    particle_rng = np.random.default_rng(CFG.seed + 25_019)
+    proposal_rng = np.random.default_rng(CFG.seed + 27_011)
+    # Separate RNGs with common seeds keep cloud/mode choices independent of simulator acquisition.
+    cloud_rngs = {name: np.random.default_rng(CFG.seed + 31_001) for name in models}
+    mode_rngs = {name: np.random.default_rng(CFG.seed + 32_001) for name in models}
+    dropout_key = jax.random.key(CFG.seed + 30_007)
+    acquisition_steps = TRAINING_ACQUISITION_STEPS
+    simulations_seen = 0
+    proposal_posterior_reference = None
+    training_rows = []
+    print(f"Shared dataset: {CFG.simulation_budget:,} simulator calls in {TRAINING_ROWS:,} observation blocks; "
+          f"{TOTAL_TRAINING_STEPS:,} optimizer updates PER model.")
 
-training_start_time = perf_counter()
-for step in range(1, TOTAL_TRAINING_STEPS + 1):
-    training_particles = int(particle_rng.choice(TRAINING_PARTICLE_COUNTS))
-    replay_epoch = 0
-    if len(simulation_buffer) < TRAINING_ROWS:
-        batch_n = min(CFG.batch_size, TRAINING_ROWS - len(simulation_buffer))
-        remaining_calls = CFG.simulation_budget - simulations_seen
-        observation_counts = np.minimum(
-            CFG.max_training_observations,
-            remaining_calls - np.arange(batch_n) * CFG.max_training_observations,
-        ).astype(np.int32)
-        if CFG.categorical_proposal_enabled and step > CFG.categorical_proposal_warmup_steps:
-            if (proposal_posterior_reference is None or
-                (step - CFG.categorical_proposal_warmup_steps - 1) % CFG.categorical_proposal_refresh_every == 0):
-                proposal_posterior_reference = evaluate_bt(
-                    models["buffered"], sample_exact_prior_np(
-                        proposal_rng, CFG.categorical_proposal_reference_particles), X_OBS)
-            theta_target, sample_weights = categorical_proposal_from_posterior_particles_np(
-                proposal_rng, proposal_posterior_reference, batch_n, CFG)
+    training_start_time = perf_counter()
+    for step in range(1, TOTAL_TRAINING_STEPS + 1):
+        training_particles = int(particle_rng.choice(TRAINING_PARTICLE_COUNTS))
+        replay_epoch = 0
+        if len(simulation_buffer) < TRAINING_ROWS:
+            batch_n = min(CFG.batch_size, TRAINING_ROWS - len(simulation_buffer))
+            remaining_calls = CFG.simulation_budget - simulations_seen
+            observation_counts = np.minimum(
+                CFG.max_training_observations,
+                remaining_calls - np.arange(batch_n) * CFG.max_training_observations,
+            ).astype(np.int32)
+            if CFG.categorical_proposal_enabled and step > CFG.categorical_proposal_warmup_steps:
+                if (proposal_posterior_reference is None or
+                    (step - CFG.categorical_proposal_warmup_steps - 1) % CFG.categorical_proposal_refresh_every == 0):
+                    proposal_posterior_reference = evaluate_bt(
+                        models["buffered"], sample_exact_prior_np(
+                            proposal_rng, CFG.categorical_proposal_reference_particles), X_OBS)
+                theta_target, sample_weights = categorical_proposal_from_posterior_particles_np(
+                    proposal_rng, proposal_posterior_reference, batch_n, CFG)
+            else:
+                theta_target = sample_exact_prior_np(train_rng, batch_n)
+                sample_weights = np.ones(batch_n, dtype=np.float32)
+            if not CFG.importance_weights_enabled:
+                sample_weights = np.ones(batch_n, dtype=np.float32)
+            # Each observation costs one call. Padding the final partial row costs no simulations.
+            valid = np.arange(CFG.max_training_observations)[None, :] < observation_counts[:, None]
+            repeated_theta = np.repeat(theta_target, observation_counts, axis=0)
+            x_batch = np.zeros((batch_n, CFG.max_training_observations, 2), dtype=np.float32)
+            x_batch[valid] = simulate_two_moons_batch_np(train_rng, repeated_theta)
+            simulations_seen += len(repeated_theta)
+            batch_indices = simulation_buffer.add_batch(theta_target, x_batch, sample_weights, observation_counts)
         else:
-            theta_target = sample_exact_prior_np(train_rng, batch_n)
-            sample_weights = np.ones(batch_n, dtype=np.float32)
-        if not CFG.importance_weights_enabled:
-            sample_weights = np.ones(batch_n, dtype=np.float32)
-        # Each observation costs one call. Padding the final partial row costs no simulations.
-        valid = np.arange(CFG.max_training_observations)[None, :] < observation_counts[:, None]
-        repeated_theta = np.repeat(theta_target, observation_counts, axis=0)
-        x_batch = np.zeros((batch_n, CFG.max_training_observations, 2), dtype=np.float32)
-        x_batch[valid] = simulate_two_moons_batch_np(train_rng, repeated_theta)
-        simulations_seen += len(repeated_theta)
-        batch_indices = simulation_buffer.add_batch(theta_target, x_batch, sample_weights, observation_counts)
-    else:
-        replay_epoch, batch_in_epoch = divmod(step - acquisition_steps - 1, acquisition_steps)
-        replay_epoch += 1
-        if batch_in_epoch == 0:
-            epoch_indices = shuffle_rng.permutation(len(simulation_buffer))
-        start = batch_in_epoch * CFG.batch_size
-        batch_indices = epoch_indices[start:start + CFG.batch_size]
-        theta_target, x_batch, sample_weights, observation_counts = simulation_buffer.get_batch(batch_indices)
+            replay_epoch, batch_in_epoch = divmod(step - acquisition_steps - 1, acquisition_steps)
+            replay_epoch += 1
+            if batch_in_epoch == 0:
+                epoch_indices = shuffle_rng.permutation(len(simulation_buffer))
+            start = batch_in_epoch * CFG.batch_size
+            batch_indices = epoch_indices[start:start + CFG.batch_size]
+            theta_target, x_batch, sample_weights, observation_counts = simulation_buffer.get_batch(batch_indices)
 
-    dropout_key, step_key = jax.random.split(dropout_key)
-    for name, cfg in TRAIN_CONFIGS.items():
-        incoming, info = make_training_prior_batch_np(
-            cloud_rngs[name], mode_rngs[name], simulation_buffer, batch_indices,
-            name, training_particles, cfg)
-        models[name], opt_states[name], loss, metrics, posterior, grad_norm = train_step(
-            models[name], opt_states[name], jnp.asarray(incoming), jnp.asarray(x_batch),
-            jnp.asarray(theta_target), jnp.asarray(sample_weights), step_key, jnp.asarray(observation_counts))
-        # Store the detached output of THIS call under the SAME row IDs, for the next visit.
-        # Targets/observations/weights stay fixed; gradients never flow through earlier calls.
-        if cfg.training_mode == "one_step":
-            simulation_buffer.update_posteriors(name, batch_indices, np.asarray(jax.device_get(posterior)))
-        host = jax.device_get(metrics)
-        training_rows.append({
-            "model": name, "training_mode": cfg.training_mode, "step": step, "simulations_seen": simulations_seen,
-            "replay_epoch": replay_epoch, "batch_examples": len(theta_target),
-            "training_particles": training_particles, "energy_score": float(host["energy_score"]),
-            **{f"energy_score_prefix_{o + 1}": float(value)
-               for o, value in enumerate(host["energy_score_by_prefix"])},
-            **{f"valid_rows_prefix_{o + 1}": int(value)
-               for o, value in enumerate(host["valid_rows_by_prefix"])},
-            "grad_norm": float(jax.device_get(grad_norm)),
-            "outside_prior_fraction": float(host["outside_prior_fraction"]),
-            "interpolation_fraction": float(np.mean(info["interpolation_used"])),
-            "mean_loss_weight": float(np.mean(sample_weights)),
-            "buffer_fraction": float(np.mean(info["buffer_used"])),
-            "fresh_prior_fraction": float(np.mean(info["exact_prior_used"])),
-            "posterior_available_fraction": float(np.mean(info["posterior_available"])),
-            "posterior_bootstrapped_fraction": float(np.mean(info["posterior_bootstrapped"])),
-        })
-    # Save only AFTER every model has populated its latest cloud, including the last fresh batch.
-    if step == acquisition_steps or step == TOTAL_TRAINING_STEPS:
-        simulation_buffer.save(OUT / "simulation_buffer.npz")
-    if step == 1 or step % CFG.log_every == 0 or step in (acquisition_steps, TOTAL_TRAINING_STEPS):
-        print(f"step {step:6d}/{TOTAL_TRAINING_STEPS} | sims {simulations_seen:,} | "
-              f"replay {replay_epoch} | M {training_particles} | " + " | ".join(
-                  f"{r['model']} ES {r['energy_score']:.5f} (posterior inputs {r['buffer_fraction']:.2f})" for r in training_rows[-len(models):]))
+        dropout_key, step_key = jax.random.split(dropout_key)
+        for name, cfg in TRAIN_CONFIGS.items():
+            incoming, info = make_training_prior_batch_np(
+                cloud_rngs[name], mode_rngs[name], simulation_buffer, batch_indices,
+                name, training_particles, cfg)
+            models[name], opt_states[name], loss, metrics, posterior, grad_norm = train_step(
+                models[name], opt_states[name], jnp.asarray(incoming), jnp.asarray(x_batch),
+                jnp.asarray(theta_target), jnp.asarray(sample_weights), step_key, jnp.asarray(observation_counts))
+            # Store the detached output of THIS call under the SAME row IDs, for the next visit.
+            # Targets/observations/weights stay fixed; gradients never flow through earlier calls.
+            if cfg.training_mode == "one_step":
+                simulation_buffer.update_posteriors(name, batch_indices, np.asarray(jax.device_get(posterior)))
+            host = jax.device_get(metrics)
+            training_rows.append({
+                "model": name, "training_mode": cfg.training_mode, "step": step, "simulations_seen": simulations_seen,
+                "replay_epoch": replay_epoch, "batch_examples": len(theta_target),
+                "training_particles": training_particles, "energy_score": float(host["energy_score"]),
+                **{f"energy_score_prefix_{o + 1}": float(value)
+                   for o, value in enumerate(host["energy_score_by_prefix"])},
+                **{f"valid_rows_prefix_{o + 1}": int(value)
+                   for o, value in enumerate(host["valid_rows_by_prefix"])},
+                "grad_norm": float(jax.device_get(grad_norm)),
+                "outside_prior_fraction": float(host["outside_prior_fraction"]),
+                "interpolation_fraction": float(np.mean(info["interpolation_used"])),
+                "mean_loss_weight": float(np.mean(sample_weights)),
+                "buffer_fraction": float(np.mean(info["buffer_used"])),
+                "fresh_prior_fraction": float(np.mean(info["exact_prior_used"])),
+                "posterior_available_fraction": float(np.mean(info["posterior_available"])),
+                "posterior_bootstrapped_fraction": float(np.mean(info["posterior_bootstrapped"])),
+            })
+        # Save only AFTER every model has populated its latest cloud, including the last fresh batch.
+        if step in CHECKPOINT_STEPS:
+            jax.block_until_ready(eqx.filter(models, eqx.is_array))
+            save_training_checkpoint(OUT, step, models, TRAIN_CONFIGS, training_rows, simulation_buffer, {
+                "step": step, "total_steps": TOTAL_TRAINING_STEPS,
+                "checkpoint_steps": CHECKPOINT_STEPS, "simulations_seen": simulations_seen,
+                "training_seconds": perf_counter() - training_start_time,
+            })
+        if step == 1 or step % CFG.log_every == 0 or step in (acquisition_steps, TOTAL_TRAINING_STEPS):
+            print(f"step {step:6d}/{TOTAL_TRAINING_STEPS} | sims {simulations_seen:,} | "
+                  f"replay {replay_epoch} | M {training_particles} | " + " | ".join(
+                      f"{r['model']} ES {r['energy_score']:.5f} (posterior inputs {r['buffer_fraction']:.2f})" for r in training_rows[-len(models):]))
 
-# Wait for asynchronous JAX updates before measuring wall-clock training time.
-jax.block_until_ready(eqx.filter(models, eqx.is_array))
-training_seconds = perf_counter() - training_start_time
-print(f"Total training time (all models): {training_seconds:,.2f} seconds "
-      f"({training_seconds / 60:.2f} minutes)")
+    # Wait for asynchronous JAX updates before measuring wall-clock training time.
+    jax.block_until_ready(eqx.filter(models, eqx.is_array))
+    training_seconds = perf_counter() - training_start_time
+    print(f"Total training time (all models): {training_seconds:,.2f} seconds "
+          f"({training_seconds / 60:.2f} minutes)")
 
-assert simulations_seen == CFG.simulation_budget
+    assert simulations_seen == CFG.simulation_budget
 
-for name, model in models.items():
-    save_model(OUT / f"{name}.eqx", model, TRAIN_CONFIGS[name])
-with (OUT / "training_history.csv").open("w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=list(training_rows[0]))
-    writer.writeheader()
-    writer.writerows(training_rows)
+    for name, model in models.items():
+        save_model(OUT / f"{name}.eqx", model, TRAIN_CONFIGS[name])
+else:
+    checkpoint_folder, checkpoint_step = checkpoint_location(OUT, tuple(TRAIN_CONFIGS))
+    models = {name: load_model(checkpoint_folder / f"{name}.eqx", cfg)
+              for name, cfg in TRAIN_CONFIGS.items()}
+    training_rows = read_training_rows(OUT / "training_history.csv", checkpoint_step)
+    print(f"Loaded models from {checkpoint_folder}; training skipped.")
 
-fig, axes = plt.subplots(1, 4, figsize=(20, 4))
-for name in models:
-    rows = [r for r in training_rows if r["model"] == name]
-    for ax, metric in zip(axes, ("energy_score", "grad_norm", "outside_prior_fraction", "buffer_fraction")):
-        ax.plot([r["step"] for r in rows], rolling_mean(np.array([r[metric] for r in rows])), label=name)
-        ax.set(xlabel="Optimizer update", title=metric.replace("_", " "))
-        ax.axvline(acquisition_steps, color="black", linestyle=":", alpha=0.5)
-axes[0].legend(fontsize=8)
-axes[3].axhline(CFG.historical_output_prior_probability, color="black", linestyle="--", alpha=0.5)
-axes[3].set_ylim(-0.02, 1.02)
-axes[1].set_yscale("symlog", linthresh=1e-5)
-fig.suptitle("Matched training — dotted line: start of simulation-dataset replay")
-fig.tight_layout()
-fig.savefig(OUT / "10_training_diagnostics.png", dpi=180, bbox_inches="tight")
-plt.show()
+if training_rows:
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    for name in models:
+        rows = [r for r in training_rows if r.get("model") == name]
+        for ax, metric in zip(axes, ("energy_score", "grad_norm", "outside_prior_fraction", "buffer_fraction")):
+            if not rows or any(metric not in r for r in rows):
+                warnings.warn(f"Training metric {metric} absent for {name}; skipping this curve.")
+                continue
+            ax.plot([r["step"] for r in rows], rolling_mean(np.array([r[metric] for r in rows])), label=name)
+            ax.set(xlabel="Optimizer update", title=metric.replace("_", " "))
+            ax.axvline(acquisition_steps, color="black", linestyle=":", alpha=0.5)
+    axes[0].legend(fontsize=8)
+    axes[3].axhline(CFG.historical_output_prior_probability, color="black", linestyle="--", alpha=0.5)
+    axes[3].set_ylim(-0.02, 1.02)
+    axes[1].set_yscale("symlog", linthresh=1e-5)
+    fig.suptitle("Matched training — dotted line: start of simulation-dataset replay")
+    fig.tight_layout()
+    fig.savefig(OUT / "10_training_diagnostics.png", dpi=180, bbox_inches="tight")
+    plt.show()
 
 
 #%% 8) Matched-endpoint sequences: particle history and parallel repeated-x control
-# If loading checkpoints, run cells 0–6 and then:
-# models = {name: load_model(OUT / f"{name}.eqx", cfg) for name, cfg in TRAIN_CONFIGS.items()}
+# Config.train=False or --no-train automatically loads the latest complete checkpoint.
 
 METHOD_LABELS = {
     "sbi_xT": "SBI: current x only",
@@ -1953,10 +2132,35 @@ METHOD_CALLS = {name: (CFG.sequence_length if name in (
     for name in METHOD_LABELS}
 
 
-def evaluate_sequence(observations: np.ndarray, scenario: Scenario, seed: int):
+def sample_evaluation_prior(rng, n, family):
+    if family == "uniform":
+        return sample_exact_prior_np(rng, n)
+    if family == "gaussian":
+        # Untruncated, moment-matched Gaussian; support violations remain measurable.
+        return rng.normal(PRIOR_CENTER, PRIOR_STD, (n, 2)).astype(np.float32)
+    raise ValueError(f"Unknown evaluation prior: {family}")
+
+
+def interpolate_evaluation_prior(cloud, anchor, tau):
+    # Evaluation tau is the retained prior fraction (opposite to training's anchor fraction).
+    if tau == 1.0:
+        return cloud
+    return (tau * cloud + (1.0 - tau) * anchor).astype(np.float32)
+
+
+def evaluate_sequence(observations: np.ndarray, scenario: Scenario, seed: int,
+                      *, prior_family: str = "uniform", tau: float = 1.0):
     rng = np.random.default_rng(seed)
-    priors = sample_exact_prior_np(rng, CFG.sequence_length * CFG.eval_particles).reshape(
+    priors = sample_evaluation_prior(rng, CFG.sequence_length * CFG.eval_particles, prior_family).reshape(
         CFG.sequence_length, CFG.eval_particles, 2)
+    anchors = np.full((len(observations), 1, 2), PRIOR_CENTER, dtype=np.float32)
+    if tau != 1.0 and CFG.evaluation_interpolation_anchor == "posterior_mean":
+        # Each anchor uses only the observation available at that time, never theta or future x.
+        anchor_rng = np.random.default_rng(seed + 71)
+        for t, observation in enumerate(observations):
+            pilot_prior = sample_exact_prior_np(anchor_rng, CFG.eval_particles)
+            anchors[t, 0] = evaluate_bt(models["single_observation"], pilot_prior, observation).mean(axis=0)
+    priors = interpolate_evaluation_prior(priors, anchors, tau)
     x_final = observations[-1]
     final = {
         "sbi_xT": evaluate_bt(models["single_observation"], priors[-1], x_final),
@@ -1974,8 +2178,15 @@ def evaluate_sequence(observations: np.ndarray, scenario: Scenario, seed: int):
         marginal_prior = (priors[t].copy() if scenario.reset_probability == 1.0 else
                           predict_transition_np(marginal_rng, marginal_prior, t, scenario))
     final["marginal_xT"] = evaluate_bt(models["buffered"], marginal_prior, x_final)
-    proposal, _ = categorical_proposal_from_posterior_particles_np(
-        rng, final["buffer_xT"], CFG.eval_particles, CFG)
+    if prior_family == "uniform" and tau == 1.0:
+        # Preserve the original RNG stream and proposal-start evaluation exactly.
+        proposal, _ = categorical_proposal_from_posterior_particles_np(
+            rng, final["buffer_xT"], CFG.eval_particles, CFG)
+    else:
+        candidates = interpolate_evaluation_prior(sample_evaluation_prior(
+            rng, CFG.categorical_proposal_candidate_particles, prior_family), anchors[-1], tau)
+        proposal, _ = categorical_proposal_from_posterior_particles_np(
+            rng, final["buffer_xT"], CFG.eval_particles, CFG, candidates=candidates)
     final["proposal_xT"] = evaluate_bt(models["buffered"], proposal, x_final)
     # First refinement call is the same buffer_xT evaluation, reused without recomputation.
     refined = [final["buffer_xT"]]
@@ -2019,81 +2230,155 @@ def score_cloud(samples: np.ndarray, truth: np.ndarray, current_reference: np.nd
     }
 
 
-def write_rows(path: Path, rows: list[dict]) -> None:
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+
+def evaluation_cache_signature():
+    config = asdict(CFG)
+    for name in ("train", "output_dir", "checkpoint_dir"):
+        config.pop(name, None)
+    folder, step = checkpoint_location(OUT, tuple(TRAIN_CONFIGS))
+    return json.dumps({"version": 1, "config": config, "checkpoint_step": step,
+                       "models": {name: (folder / f"{name}.eqx").stat().st_mtime_ns
+                                  for name in TRAIN_CONFIGS}}, sort_keys=True)
 
 
-metric_rows, example_sequences = [], {}
-all_theta, all_x, all_scenario_names = [], [], []
-all_samples = {name: [] for name in METHOD_LABELS}
-endpoint_axis, paired_endpoint_indices, common_endpoint_mass, endpoint_design = matched_endpoint_design(
-    SCENARIOS, np.random.default_rng(CFG.seed + 90_001))
-np.savez_compressed(OUT / "matched_endpoint_design.npz", axis=endpoint_axis,
-                    endpoint_indices=paired_endpoint_indices, common_endpoint_mass=common_endpoint_mass)
-for scenario_id, scenario in enumerate(SCENARIOS):
-    for sequence_id in range(CFG.evaluation_sequences):
-        sequence_seed = CFG.seed + 100_000 + sequence_id * 10
-        design = endpoint_design[scenario.name]
-        theta, observations = simulate_sequence_np(
-            np.random.default_rng(sequence_seed + scenario_id * 10_000), scenario,
-            endpoint_index=int(paired_endpoint_indices[sequence_id]), axis=endpoint_axis,
-            marginals=design["marginals"], observation_seed=sequence_seed + 3)
-        final, paths = evaluate_sequence(observations, scenario, sequence_seed + 1)
-        axis, single_mass, history_mass, uniform_mass = filtering_grid_references(
-            observations, scenario, selection_weights=design["selection_weights"])
-        reference_rng = np.random.default_rng(sequence_seed + 2)
-        current_reference = sample_grid_mass(reference_rng, axis, single_mass[-1], CFG.exact_reference_samples)
-        history_reference = sample_grid_mass(reference_rng, axis, history_mass[-1], CFG.exact_reference_samples)
-        uniform_reference = sample_grid_mass(reference_rng, axis, uniform_mass[-1], CFG.exact_reference_samples)
-        # Equal-size oracle particle clouds make finite-ensemble truth scores comparable.
-        final["reference_current"] = sample_grid_mass(reference_rng, axis, single_mass[-1], CFG.eval_particles)
-        final["reference_history"] = sample_grid_mass(reference_rng, axis, history_mass[-1], CFG.eval_particles)
-        for name, samples in final.items():
-            metric_rows.append({
-                "scenario": scenario.name, "sequence": sequence_id, "method": name,
-                "sequence_length": CFG.sequence_length, "model_calls": METHOD_CALLS[name],
-                **score_cloud(samples, theta[-1], current_reference, history_reference, uniform_reference),
-            })
-            all_samples[name].append(samples)
-        all_theta.append(theta)
-        all_x.append(observations)
-        all_scenario_names.append(scenario.name)
-        if sequence_id == 0:
-            example_sequences[scenario.name] = {
-                "theta": theta, "x": observations, "final": final, "paths": paths,
-                "axis": axis, "single_mass": single_mass, "history_mass": history_mass, "uniform_mass": uniform_mass,
-            }
-        if sequence_id == 0 or (sequence_id + 1) % 8 == 0 or sequence_id + 1 == CFG.evaluation_sequences:
-            print(f"{scenario.name}: {sequence_id + 1}/{CFG.evaluation_sequences} held-out sequences")
+def save_evaluation_cache(path, signature, metric_rows, sweep_rows, examples, sweep_examples):
+    payload = {"signature": np.asarray(signature), "metrics": np.asarray(json.dumps(metric_rows)),
+               "sweep_metrics": np.asarray(json.dumps(sweep_rows))}
+    def flatten(prefix, value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                flatten(prefix + "/" + key, item)
+        else:
+            payload[prefix] = np.asarray(value)
+    flatten("examples", examples)
+    flatten("sweep_examples", sweep_examples)
+    temporary = path.with_name(path.stem + ".tmp.npz")
+    np.savez_compressed(temporary, **payload)
+    temporary.replace(path)
 
-write_rows(OUT / "sequence_metrics.csv", metric_rows)
-np.savez_compressed(OUT / "held_out_sequences_and_posteriors.npz",
-                    theta=np.asarray(all_theta), x=np.asarray(all_x),
-                    scenario=np.asarray(all_scenario_names),
-                    **{name: np.asarray(samples) for name, samples in all_samples.items()})
-with (OUT / "experiment_config.json").open("w") as f:
-    json.dump({"config": asdict(CFG), "scenarios": [asdict(s) for s in SCENARIOS],
-               "training_simulator_calls_shared": CFG.simulation_budget,
-               "training_rows": TRAINING_ROWS,
-               "training_prefixes": list(range(1, CFG.max_training_observations + 1)),
-               "prefix_replay": ("same row and same prefix; padded prefixes masked from loss"
-                                 if CFG.training_mode == "one_step" else "disabled; fresh prior inputs"),
-               "model_calls_notes": "Transport invocations; excludes internal ODE vector-field evaluations",
-               "flow_map_notes": "Training integrates dPhi/dt at fixed initial cloud; inference directly evaluates Phi(1). Finite-step quadrature can differ from the direct endpoint.",
-               "optional_diagnostic_simulator_calls": (CFG.prior_predictive_plot_samples
-                                                       if CFG.simulator_diagnostics_enabled else 0),
-               "evaluation_simulator_calls": len(SCENARIOS) * CFG.evaluation_sequences * CFG.sequence_length,
-               "inference_simulator_calls": 0,
-               "configured_updates_per_model": TRAINING_ACQUISITION_STEPS * (1 + CFG.replay_epochs),
-               "method_calls": METHOD_CALLS,
-               "uncertainty_scope": "held-out trajectories conditional on one training seed",
-               "paired_endpoints": True,
-               "paired_final_observations": True,
-               "evaluation_path_law": "grid Markov bridges; common terminal mass proportional to minimum scenario marginal",
-               "reference_notes": "Grid approximations including deterministic transition interpolation; references account for endpoint selection distribution, never the sampled endpoint; relocation oracle knows reset time, neural methods do not."}, f, indent=2)
+
+def load_evaluation_cache(path, signature):
+    try:
+        with np.load(path, allow_pickle=False) as cache:
+            if str(cache["signature"]) != signature:
+                warnings.warn("Saved evaluation settings/checkpoint differ; recomputing evaluation.")
+                return None
+            roots = {"examples": {}, "sweep_examples": {}}
+            for key in cache.files:
+                if "/" not in key:
+                    continue
+                parts = key.split("/")
+                target = roots[parts[0]]
+                for part in parts[1:-1]:
+                    target = target.setdefault(part, {})
+                target[parts[-1]] = cache[key]
+            return (json.loads(str(cache["metrics"])), json.loads(str(cache["sweep_metrics"])),
+                    roots["examples"], roots["sweep_examples"])
+    except (OSError, ValueError, KeyError) as exc:
+        warnings.warn(f"Saved evaluation metrics/particles unavailable: {exc}; recomputing evaluation.")
+        return None
+
+
+_cache_signature = evaluation_cache_signature()
+_cached_evaluation = (load_evaluation_cache(OUT / "evaluation_cache.npz", _cache_signature)
+                      if not CFG.train else None)
+if _cached_evaluation is not None:
+    metric_rows, sweep_rows, example_sequences, sweep_examples = _cached_evaluation
+    print("Loaded saved evaluation metrics and particles; regenerating figures.")
+else:
+    metric_rows, example_sequences = [], {}
+    sweep_rows, sweep_examples = [], {}
+    all_theta, all_x, all_scenario_names = [], [], []
+    all_samples = {name: [] for name in METHOD_LABELS}
+    endpoint_axis, paired_endpoint_indices, common_endpoint_mass, endpoint_design = matched_endpoint_design(
+        SCENARIOS, np.random.default_rng(CFG.seed + 90_001))
+    np.savez_compressed(OUT / "matched_endpoint_design.npz", axis=endpoint_axis,
+                        endpoint_indices=paired_endpoint_indices, common_endpoint_mass=common_endpoint_mass)
+    for scenario_id, scenario in enumerate(SCENARIOS):
+        for sequence_id in range(CFG.evaluation_sequences):
+            sequence_seed = CFG.seed + 100_000 + sequence_id * 10
+            design = endpoint_design[scenario.name]
+            theta, observations = simulate_sequence_np(
+                np.random.default_rng(sequence_seed + scenario_id * 10_000), scenario,
+                endpoint_index=int(paired_endpoint_indices[sequence_id]), axis=endpoint_axis,
+                marginals=design["marginals"], observation_seed=sequence_seed + 3)
+            final, paths = evaluate_sequence(observations, scenario, sequence_seed + 1)
+            axis, single_mass, history_mass, uniform_mass = filtering_grid_references(
+                observations, scenario, selection_weights=design["selection_weights"])
+            reference_rng = np.random.default_rng(sequence_seed + 2)
+            current_reference = sample_grid_mass(reference_rng, axis, single_mass[-1], CFG.exact_reference_samples)
+            history_reference = sample_grid_mass(reference_rng, axis, history_mass[-1], CFG.exact_reference_samples)
+            uniform_reference = sample_grid_mass(reference_rng, axis, uniform_mass[-1], CFG.exact_reference_samples)
+            # Equal-size oracle particle clouds make finite-ensemble truth scores comparable.
+            final["reference_current"] = sample_grid_mass(reference_rng, axis, single_mass[-1], CFG.eval_particles)
+            final["reference_history"] = sample_grid_mass(reference_rng, axis, history_mass[-1], CFG.eval_particles)
+            for name, samples in final.items():
+                metric_rows.append({
+                    "scenario": scenario.name, "sequence": sequence_id, "method": name,
+                    "sequence_length": CFG.sequence_length, "model_calls": METHOD_CALLS[name],
+                    **score_cloud(samples, theta[-1], current_reference, history_reference, uniform_reference),
+                })
+                all_samples[name].append(samples)
+            for family in CFG.evaluation_priors:
+                for tau in CFG.evaluation_taus:
+                    if family == "uniform" and tau == 1.0:
+                        sweep_final, sweep_paths = final, paths
+                    else:
+                        sweep_final, sweep_paths = evaluate_sequence(
+                            observations, scenario, sequence_seed + 1, prior_family=family, tau=tau)
+                    anchor_calls = (len(observations) if tau != 1.0 and
+                                    CFG.evaluation_interpolation_anchor == "posterior_mean" else 0)
+                    for name in METHOD_LABELS:
+                        samples = final[name] if name.startswith("reference_") else sweep_final[name]
+                        sweep_rows.append({
+                            "scenario": scenario.name, "sequence": sequence_id, "method": name,
+                            "prior": family, "tau": tau,
+                            "model_calls": METHOD_CALLS[name] + (0 if name.startswith("reference_") else anchor_calls),
+                            **score_cloud(samples, theta[-1], current_reference, history_reference, uniform_reference),
+                        })
+                    if sequence_id == 0:
+                        sweep_examples[f"{scenario.name}__{family}__{tau:g}"] = sweep_paths
+
+            all_theta.append(theta)
+            all_x.append(observations)
+            all_scenario_names.append(scenario.name)
+            if sequence_id == 0:
+                example_sequences[scenario.name] = {
+                    "theta": theta, "x": observations, "final": final, "paths": paths,
+                    "axis": axis, "single_mass": single_mass, "history_mass": history_mass, "uniform_mass": uniform_mass,
+                }
+            if sequence_id == 0 or (sequence_id + 1) % 8 == 0 or sequence_id + 1 == CFG.evaluation_sequences:
+                print(f"{scenario.name}: {sequence_id + 1}/{CFG.evaluation_sequences} held-out sequences")
+
+        write_rows(OUT / "sequence_metrics.csv", metric_rows)
+        write_rows(OUT / "prior_interpolation_metrics.csv", sweep_rows)
+    np.savez_compressed(OUT / "held_out_sequences_and_posteriors.npz",
+                        theta=np.asarray(all_theta), x=np.asarray(all_x),
+                        scenario=np.asarray(all_scenario_names),
+                        **{name: np.asarray(samples) for name, samples in all_samples.items()})
+    with (OUT / "experiment_config.json").open("w") as f:
+        json.dump({"config": asdict(CFG), "scenarios": [asdict(s) for s in SCENARIOS],
+                   "training_simulator_calls_shared": CFG.simulation_budget,
+                   "training_rows": TRAINING_ROWS,
+                   "training_prefixes": list(range(1, CFG.max_training_observations + 1)),
+                   "prefix_replay": ("same row and same prefix; padded prefixes masked from loss"
+                                     if CFG.training_mode == "one_step" else "disabled; fresh prior inputs"),
+                   "model_calls_notes": "Transport invocations; excludes internal ODE vector-field evaluations",
+                   "flow_map_notes": "Training integrates dPhi/dt at fixed initial cloud; inference directly evaluates Phi(1). Finite-step quadrature can differ from the direct endpoint.",
+                   "optional_diagnostic_simulator_calls": (CFG.prior_predictive_plot_samples
+                                                           if CFG.simulator_diagnostics_enabled else 0),
+                   "evaluation_simulator_calls": len(SCENARIOS) * CFG.evaluation_sequences * CFG.sequence_length,
+                   "inference_simulator_calls": 0,
+                   "configured_updates_per_model": TRAINING_ACQUISITION_STEPS * (1 + CFG.replay_epochs),
+                   "method_calls": METHOD_CALLS,
+                   "uncertainty_scope": "held-out trajectories conditional on one training seed",
+                   "paired_endpoints": True,
+                   "paired_final_observations": True,
+                   "evaluation_path_law": "grid Markov bridges; common terminal mass proportional to minimum scenario marginal",
+                   "reference_notes": "Grid approximations including deterministic transition interpolation; references account for endpoint selection distribution, never the sampled endpoint; relocation oracle knows reset time, neural methods do not."}, f, indent=2)
+
+    save_evaluation_cache(OUT / "evaluation_cache.npz", _cache_signature,
+                          metric_rows, sweep_rows, example_sequences, sweep_examples)
 
 
 #%% 9) Paired improvements with trajectory-bootstrap uncertainty
@@ -2255,6 +2540,92 @@ axes[0, 0].legend(fontsize=7)
 fig.tight_layout()
 fig.savefig(OUT / "60_target_fidelity_and_calibration.png", dpi=180, bbox_inches="tight")
 plt.show()
+
+#%% 15) All methods under both input priors and interpolation strengths
+# Same paired truths/reference targets throughout; Gaussian is an input-cloud transfer test.
+sweep_summary = []
+for scenario in SCENARIOS:
+    for family in CFG.evaluation_priors:
+        for tau in CFG.evaluation_taus:
+            for name in METHOD_LABELS:
+                rows = [r for r in sweep_rows if r["scenario"] == scenario.name
+                        and r["prior"] == family and r["tau"] == tau and r["method"] == name]
+                sweep_summary.append({"scenario": scenario.name, "prior": family, "tau": tau, "method": name,
+                                      **{metric: float(np.mean([r[metric] for r in rows]))
+                                         for metric in SCORED_METRICS}})
+write_rows(OUT / "prior_interpolation_summary.csv", sweep_summary)
+fig, axes = plt.subplots(len(SCENARIOS), len(CFG.evaluation_priors) * 3,
+    figsize=(10 * len(CFG.evaluation_priors), 4.2 * len(SCENARIOS)), squeeze=False)
+colors = dict(zip(METHOD_LABELS, plt.cm.tab20(np.linspace(0, 1, len(METHOD_LABELS)))))
+for row, scenario in enumerate(SCENARIOS):
+    for col, family in enumerate(CFG.evaluation_priors):
+        for k, metric in enumerate(("energy_score", "sw_history", "marginal_coverage")):
+            ax = axes[row, 3 * col + k]
+            for name in METHOD_LABELS:
+                values = sorted([r for r in sweep_summary if r["scenario"] == scenario.name
+                                 and r["prior"] == family and r["method"] == name], key=lambda r: r["tau"])
+                ax.plot([r["tau"] for r in values], [r[metric] for r in values], marker="o",
+                        color=colors[name], linestyle="--" if name.startswith("reference_") else "-",
+                        label=METHOD_LABELS[name], markersize=3)
+            ax.set_title(f"{scenario.name} | {family}\n{metric.replace('_', ' ')}", fontsize=11)
+            ax.set_xlabel("Prior fraction $\\tau$\n(1 = no interpolation)", fontsize=10)
+            if metric == "marginal_coverage":
+                ax.axhline(CFG.credible_mass, color="black", linestyle=":")
+                ax.set_ylim(-0.02, 1.02)
+handles, labels = axes[0, 0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="lower center", ncol=3, fontsize=8)
+fig.suptitle(f"Input-prior sensitivity — anchor: {CFG.evaluation_interpolation_anchor}; fixed evaluation targets")
+fig.tight_layout(rect=(0, 0.18, 1, 0.94))
+fig.savefig(OUT / "70_all_priors_and_interpolation.png", dpi=180, bbox_inches="tight")
+plt.show()
+
+
+def save_sequential_gif(path, example, paths, title):
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    methods = ("history_raw", "history_defensive", "no_replay_history", "refine_xT")
+    fig, axes = plt.subplots(1, len(methods), figsize=(4.5 * len(methods), 4.5))
+    try:
+        artists = []
+        for ax, name in zip(axes, methods):
+            mass = example["single_mass"][-1] if name == "refine_xT" else example["history_mass"][0]
+            density = ax.imshow(mass, origin="lower", cmap="Greys", alpha=0.5,
+                                extent=[CFG.prior_low, CFG.prior_high] * 2)
+            cloud = ax.scatter([], [], s=12, alpha=0.6)
+            truth = ax.scatter([], [], marker="*", s=150, color="crimson")
+            ax.set(title=METHOD_LABELS[name], xlabel=r"$\theta_1$", ylabel=r"$\theta_2$",
+                   xlim=(CFG.prior_low, CFG.prior_high), ylim=(CFG.prior_low, CFG.prior_high))
+            artists.append((density, cloud, truth))
+        heading = fig.suptitle(title)
+        def update(t):
+            for name, (density, cloud, truth) in zip(methods, artists):
+                # Refinement reuses x_T: only its cloud changes across transport calls.
+                reference_t = len(example["x"]) - 1 if name == "refine_xT" else t
+                mass = example["single_mass"][-1] if name == "refine_xT" else example["history_mass"][t]
+                density.set_data(mass)
+                density.set_clim(0, float(mass.max()))
+                cloud.set_offsets(paths[name][t])
+                truth.set_offsets(example["theta"][reference_t:reference_t + 1])
+            heading.set_text(f"{title} | step={t + 1}/{len(example['x'])} | "
+                             f"history x_t={np.round(example['x'][t], 3)} | "
+                             f"refinement fixed x_T={np.round(example['x'][-1], 3)}\n"
+                             "Grey: temporal reference (history), final current-only reference (refinement); star: corresponding truth")
+            return [heading] + [artist for group in artists for artist in group]
+        fig.tight_layout(rect=(0, 0, 1, 0.86))
+        animation = FuncAnimation(fig, update, frames=len(example["x"]), interval=1000 / CFG.evaluation_gif_fps)
+        animation.save(path, writer=PillowWriter(fps=CFG.evaluation_gif_fps), dpi=100)
+    finally:
+        plt.close(fig)
+
+
+if CFG.evaluation_gif:
+    for scenario in SCENARIOS:
+        for family in CFG.evaluation_priors:
+            try:
+                save_sequential_gif(OUT / f"80_sequential_{scenario.name}_{family}.gif",
+                    example_sequences[scenario.name], sweep_examples[f"{scenario.name}__{family}__1"],
+                    f"{scenario.name} | {family} prior | tau=1")
+            except (ImportError, OSError, RuntimeError) as exc:
+                warnings.warn(f"Could not save sequential GIF for {scenario.name}/{family}: {exc}")
 
 print("\nResults saved to", OUT.resolve())
 print("History is useful only if held-out scores improve; narrow clouds alone are not evidence.")
