@@ -7,8 +7,9 @@ Run #%% cells in order. There is deliberately no main() function.
 Training saves ten complete .eqx checkpoint sets at ceil(k * total_steps / 10), k=1..10
 (or one per update for tiny runs with fewer than ten updates), plus CSV statistics, elapsed
 training time, and the simulation buffer. The schedule, configuration, and a copy of this script
-are saved before training. Set Config.train=False in the saved script, or run it with --no-train,
-to load the latest complete checkpoint beside it. --checkpoint-dir can select another run.
+are saved before training. Set Config.train=False to load the latest complete checkpoint
+beside the script, or set Config.checkpoint_dir to select another run. Set Config.train=True
+and Config.output_dir to train a new run. All settings come from Config, including in notebooks.
 Saved training/evaluation metrics are reloaded and plotted; missing optional results warn and
 allow evaluation to continue. Changed evaluation settings trigger fresh evaluation.
 
@@ -92,7 +93,6 @@ from dataclasses import dataclass, asdict, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-import argparse
 import csv
 import os
 import shutil
@@ -134,7 +134,7 @@ Array = jax.Array
 class Config:
     # Reproducibility / outputs
     seed: int = 2032
-    train: bool = False  # False: load the latest checkpoint beside this script and evaluate.
+    train: bool = True  # False: load the latest checkpoint beside this script and evaluate.
     checkpoint_dir: str | None = None  # Optional run directory for evaluation-only mode.
     output_dir: str = f"bayesian_transport/runs/{datetime.now():%Y-%m-%d_%H-%M-%S-%f}"
 
@@ -386,18 +386,12 @@ def setup_run(cfg: Config, script_path: Path) -> tuple[Config, Path]:
     return cfg, out
 
 
-_requested_config = Config()
-if __name__ == "__main__":
-    _parser = argparse.ArgumentParser(description=__doc__)
-    _parser.add_argument("--no-train", action="store_true", help="Load checkpoints and evaluate only.")
-    _parser.add_argument("--checkpoint-dir", help="Saved run folder (defaults to the script's folder).")
-    _parser.add_argument("--output-dir", help="New training output directory.")
-    _args = _parser.parse_args()
-    _requested_config = replace(_requested_config,
-        train=_requested_config.train and not _args.no_train,
-        checkpoint_dir=_args.checkpoint_dir or _requested_config.checkpoint_dir,
-        output_dir=_args.output_dir or _requested_config.output_dir)
-CFG, OUT = setup_run(_requested_config, Path(__file__))
+# Notebook cells may not define __file__. Support running from the script folder
+# or from the project root. Jupyter's command-line arguments are never parsed.
+_script_path = Path(globals().get("__file__", "bayes_transport_two_moons_history_buffer.py"))
+if not _script_path.is_file():
+    _script_path = Path("bayesian_transport/runs/2026-09-27_01-37-50-257169-RepeatedSequentialEval*/bayes_transport_two_moons_history_buffer.py")
+CFG, OUT = setup_run(Config(), _script_path)
 
 if (not CFG.evaluation_priors or not set(CFG.evaluation_priors) <= {"uniform", "gaussian"}
         or len(set(CFG.evaluation_priors)) != len(CFG.evaluation_priors)):
@@ -2104,7 +2098,7 @@ if training_rows:
 
 
 #%% 8) Matched-endpoint sequences: particle history and parallel repeated-x control
-# Config.train=False or --no-train automatically loads the latest complete checkpoint.
+# Config.train=False automatically loads the latest complete checkpoint.
 
 METHOD_LABELS = {
     "sbi_xT": "SBI: current x only",
